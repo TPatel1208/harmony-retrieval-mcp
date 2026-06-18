@@ -1,0 +1,44 @@
+services:
+
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: harmony-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: harmony_mcp
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./sql/01_catalog.sql:/docker-entrypoint-initdb.d/01_catalog.sql:ro
+      - ./sql/02_workspace.sql:/docker-entrypoint-initdb.d/02_workspace.sql:ro
+      - ./sql/03_provenance.sql:/docker-entrypoint-initdb.d/03_provenance.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d harmony_mcp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  mcp:
+    build: .
+    container_name: harmony-mcp
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: harmony_mcp
+      DB_USER: postgres
+    volumes:
+      - workspace_data:/data/workspace
+      - ./src:/app/src
+      - ./tests:/app/tests
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "harmony_retrieval_mcp.server"]
+
+volumes:
+  pg_data:
+  workspace_data:
