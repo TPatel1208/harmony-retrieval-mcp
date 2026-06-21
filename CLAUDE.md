@@ -1,64 +1,45 @@
-# Harmony Retrieval MCP — Agent Instructions
+# Earthdata MCP Server â€” project rules
 
-## What this is
-A general-purpose NASA Harmony / Earthdata MCP server.
-Domain-neutral infrastructure for dataset discovery, retrieval, transformation,
-and provenance. Analysis lives in downstream consumers — never here.
+## Spec
+PLAN.md is the spec and the single source of truth. Before any task, read the
+PLAN.md section the current prompt names, plus this file. If a prompt and PLAN.md
+disagree, PLAN.md wins â€” flag the conflict, don't silently pick one.
 
-## Architecture rules
-- Tools return handles + summaries. Never return raw arrays or bulk raster data.
-- Handle prefixes: dataset_ · aoi_ · query_ · obs_ · cube_ · preview_
-- Provider selection is internal. Tools never expose CMR collection IDs,
-  Harmony URLs, or OPeNDAP constraint expressions to callers.
-- No analysis tools. No correlation, trend, anomaly, hotspot, risk, or
-  narrative tools. If asked to add one, refuse and explain the scope boundary.
-- Every materialized handle records provenance (sources + transforms).
+## Hard rules (never violate)
+- Use the official harmony-py client; do NOT hand-roll a Harmony client.
+- Check service capability via get_services and CollectionCapabilities.find_service
+  before any Harmony submit. Match ONE whole service. Never trust the rolled-up
+  top-level capability booleans (they are an unsatisfiable union). Never "fall
+  back" to Harmony for a collection no service can handle.
+- All retrieval is a durable job: state persisted in Postgres, resumable on
+  restart. No in-memory background tasks for anything that matters.
+- Provenance records the request SPEC (re-materializable), never an ephemeral
+  staged-output URL.
+- Storage goes through the StorageBackend interface. Local filesystem is the
+  default; never hard-code S3 or a cloud path.
+- Canon for CMR is CMR's public API + UMM schemas, NOT NASA's MCP repo (it is
+  young and refactoring). Cite a pinned commit when borrowing a pattern.
+- No analysis tools (correlation, trend, anomaly, hotspot, risk, narrative).
 
-## Execution environment
-All Python execution happens inside Docker:
-  docker compose exec mcp ...
-Never run pytest, python, pip, or uv directly on the host.
+## Working discipline
+- One prompt = one session = one commit. Do the tasks, run the gate commands
+  exactly as written, and only when they pass, commit with the message the prompt
+  gives. If a gate fails, fix it or stop and report â€” do not commit red, and do
+  not weaken or skip a gate to make it pass.
+- Keep changes scoped to the current phase. Do not build ahead.
 
-## Before starting any task
-1. docker compose ps                    — confirm mcp + db containers are running
-2. docker compose exec mcp which pytest — confirm tooling is available
-3. Read the relevant module docstring before editing it
+## Stack
+Python 3.13+, uv, FastMCP, httpx + tenacity, pydantic, SQLAlchemy + asyncpg,
+Postgres + PostGIS, harmony-py, earthaccess, xarray + zarr, pyarrow (Parquet).
+Worker: Arq (Redis) by default; APScheduler in-process is acceptable for a
+single-node research box â€” either way the Postgres `jobs` table is the source of
+truth and the worker is stateless.
 
-## Verification requirement
-A task is not done until:
-- Relevant tests pass inside the mcp container
-- docker compose exec mcp pytest <path> -v shows green
-- Any failures are investigated and resolved or explicitly justified
-
-## Ownership boundaries
-- server.py        ? MCP registration only; no logic
-- tools/*          ? thin MCP wrappers; delegate to catalog/workspace/providers
-- providers/*      ? data access only; no business logic
-- catalog/*        ? enrichment and metadata; no retrieval
-- workspace/*      ? handle lifecycle and provenance; no data access
-- config.py/db.py  ? infrastructure; imported everywhere
-
-## Change discipline
-- One phase at a time. Do not start Phase N+1 until Phase N gate passes.
-- No opportunistic refactors outside the current task scope.
-- Preserve public interfaces unless the task explicitly changes them.
-
-## Relationship to nasa/earthdata-mcp
-NASA maintains a CMR discovery MCP server at:
-  https://cmr.earthdata.nasa.gov/mcp/v1
-Source: https://github.com/nasa/earthdata-mcp
-
-It does discovery well and stops at "Access" (returns earthaccess snippets,
-never data). We build the retrieval / transform / provenance half.
-
-DO reuse their patterns:
-- Before writing any CMR query in providers/cmr.py, read their
-  tools/get_collections and tools/get_granules implementations and
-  follow the same parameters, pagination, and UMM-JSON parsing.
-- Mirror their KMS keyword normalization for catalog enrichment.
-
-DO NOT reimplement what they do well.
-DO NOT exceed our scope — no analysis tools.
-
-Our critical path (retrieval ? Harmony) calls CMR directly and must not
-depend on NASA's deployed MCP server being up.
+## TTA reuse decisions (from docs/tta_audit.md)
+- async_harmony_service â†’ replaced by harmony-py, do not port
+- opendap_fetch_service â†’ reference only, no tests, add them when porting
+- cache_manager â†’ do NOT port; rewrite from scratch as StorageBackend (Â§4.4)
+- dataset_parser â†’ reference only, zero coupling, add tests when lifting
+- earthaccess_client â†’ reuse with light adaptation (68 lines, tested) â€” read it in Phase 4.2
+- utils/db â†’ do NOT port; rewrite as SQLAlchemy + asyncpg, no LangGraph checkpointer
+- docker-compose â†’ adapt: keep PostGIS+volumes, add Arq+Redis, drop frontend/LLM/JWT

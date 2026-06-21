@@ -1,0 +1,79 @@
+{
+  "TemporalExtents": [
+    {
+      "RangeDateTimes": [
+        {
+          "BeginningDateTime": "2023-08-02T00:00:00.000Z",
+          "EndingDateTime": "2025-09-16T23:59:00.000Z"
+        }
+      ],
+      "EndsAtPresentFlag": false,
+      "TemporalResolution": { "Value": 1, "Unit": "Hour" }
+    }
+  ],
+  "CollectionProgress": "COMPLETE",
+  "StandardProduct": false,
+  "ScienceKeywords": [
+    {
+      "Category": "EARTH SCIENCE",
+      "Topic": "ATMOSPHERE",
+      "Term": "ATMOSPHERIC CHEMISTRY",
+      "VariableLevel1": "NITROGEN COMPOUNDS",
+      "VariableLevel2": "NITROGEN DIOXIDE"
+    },
+    {
+      "Category": "EARTH SCIENCE",
+      "Topic": "ATMOSPHERE",
+      "Term": "AIR QUALITY",
+      "VariableLevel1": "NITROGEN OXIDES"
+    }
+  ],
+  "ProcessingLevel": { "Id": "3" },
+  "DOI": {
+    "DOI": "10.5067/IS-40e/TEMPO/NO2_L3.003",
+    "Authority": "https://doi.org"
+  },
+  "ShortName": "TEMPO_NO2_L3",
+  "Version": "V03",
+  "EntryTitle": "TEMPO gridded NO2 tropospheric and stratospheric columns V03 (PROVISIONAL)",
+  "DirectDistributionInformation": {
+    "S3BucketAndObjectPrefixNames": ["s3://asdc-prod-protected/TEMPO/TEMPO_NO2_L3_V03"],
+    "Region": "us-west-2",
+    "S3CredentialsAPIEndpoint": "https://data.asdc.earthdata.nasa.gov/s3credentials",
+    "S3CredentialsAPIDocumentationURL": "https://data.asdc.earthdata.nasa.gov/s3credentialsREADME"
+  },
+  "SpatialExtent": {
+    "HorizontalSpatialDomain": {
+      "Geometry": {
+        "GPolygons": [
+          {
+            "Boundary": {
+              "Points": [
+                { "Longitude": -170, "Latitude": 10 },
+                { "Longitude": -10, "Latitude": 10 },
+                { "Longitude": -10, "Latitude": 80 },
+                { "Longitude": -170, "Latitude": 80 },
+                { "Longitude": -170, "Latitude": 10 }
+              ]
+            }
+          }
+        ],
+        "CoordinateSystem": "CARTESIAN"
+      }
+    },
+    "GranuleSpatialRepresentation": "CARTESIAN"
+  },
+  "Abstract": "Nitrogen dioxide Level 3 files provide trace gas information on a regular grid covering the TEMPO field of regard for nominal TEMPO observations. The files are provided in netCDF4 format. These data reached provisional validation on December 9, 2024.",
+  "Purpose": "These TEMPO V03 data products should be considered at provisional maturity as defined in the TEMPO validation plan. Users may consult the TEMPO user guides for recommendations for best use and associated known issues.",
+  "UseConstraints": { "FreeAndOpenData": true },
+  "ArchiveAndDistributionInformation": {
+    "FileDistributionInformation": [
+      { "Format": "netCDF-4", "TotalCollectionFileSize": 90, "TotalCollectionFileSizeUnit": "MB" }
+    ]
+  },
+  "MetadataSpecification": {
+    "URL": "https://cdn.earthdata.nasa.gov/umm/collection/v1.18.5",
+    "Name": "UMM-C",
+    "Version": "1.18.5"
+  }
+}

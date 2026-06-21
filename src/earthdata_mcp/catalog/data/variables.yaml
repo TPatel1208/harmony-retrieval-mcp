@@ -1,0 +1,10 @@
+# Advisory variable notes (Phase 2 populates this).
+# QA/scale/offset/fill are pulled from UMM-Var FIRST; this file adds only
+# genuinely-additive notes. Each entry carries owner + last_reviewed.
+# Example shape:
+#   <short_name>:
+#     <variable>:
+#       note: "..."
+#       owner: "team@example.org"
+#       last_reviewed: "2026-01-01"
+variables: {}

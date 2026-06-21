@@ -1,24 +1,14 @@
-FROM python:3.11-slim
-
-# System dependencies for rasterio, shapely, psycopg, pyproj
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libgdal-dev \
-    libproj-dev \
-    libgeos-dev \
-    libpq-dev \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 
 WORKDIR /app
 
-# Install Python dependencies first (layer cache)
+# Install dependencies first for layer caching. src/ is needed because the
+# project is installed editable (hatchling reads the package from src/).
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir -e ".[dev]"
-
-# Copy source
 COPY src/ ./src/
-COPY tests/ ./tests/
-COPY sql/ ./sql/
+RUN uv pip install --system -e ".[dev]"
 
-CMD ["python", "-m", "harmony_retrieval_mcp.server"]
+COPY tests/ ./tests/
+
+# Default: run the MCP server. docker-compose may override (see comments there).
+CMD ["python", "-m", "earthdata_mcp.server"]

@@ -1,1 +1,0 @@
-"""Harmony async retrieval provider."""
