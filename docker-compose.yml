@@ -2,43 +2,88 @@ services:
 
   db:
     image: postgis/postgis:16-3.4
-    container_name: harmony-db
+    container_name: earthdata-db
     restart: unless-stopped
     environment:
-      POSTGRES_DB: harmony_mcp
+      POSTGRES_DB: earthdata_mcp
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
     volumes:
       - pg_data:/var/lib/postgresql/data
-      - ./sql/01_catalog.sql:/docker-entrypoint-initdb.d/01_catalog.sql:ro
-      - ./sql/02_workspace.sql:/docker-entrypoint-initdb.d/02_workspace.sql:ro
-      - ./sql/03_provenance.sql:/docker-entrypoint-initdb.d/03_provenance.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d harmony_mcp"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d earthdata_mcp"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 15s
 
+  redis:
+    image: redis:7-alpine
+    container_name: earthdata-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   mcp:
     build: .
-    container_name: harmony-mcp
+    container_name: earthdata-mcp
     restart: unless-stopped
     env_file: .env
     environment:
-      DB_HOST: db
-      DB_PORT: "5432"
-      DB_NAME: harmony_mcp
-      DB_USER: postgres
+      DATABASE_URL: postgresql+asyncpg://postgres:${DB_PASSWORD:-postgres}@db:5432/earthdata_mcp
+      REDIS_URL: redis://redis:6379/0
+      EARTHDATA_DATA_DIR: /data
     volumes:
-      - workspace_data:/data/workspace
       - ./src:/app/src
       - ./tests:/app/tests
+      - data:/data          # local storage backend root (default)
     depends_on:
       db:
         condition: service_healthy
-    command: ["python", "-m", "harmony_retrieval_mcp.server"]
+      redis:
+        condition: service_healthy
+    # Phase 1 wires the skeleton; the MCP transport is finalized in a later phase.
+    # Keep the container alive so the gate can `docker compose exec` into it.
+    command: ["sleep", "infinity"]
+
+  worker:
+    build: .
+    container_name: earthdata-worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:${DB_PASSWORD:-postgres}@db:5432/earthdata_mcp
+      REDIS_URL: redis://redis:6379/0
+      EARTHDATA_DATA_DIR: /data
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["arq", "earthdata_mcp.jobs.worker.WorkerSettings"]
+
+  # Optional S3-compatible object store for exercising ObjectStoreBackend.
+  # Off by default: starts only with `docker compose --profile s3 up`.
+  minio:
+    image: minio/minio:latest
+    container_name: earthdata-minio
+    profiles: ["s3"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
 
 volumes:
   pg_data:
-  workspace_data:
+  data:
+  minio_data:

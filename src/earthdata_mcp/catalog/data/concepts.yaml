@@ -1,0 +1,6 @@
+# KMS concept normalization stubs (Phase 2 populates this).
+# Maps colloquial terms to GCMD science keywords, mirroring NASA get_keywords.
+# Example shape:
+#   rain:
+#     - PRECIPITATION AMOUNT
+concepts: {}

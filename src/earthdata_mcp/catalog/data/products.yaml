@@ -1,0 +1,8 @@
+# Advisory product notes — ≤10 products, advisory/non-authoritative (PLAN.md §4.2).
+# Each entry carries owner + last_reviewed. Phase 2 populates this.
+# Example shape:
+#   <short_name>:
+#     advisory: ["PROVISIONAL; see known issues"]
+#     owner: "team@example.org"
+#     last_reviewed: "2026-01-01"
+products: {}

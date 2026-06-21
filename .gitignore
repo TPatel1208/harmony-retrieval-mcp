@@ -13,6 +13,9 @@ build/
 .venv/
 venv/
 
+# uv
+uv.lock
+
 # Type checking / linting caches
 .mypy_cache/
 .ruff_cache/
@@ -30,6 +33,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Data
+# Data (local storage backend root)
 /data/
 *.zarr/
