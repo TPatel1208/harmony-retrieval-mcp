@@ -94,6 +94,30 @@ class WorkspaceStore:
                 )
             return _to_record(row)
 
+    async def update_handle(
+        self, workspace_id: str, handle: str, payload: dict
+    ) -> HandleRecord:
+        """Merge ``payload`` into a handle's payload, scoped to ``workspace_id``.
+
+        Used by the worker to resolve a pending ``obs_`` handle once its job
+        materializes (it records the durable ``storage_key`` + media type — never
+        a staged-output URL). Same isolation contract as :meth:`get_handle`:
+        :class:`HandleNotFoundError` if absent, :class:`CrossWorkspaceError` if
+        owned by another workspace.
+        """
+        async with self._session_factory() as session:
+            row = await session.get(Handle, handle)
+            if row is None:
+                raise HandleNotFoundError(handle)
+            if row.workspace_id != workspace_id:
+                raise CrossWorkspaceError(
+                    f"handle {handle!r} is not owned by workspace {workspace_id!r}"
+                )
+            # Reassign a new dict so SQLAlchemy detects the JSONB change.
+            row.payload = {**(row.payload or {}), **payload}
+            await session.commit()
+            return _to_record(row)
+
     async def list_handles(
         self, workspace_id: str, handle_type: HandleType | None = None
     ) -> list[HandleRecord]:
