@@ -46,6 +46,9 @@ packages = ["src/earthdata_mcp"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "live: needs real Earthdata Login credentials / network (run on demand, nightly CI)",
+]
 
 [tool.ruff]
 line-length = 88
