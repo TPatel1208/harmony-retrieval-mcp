@@ -15,6 +15,7 @@ from earthdata_mcp.workspace.models import (
 from earthdata_mcp.workspace.provenance import (
     Ancestor,
     ProvenanceError,
+    ProvenanceEventRecord,
     ProvenanceStore,
 )
 from earthdata_mcp.workspace.store import (
@@ -37,6 +38,7 @@ __all__ = [
     "ProvenanceEdge",
     "ProvenanceError",
     "ProvenanceEvent",
+    "ProvenanceEventRecord",
     "ProvenanceEventType",
     "ProvenanceStore",
     "WorkspaceStore",

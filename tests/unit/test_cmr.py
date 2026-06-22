@@ -131,5 +131,70 @@ async def test_search_after_pagination(
     assert httpx_mock.get_requests()[1].headers.get("CMR-Search-After") == "tok1"
 
 
+async def test_get_citations_surfaces_doi_and_collection_citations(
+    httpx_mock, provider: CMRProvider
+) -> None:
+    """DOI + formal CollectionCitations come straight from UMM-C; the associated
+    citation concepts (works that cite the dataset) are counted, not fetched."""
+    httpx_mock.add_response(
+        json={
+            "items": [
+                {
+                    "meta": {
+                        "concept-id": "C2-X",
+                        "associations": {"citations": ["CIT1-E", "CIT2-E", "CIT3-E"]},
+                    },
+                    "umm": {
+                        "DOI": {
+                            "DOI": "10.5067/MODIS/MOD13A1.061",
+                            "Authority": "https://doi.org",
+                        },
+                        "CollectionCitations": [
+                            {"Title": "MODIS/Terra Vegetation Indices", "Creator": "K. Didan"}
+                        ],
+                    },
+                }
+            ]
+        }
+    )
+    out = await provider.get_citations("C2-X")
+    assert out["concept_id"] == "C2-X"
+    assert out["doi"] == "10.5067/MODIS/MOD13A1.061"
+    assert out["doi_authority"] == "https://doi.org"
+    assert out["collection_citations"][0]["Creator"] == "K. Didan"
+    # Counted, not fetched (only the one collection request was made).
+    assert out["reference_citation_count"] == 3
+    assert len(httpx_mock.get_requests()) == 1
+
+
+async def test_get_citations_graceful_without_doi_or_citations(
+    httpx_mock, provider: CMRProvider
+) -> None:
+    """A collection with no DOI and no citations returns empty fields, not an error."""
+    httpx_mock.add_response(
+        json={"items": [{"meta": {"concept-id": "C3-X"}, "umm": {}}]}
+    )
+    out = await provider.get_citations("C3-X")
+    assert out["doi"] is None
+    assert out["doi_authority"] is None
+    assert out["collection_citations"] == []
+    assert out["reference_citation_count"] == 0
+
+
+async def test_get_citations_graceful_when_collection_missing(
+    httpx_mock, provider: CMRProvider
+) -> None:
+    """An unknown concept id (no items) yields empty fields, never an error."""
+    httpx_mock.add_response(json={"items": []})
+    out = await provider.get_citations("C-NOPE")
+    assert out == {
+        "concept_id": "C-NOPE",
+        "doi": None,
+        "doi_authority": None,
+        "collection_citations": [],
+        "reference_citation_count": 0,
+    }
+
+
 def test_providers_package_importable() -> None:
     assert providers.__doc__  # sanity: package docstring intact

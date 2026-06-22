@@ -31,6 +31,7 @@ from earthdata_mcp.db import create_engine, create_session_factory
 from earthdata_mcp.jobs import crud
 from earthdata_mcp.jobs.state import JobState
 from earthdata_mcp.providers._capabilities import CollectionCapabilities
+from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, TransformSpec
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.providers.router import Router, RoutingDecision
@@ -117,6 +118,7 @@ async def retrieve_data(
         needs_bbox=True,
         needs_variable=False,
         needs_temporal=bool(time_range),
+        needs_point_sample=False,
         cmr=cmr,
         store=store,
         provenance=provenance,
@@ -151,6 +153,7 @@ async def retrieve_subset(
         needs_bbox=True,
         needs_variable=True,
         needs_temporal=bool(time_range),
+        needs_point_sample=False,
         cmr=cmr,
         store=store,
         provenance=provenance,
@@ -166,6 +169,7 @@ async def retrieve_timeseries(
     workspace_id: str = DEFAULT_WORKSPACE,
     output_format: str | None = None,
     aoi_handle: str | None = None,
+    point_sample: bool = False,
     *,
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
@@ -177,6 +181,12 @@ async def retrieve_timeseries(
 
     A bbox subset is requested only when ``aoi_handle`` is given, so the route is
     gated on ``needs_bbox`` accordingly.
+
+    Set ``point_sample=True`` to sample the variable at a point/area: that is an
+    *intent* the router honours by routing to AppEEARS (§4.4), which returns a
+    tabular series — so the result defaults to Parquet, never a Zarr cube. The
+    ``aoi_handle`` then carries the sample point (a degenerate point bbox is the
+    common case).
     """
     return await _submit_retrieval(
         dataset_handle=dataset_handle,
@@ -185,9 +195,10 @@ async def retrieve_timeseries(
         variables=tuple(variables or ()),
         workspace_id=workspace_id,
         output_format=output_format,
-        needs_bbox=aoi_handle is not None,
+        needs_bbox=aoi_handle is not None and not point_sample,
         needs_variable=True,
         needs_temporal=bool(time_range),
+        needs_point_sample=point_sample,
         cmr=cmr,
         store=store,
         provenance=provenance,
@@ -275,6 +286,7 @@ async def _submit_retrieval(
     needs_bbox: bool,
     needs_variable: bool,
     needs_temporal: bool,
+    needs_point_sample: bool,
     cmr: CMRProvider | None,
     store: WorkspaceStore | None,
     provenance: ProvenanceStore | None,
@@ -298,13 +310,19 @@ async def _submit_retrieval(
     )
 
     caps = await cmr.collection_capabilities(concept_id)
-    fmt = output_format or _FORMAT_BY_SHAPE.get(caps.output_shape, _DEFAULT_FORMAT)
+    # A point sample is tabular wherever the collection's grid lives: default to
+    # Parquet regardless of output_shape, never a Zarr cube (§4.4).
+    if needs_point_sample:
+        fmt = output_format or _FORMAT_BY_SHAPE["point"]
+    else:
+        fmt = output_format or _FORMAT_BY_SHAPE.get(caps.output_shape, _DEFAULT_FORMAT)
 
     plan = RetrievalPlan(
         output_format=fmt,
         needs_bbox=needs_bbox,
         needs_variable=needs_variable,
         needs_temporal=needs_temporal,
+        needs_point_sample=needs_point_sample,
         concept_id=concept_id,
         short_name=caps.short_name,
         aoi=AOI(bbox=bbox) if bbox is not None else None,
@@ -315,7 +333,10 @@ async def _submit_retrieval(
     )
 
     # Plan-time gate: raises NotRetrievable if no single service fits. No fallback.
-    decision = Router(caps).route(plan)
+    # The AppEEARS provider is wired in so a point-sample plan routes to it (router
+    # step 0); its can_handle keys on needs_point_sample, so non-point plans are
+    # untouched.
+    decision = Router(caps, appeears=AppEEARSProvider(caps)).route(plan)
     service_name = decision.service.service_name if decision.service else None
 
     # Mint the two handles, then persist the durable spec that ties them together.
@@ -339,6 +360,7 @@ async def _submit_retrieval(
         needs_bbox=needs_bbox,
         needs_variable=needs_variable,
         needs_temporal=needs_temporal,
+        needs_point_sample=needs_point_sample,
         workspace_id=workspace_id,
         job_handle=job_handle,
         obs_handle=obs_handle,
@@ -386,6 +408,7 @@ def _build_spec(
     needs_bbox: bool,
     needs_variable: bool,
     needs_temporal: bool,
+    needs_point_sample: bool,
     workspace_id: str,
     job_handle: str,
     obs_handle: str,
@@ -404,6 +427,7 @@ def _build_spec(
         "needs_bbox": needs_bbox,
         "needs_variable": needs_variable,
         "needs_temporal": needs_temporal,
+        "needs_point_sample": needs_point_sample,
         "aoi_bbox": list(bbox) if bbox is not None else None,
         "time_range": time_range or None,
         "variables": list(variables),

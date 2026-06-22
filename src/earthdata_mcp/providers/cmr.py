@@ -26,6 +26,7 @@ from tenacity import (
 from earthdata_mcp.config import Settings, get_settings
 from earthdata_mcp.providers._capabilities import CollectionCapabilities
 from earthdata_mcp.providers.base import ProviderCapabilities
+from earthdata_mcp.providers.ratelimit import get_limiter
 
 # UMM-JSON endpoints (docs/cmr_patterns.md). All five search tools hit the
 # ``.umm_json`` variants so the response carries typed ``umm`` + CMR ``meta``.
@@ -105,6 +106,9 @@ class CMRProvider:
         merged = dict(self._headers)
         if headers:
             merged.update(headers)
+        # Polite per-provider rate limiting at the HTTP boundary (§8). Each retry
+        # attempt takes a token too, so a retry storm is throttled as well.
+        await get_limiter("cmr").acquire()
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.request(
                 method, url, params=params, headers=merged
@@ -293,6 +297,45 @@ class CMRProvider:
             return []
         items = await self._search(_SERVICES, params, limit=limit)
         return [normalize_service_item(i) for i in items]
+
+    # -- Citations (NASA get_citations pattern; canon = UMM-C) ------------
+
+    async def get_citations(self, collection_concept_id: str) -> dict:
+        """Official DOI + formal citation strings for a collection.
+
+        Mirrors NASA's ``get_citations`` intent — "how do I cite this dataset" —
+        but reads the authoritative records straight from UMM-C (canon, not the
+        NASA repo): the collection's own ``DOI`` and ``CollectionCitations`` (the
+        formal citation strings CMR publishes). It also counts the works that
+        *cite* the dataset via ``meta.associations.citations`` (CMR's citation
+        concepts are publications-that-cite, a different thing from the dataset's
+        own citation), exposed as a count rather than fetching hundreds of records.
+
+        Graceful by contract: a collection with no DOI and no citation records
+        returns empty fields and a zero count — never an error.
+        """
+        item = await self._fetch_collection(collection_concept_id)
+        if not item:
+            return {
+                "concept_id": collection_concept_id,
+                "doi": None,
+                "doi_authority": None,
+                "collection_citations": [],
+                "reference_citation_count": 0,
+            }
+        meta = item.get("meta", {})
+        umm = item.get("umm", {})
+        doi = umm.get("DOI") or {}
+        reference_ids = meta.get("associations", {}).get("citations", []) or []
+        return {
+            "concept_id": meta.get("concept-id", collection_concept_id),
+            "doi": doi.get("DOI"),
+            "doi_authority": doi.get("Authority"),
+            # The formal "how to cite" strings, verbatim from CMR's UMM-C record.
+            "collection_citations": umm.get("CollectionCitations") or [],
+            # Count of works citing the dataset (associated citation concepts).
+            "reference_citation_count": len(reference_ids),
+        }
 
     # -- Merged capability view (Layer 1 + Layer 2) -----------------------
 

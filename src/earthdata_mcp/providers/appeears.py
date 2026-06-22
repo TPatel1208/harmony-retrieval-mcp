@@ -40,6 +40,7 @@ from earthdata_mcp.providers.base import (
     MaterializedResult,
     RetrievalPlan,
 )
+from earthdata_mcp.providers.ratelimit import get_limiter
 from earthdata_mcp.storage.backend import StorageBackend
 from earthdata_mcp.storage.local import LocalFilesystemBackend
 
@@ -105,6 +106,7 @@ class AppEEARSProvider:
                 "(needs_point_sample); the router must not dispatch this here"
             )
         body = self._build_task(plan)
+        await get_limiter(PROVIDER).acquire()
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.post(
                 f"{self._base}/task", json=body, headers=self._auth_headers()
@@ -123,6 +125,7 @@ class AppEEARSProvider:
 
     async def poll(self, job: JobRef) -> JobStatus:
         """One status check against ``<appeears>/task/<id>`` (worker drives the loop)."""
+        await get_limiter(PROVIDER).acquire()
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.get(
                 f"{self._base}/task/{job.provider_job_id}",
@@ -142,6 +145,7 @@ class AppEEARSProvider:
         ``pyarrow`` table and write Parquet (never Zarr). The obs_ handle this
         resolves to carries ``application/x-parquet`` (PLAN.md §4.4 hard rule).
         """
+        await get_limiter(PROVIDER).acquire()
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             headers = self._auth_headers()
             bundle = await client.get(
