@@ -125,3 +125,38 @@ def test_opendap_path_taken_when_provider_can_handle(l3_caps) -> None:
     decision = router.route(plan)
     assert decision.path == "opendap"
     assert decision.provider is opendap
+
+
+# -- AppEEARS point/area-sample path (Phase 7.4) ---------------------------
+
+
+def test_point_sample_routes_to_appeears_before_harmony(l2_caps) -> None:
+    # A point/area sample is tabular: it goes to AppEEARS even when a Harmony
+    # service could match — it must not be forced through the gridded cube path.
+    appeears = MagicMock()
+    appeears.can_handle.return_value = True
+    harmony = MagicMock()
+    router = Router(l2_caps, harmony=harmony, appeears=appeears)
+    plan = RetrievalPlan(
+        output_format="application/x-parquet",
+        needs_bbox=True,
+        needs_point_sample=True,
+    )
+
+    decision = router.route(plan)
+    assert decision.path == "appeears"
+    assert decision.provider is appeears
+    harmony.submit.assert_not_called()
+
+
+def test_non_point_plan_does_not_hijack_to_appeears(l2_caps) -> None:
+    # AppEEARS is consulted but declines a non-point plan, so routing falls
+    # through to the normal Harmony decision tree.
+    appeears = MagicMock()
+    appeears.can_handle.return_value = False
+    router = Router(l2_caps, harmony=MagicMock(), appeears=appeears)
+    plan = RetrievalPlan(output_format="application/netcdf", needs_bbox=True)
+
+    decision = router.route(plan)
+    assert decision.path == "harmony"
+    assert decision.service.service_name == SUBSETTER

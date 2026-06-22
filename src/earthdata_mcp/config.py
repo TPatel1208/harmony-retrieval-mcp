@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     # Canon is CMR's public API + UMM schemas (PLAN.md §1).
     cmr_url: str = "https://cmr.earthdata.nasa.gov"
     harmony_url: str = "https://harmony.earthdata.nasa.gov"
+    # AppEEARS point/area sample API (Phase 7.4; Bearer-authenticated with the EDL
+    # token below). Trailing path segments (``/task``, ``/bundle/...``) are appended.
+    appeears_url: str = "https://appeears.earthdatacloud.nasa.gov/api"
     # CMR asks every client to identify itself — set OUR own id, never NASA's.
     cmr_client_id: str = "earthdata-retrieval-mcp"
     # GCMD Keyword Management Service (KMS) base for keyword normalization.

@@ -164,6 +164,10 @@ class RetrievalPlan:
     needs_shape: bool = False
     needs_dimension: bool = False
     needs_reproject: bool = False
+    # Point/area-sample intent (PLAN.md §4.4): the router gates the AppEEARS path
+    # on this. Defaulted False, so it never affects `find_service` (Harmony
+    # services don't sample points) nor any existing gate-only RetrievalPlan.
+    needs_point_sample: bool = False
     # Concrete request description (used to build the provider request).
     concept_id: str | None = None
     short_name: str | None = None

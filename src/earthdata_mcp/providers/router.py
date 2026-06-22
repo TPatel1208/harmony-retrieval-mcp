@@ -44,7 +44,7 @@ class NotRetrievable(Exception):
 class RoutingDecision:
     """The chosen retrieval path. ``service``/``provider`` set where they apply."""
 
-    path: Literal["harmony", "direct", "opendap"]
+    path: Literal["harmony", "direct", "opendap", "appeears"]
     service: ServiceCapability | None = None
     provider: RetrievalProvider | None = None
 
@@ -58,13 +58,21 @@ class Router:
         *,
         harmony: RetrievalProvider | None = None,
         opendap: RetrievalProvider | None = None,
+        appeears: RetrievalProvider | None = None,
     ) -> None:
         self._caps = capabilities
         self._harmony = harmony
         self._opendap = opendap
+        self._appeears = appeears
 
     def route(self, plan: RetrievalPlan) -> RoutingDecision:
         """Apply the §4.2 decision tree. Decide only — never submit."""
+        # 0. A point/area sample is a tabular request: AppEEARS owns it, and it must
+        #    not be forced through Harmony's gridded cube path (PLAN.md §4.4). Gated
+        #    on the plan's point-sample intent, so non-point plans skip it entirely.
+        if self._appeears is not None and self._appeears.can_handle(plan):
+            return RoutingDecision("appeears", provider=self._appeears)
+
         # 1. A single Harmony service satisfies the whole plan → use that service.
         svc = self._caps.find_service(plan)
         if svc is not None:
