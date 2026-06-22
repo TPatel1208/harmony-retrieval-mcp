@@ -78,6 +78,44 @@ async def test_list_handles_filters_by_type(
     assert len(await workspace_store.list_handles(workspace_id)) == 3
 
 
+# --- update_handle -------------------------------------------------------
+
+
+async def test_update_handle_merges_and_reads_back(
+    workspace_store: WorkspaceStore, workspace_id: str
+) -> None:
+    """update_handle must merge the payload and return the populated record.
+
+    Regression for the MissingGreenlet bug: ``updated_at`` (``onupdate=func.now()``)
+    is expired by the UPDATE flush, so building the detached record used to fire a
+    sync lazy-load in the async context. The returned record — and a fresh read —
+    must both reflect the merge without raising.
+    """
+    handle = await workspace_store.put_handle(
+        workspace_id, HandleType.OBS, {"status": "pending"}
+    )
+
+    returned = await workspace_store.update_handle(
+        workspace_id, handle, {"status": "ready", "storage_key": "results/x.zarr"}
+    )
+
+    # The record returned straight from update_handle is fully populated.
+    assert returned.payload == {"status": "ready", "storage_key": "results/x.zarr"}
+    assert returned.updated_at is not None
+
+    # And a fresh read sees the merged payload (original key kept, new keys added).
+    reread = await workspace_store.get_handle(workspace_id, handle)
+    assert reread.payload == {"status": "ready", "storage_key": "results/x.zarr"}
+
+
+async def test_update_handle_cross_workspace_denied(
+    workspace_store: WorkspaceStore,
+) -> None:
+    handle = await workspace_store.put_handle("ws-owner", HandleType.OBS, {})
+    with pytest.raises(CrossWorkspaceError):
+        await workspace_store.update_handle("ws-intruder", handle, {"x": 1})
+
+
 # --- ownership / isolation ----------------------------------------------
 
 
