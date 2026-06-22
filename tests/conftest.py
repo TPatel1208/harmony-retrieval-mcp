@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from earthdata_mcp.config import Settings
 from earthdata_mcp.db import create_session_factory
+from earthdata_mcp.jobs.models import create_jobs_schema
 from earthdata_mcp.storage.local import LocalFilesystemBackend
 from earthdata_mcp.workspace import (
     ProvenanceStore,
@@ -54,10 +55,15 @@ def local_backend(tmp_path: Path) -> LocalFilesystemBackend:
 
 @pytest.fixture
 async def pg_engine():
-    """A real async engine with the workspace/provenance schema created."""
+    """A real async engine with the workspace/provenance + jobs schemas created.
+
+    The two declarative bases are independent and create disjoint tables; both
+    ``create_*`` calls are idempotent.
+    """
     settings = Settings()
     engine = create_async_engine(settings.database_url)
     await create_schema(engine)
+    await create_jobs_schema(engine)
     try:
         yield engine
     finally:
