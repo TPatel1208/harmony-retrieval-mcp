@@ -11,11 +11,17 @@ from datetime import datetime
 
 from sqlalchemy import DateTime, Integer, String, func
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
-    """Declarative base for the durable job model."""
+    """Declarative base for the durable job model.
+
+    Independent of the workspace/provenance ``Base`` (``workspace/models.py``);
+    the two metadatas create disjoint tables, so creating one schema never touches
+    the other's.
+    """
 
 
 class Job(Base):
@@ -42,3 +48,19 @@ class Job(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+async def create_jobs_schema(engine: AsyncEngine) -> None:
+    """Create the durable ``jobs`` table (idempotent).
+
+    Phase 6 owns the jobs table's creation, separate from the workspace schema so
+    each is created from its own ``metadata``.
+    """
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def drop_jobs_schema(engine: AsyncEngine) -> None:
+    """Drop the durable ``jobs`` table (for teardown)."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)

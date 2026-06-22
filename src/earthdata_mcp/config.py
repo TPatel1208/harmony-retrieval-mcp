@@ -17,6 +17,20 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # CMR / Harmony / KMS (metadata services, Phase 2) --------------------
+    # Canon is CMR's public API + UMM schemas (PLAN.md §1).
+    cmr_url: str = "https://cmr.earthdata.nasa.gov"
+    harmony_url: str = "https://harmony.earthdata.nasa.gov"
+    # AppEEARS point/area sample API (Phase 7.4; Bearer-authenticated with the EDL
+    # token below). Trailing path segments (``/task``, ``/bundle/...``) are appended.
+    appeears_url: str = "https://appeears.earthdatacloud.nasa.gov/api"
+    # CMR asks every client to identify itself — set OUR own id, never NASA's.
+    cmr_client_id: str = "earthdata-retrieval-mcp"
+    # GCMD Keyword Management Service (KMS) base for keyword normalization.
+    kms_url: str = "https://gcmd.earthdata.nasa.gov/kms"
+    # How long a cached KMS dump stays fresh before a refresh (default 7 days).
+    kms_cache_ttl_seconds: int = 7 * 24 * 3600
+
     # Storage --------------------------------------------------------------
     # `local` (default) or an `s3://bucket/prefix` URL.
     earthdata_storage: str = "local"
@@ -37,6 +51,15 @@ class Settings(BaseSettings):
     edl_username: str = ""
     edl_password: str = ""
     earthdata_token: str = ""
+
+    # Per-provider rate limiting (Phase 8 hardening, §8) ------------------
+    # Token-bucket refill rate in requests/sec at each provider's HTTP boundary.
+    # Generous by default so normal traffic is never delayed — a backstop against
+    # a runaway poll loop, not a throttle on ordinary use.
+    cmr_rate_per_sec: float = 20.0
+    harmony_rate_per_sec: float = 10.0
+    appeears_rate_per_sec: float = 10.0
+    opendap_rate_per_sec: float = 10.0
 
     # Logging --------------------------------------------------------------
     log_level: str = "INFO"

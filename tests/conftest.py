@@ -3,11 +3,33 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from earthdata_mcp.config import Settings
+from earthdata_mcp.db import create_session_factory
+from earthdata_mcp.jobs.models import create_jobs_schema
 from earthdata_mcp.storage.local import LocalFilesystemBackend
+from earthdata_mcp.workspace import (
+    ProvenanceStore,
+    WorkspaceStore,
+    create_schema,
+)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the ``live`` marker here too.
+
+    It is declared canonically in ``pyproject.toml``, but that file is baked into
+    the dev image (only ``src``/``tests`` are bind-mounted), so registering it in
+    this mounted conftest keeps ``-m live`` warning-free without an image rebuild.
+    """
+    config.addinivalue_line(
+        "markers",
+        "live: needs real Earthdata Login credentials / network (run on demand, nightly CI)",
+    )
 
 
 @pytest.fixture
@@ -24,3 +46,46 @@ def local_settings(tmp_path: Path) -> Settings:
 def local_backend(tmp_path: Path) -> LocalFilesystemBackend:
     """A local filesystem backend rooted in a tmp dir."""
     return LocalFilesystemBackend(tmp_path / "store")
+
+
+# --- Postgres-backed fixtures (workspace + provenance) -------------------
+# These connect lazily — only tests that request them touch the DB. DATABASE_URL
+# comes from the environment (set by docker-compose for the mcp container).
+
+
+@pytest.fixture
+async def pg_engine():
+    """A real async engine with the workspace/provenance + jobs schemas created.
+
+    The two declarative bases are independent and create disjoint tables; both
+    ``create_*`` calls are idempotent.
+    """
+    settings = Settings()
+    engine = create_async_engine(settings.database_url)
+    await create_schema(engine)
+    await create_jobs_schema(engine)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture
+def session_factory(pg_engine):
+    return create_session_factory(pg_engine)
+
+
+@pytest.fixture
+def workspace_store(session_factory) -> WorkspaceStore:
+    return WorkspaceStore(session_factory)
+
+
+@pytest.fixture
+def provenance_store(session_factory) -> ProvenanceStore:
+    return ProvenanceStore(session_factory)
+
+
+@pytest.fixture
+def workspace_id() -> str:
+    """A unique workspace id, isolating each test's rows."""
+    return f"ws-{uuid4().hex}"
