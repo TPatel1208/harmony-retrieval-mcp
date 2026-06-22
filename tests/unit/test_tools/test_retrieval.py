@@ -282,6 +282,39 @@ async def test_retrieve_timeseries_no_aoi_required(
     assert spec["needs_bbox"] is False
     assert spec["aoi_bbox"] is None
     assert spec["needs_variable"] is True
+    # A plain time-series is a Harmony route, not a point sample.
+    assert out["provider"] == "harmony"
+    assert spec["needs_point_sample"] is False
+
+
+async def test_retrieve_timeseries_point_sample_routes_appeears(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """point_sample=True is an intent the router honours by routing to AppEEARS
+    (§4.4) — tabular, so the format defaults to Parquet, never the grid's Zarr."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_timeseries(
+        ds, _TIME, ["NDVI"], workspace_id=workspace_id, aoi_handle=aoi,
+        point_sample=True,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    assert out["provider"] == "appeears"
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    spec = job.request_spec
+    assert spec["needs_point_sample"] is True
+    assert spec["provider"] == "appeears"
+    # Tabular: Parquet even though the collection is gridded (output_shape == grid).
+    assert spec["output_format"] == "application/x-parquet"
+    assert spec["output_shape"] == "grid"
+    # The sample point is still carried for AppEEARS, but not as a bbox-subset.
+    assert spec["aoi_bbox"] == _BBOX
+    assert spec["needs_bbox"] is False
+    assert job.provider == "appeears"
 
 
 # -- get_retrieval_status --------------------------------------------------

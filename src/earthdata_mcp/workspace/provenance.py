@@ -62,6 +62,15 @@ class Ancestor:
     depth: int
 
 
+@dataclass(frozen=True)
+class ProvenanceEventRecord:
+    """One first-class lineage event read back for a handle."""
+
+    event_type: str
+    detail: dict
+    created_at: object
+
+
 class ProvenanceStore:
     """Records lineage edges and events; answers ancestry queries."""
 
@@ -136,6 +145,38 @@ class ProvenanceStore:
                 {"start": handle, "ws": workspace_id, "max_depth": max_depth},
             )
             return [Ancestor(handle=r.handle, depth=r.depth) for r in rows]
+
+    async def events(
+        self, workspace_id: str, handle: str
+    ) -> list[ProvenanceEventRecord]:
+        """Return a handle's first-class lineage events, newest first.
+
+        Workspace-scoped like :meth:`ancestry` — events in other workspaces are
+        invisible. The ``created``/``materialized``/``expired``/``re-materialized``
+        timeline is what ``get_provenance`` surfaces alongside the ancestry graph.
+        """
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT event_type, detail, created_at
+                        FROM provenance_events
+                        WHERE handle = :h AND workspace_id = :ws
+                        ORDER BY created_at DESC, id DESC
+                        """
+                    ),
+                    {"h": handle, "ws": workspace_id},
+                )
+            ).all()
+            return [
+                ProvenanceEventRecord(
+                    event_type=r.event_type,
+                    detail=r.detail or {},
+                    created_at=r.created_at,
+                )
+                for r in rows
+            ]
 
     async def re_materialize(self, workspace_id: str, handle: str) -> dict:
         """Re-materialization stub: recover the durable spec for ``handle``.

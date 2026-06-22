@@ -6,10 +6,10 @@ adds the durable retrieval tools (``retrieve_data``/``retrieve_subset``/
 ``retrieve_timeseries``/``get_retrieval_status``/``cancel_retrieval``); Phase 7.1–7.2
 adds the preview tools (``preview_dataset``/``summarize_dataset``/
 ``inspect_statistics``) and the transform tools (``subset``/``reproject``/
-``resample``/``convert_format``/``align``). The rest arrives in its respective
-phase. Importing this module must have no DB, network,
-or credential side effects — the tools build their dependencies lazily, on first
-call, never at import.
+``resample``/``convert_format``/``align``); Phase 8 completes the v1 surface with
+the provenance tools (``get_provenance``/``cite_dataset``). Importing this module
+must have no DB, network, or credential side effects — the tools build their
+dependencies lazily, on first call, never at import.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from earthdata_mcp.tools import (
     coverage,
     discovery,
     preview,
+    provenance,
     retrieval,
     transform,
     understanding,
@@ -169,8 +170,13 @@ async def retrieve_timeseries(
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
     output_format: str | None = None,
     aoi_handle: str | None = None,
+    point_sample: bool = False,
 ) -> dict:
-    """Retrieve a variable time-series as a durable job; the AOI is optional."""
+    """Retrieve a variable time-series as a durable job; the AOI is optional.
+
+    Set ``point_sample=True`` to sample at a point/area: the request routes to
+    AppEEARS and returns a tabular series as Parquet (never a Zarr cube).
+    """
     return await retrieval.retrieve_timeseries(
         dataset_handle,
         time_range,
@@ -178,6 +184,7 @@ async def retrieve_timeseries(
         workspace_id,
         output_format,
         aoi_handle,
+        point_sample,
     )
 
 
@@ -291,6 +298,33 @@ async def align(
 ) -> dict:
     """Align ≥2 gridded results to a common grid → a ``cube_`` handle + alignment report."""
     return await transform.align(source_handles, method, workspace_id)
+
+
+@mcp.tool
+async def get_provenance(
+    handle: str,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+) -> dict:
+    """Return a handle's lineage: its ancestry graph (recursive CTE) and events.
+
+    Returns ``{handle, ancestors: [{handle, depth}], events: [...]}`` scoped to the
+    workspace — lineage never crosses a workspace boundary.
+    """
+    return await provenance.get_provenance(handle, workspace_id)
+
+
+@mcp.tool
+async def cite_dataset(
+    dataset_handle: str,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+) -> dict:
+    """Official DOI + formal citation strings for a ``dataset_`` handle.
+
+    Citations come from CMR's own records (UMM-C DOI + CollectionCitations), never
+    hand-rolled. Returns ``{handle, concept_id, doi, doi_authority,
+    collection_citations, reference_citation_count}``.
+    """
+    return await provenance.cite_dataset(dataset_handle, workspace_id)
 
 
 def main() -> None:

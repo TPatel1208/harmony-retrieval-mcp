@@ -42,6 +42,7 @@ from earthdata_mcp.providers.base import (
     MaterializedResult,
     RetrievalPlan,
 )
+from earthdata_mcp.providers.ratelimit import get_limiter
 from earthdata_mcp.storage.backend import StorageBackend
 from earthdata_mcp.storage.local import LocalFilesystemBackend
 
@@ -160,6 +161,7 @@ class OPeNDAPProvider:
 
     async def _fetch(self, url: str) -> bytes:
         """GET the DAP4 subset bytes (Bearer-authenticated when a token is set)."""
+        await get_limiter(PROVIDER).acquire()
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.get(
                 url, headers=self._auth_headers(), follow_redirects=True

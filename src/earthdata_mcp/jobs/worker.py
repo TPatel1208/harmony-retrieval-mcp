@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 from arq.connections import RedisSettings
 
@@ -231,17 +232,34 @@ def _apply_poll(job: Job, status: object) -> str | None:
 
 
 async def _provider_for(spec: dict):
-    """Rebuild the retrieval provider from a durable spec.
+    """Rebuild the retrieval provider from a durable spec, keyed on ``provider``.
 
-    Only Harmony is wired in Phase 6.3. The provider is bound to the collection's
-    freshly-fetched capabilities so its ``find_service`` re-checks the matched
-    service rather than trusting the spec blindly.
+    The worker owns no provider state — it reconstructs the right provider on every
+    task from ``request_spec["provider"]`` (the path the router chose at planning
+    time), bound to the collection's **freshly-fetched** capabilities so
+    ``find_service`` re-checks the matched service rather than trusting the spec
+    blindly. This is the single switch that decides which provider drives
+    submit→poll→materialize for a given job (Harmony, AppEEARS point→Parquet, or
+    OPeNDAP DAP4 subset). An unknown provider fails loud — we never silently fall
+    back to Harmony for a job another provider planned.
     """
+    from earthdata_mcp.providers.appeears import AppEEARSProvider
     from earthdata_mcp.providers.cmr import CMRProvider
     from earthdata_mcp.providers.harmony import HarmonyProvider
+    from earthdata_mcp.providers.opendap import OPeNDAPProvider
 
+    provider = spec.get("provider", "harmony")
     caps = await CMRProvider().collection_capabilities(spec["concept_id"])
-    return HarmonyProvider(caps)
+    if provider == "harmony":
+        return HarmonyProvider(caps)
+    if provider == "appeears":
+        # AppEEARS builds its point-task body from the plan alone (no granule URL).
+        return AppEEARSProvider(caps)
+    if provider == "opendap":
+        # The granule's OPeNDAP URL is discovered at planning time; carried on the
+        # spec when present (OPeNDAP routing is still dormant — router.py step 3).
+        return OPeNDAPProvider(caps, opendap_url=spec.get("opendap_url"))
+    raise ValueError(f"no retrieval provider for spec provider {provider!r}")
 
 
 def _plan_from_spec(spec: dict) -> RetrievalPlan:
@@ -254,6 +272,8 @@ def _plan_from_spec(spec: dict) -> RetrievalPlan:
         needs_bbox=bool(spec.get("needs_bbox")),
         needs_variable=bool(spec.get("needs_variable")),
         needs_temporal=bool(spec.get("needs_temporal")),
+        # Carried so a resumed AppEEARS job rebuilds a plan its provider can_handle.
+        needs_point_sample=bool(spec.get("needs_point_sample")),
         concept_id=spec.get("concept_id"),
         short_name=spec.get("short_name"),
         aoi=AOI(bbox=tuple(bbox)) if bbox else None,
@@ -267,15 +287,18 @@ def _plan_from_spec(spec: dict) -> RetrievalPlan:
 
 
 def _job_id_from_url(url: str | None) -> str | None:
-    """Recover a Harmony job id from its status URL (``…/jobs/<id>``).
+    """Recover a Harmony job id from its status URL (``…/jobs/<id>?linktype=…``).
 
     The durable row stores only ``provider_job_url`` (the spec'd column set has no
     ``provider_job_id``), so on a resumed poll we recover the id from the URL's
-    last path segment.
+    last *path* segment. We parse the path explicitly so a trailing query string
+    (harmony-py appends ``?linktype=…``) or fragment never leaks into the id —
+    passing ``<uuid>?linktype=https`` to ``client.status`` makes Harmony reject it.
     """
     if not url:
         return None
-    return url.rstrip("/").rsplit("/", 1)[-1]
+    path = urlsplit(url).path
+    return path.rstrip("/").rsplit("/", 1)[-1] or None
 
 
 class WorkerSettings:

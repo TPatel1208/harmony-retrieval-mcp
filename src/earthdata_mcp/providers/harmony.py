@@ -41,6 +41,7 @@ from earthdata_mcp.providers.base import (
     MaterializedResult,
     RetrievalPlan,
 )
+from earthdata_mcp.providers.ratelimit import get_limiter
 from earthdata_mcp.storage.backend import StorageBackend
 from earthdata_mcp.storage.local import LocalFilesystemBackend
 
@@ -109,6 +110,7 @@ class HarmonyProvider:
             )
         request = self._build_request(plan, svc)
         client = self._client()
+        await get_limiter("harmony").acquire()
         job_id = await asyncio.to_thread(client.submit, request)
         logger.info(
             "Harmony job submitted: service=%s job_id=%s", svc.service_name, job_id
@@ -123,6 +125,7 @@ class HarmonyProvider:
     async def poll(self, job: JobRef) -> JobStatus:
         """One status check (the durable worker drives the loop, PLAN.md §4.3)."""
         client = self._client()
+        await get_limiter("harmony").acquire()
         raw = await asyncio.to_thread(client.status, job.provider_job_id)
         status = self._to_job_status(raw)
         if self._on_progress is not None:

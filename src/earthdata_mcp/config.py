@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     edl_password: str = ""
     earthdata_token: str = ""
 
+    # Per-provider rate limiting (Phase 8 hardening, §8) ------------------
+    # Token-bucket refill rate in requests/sec at each provider's HTTP boundary.
+    # Generous by default so normal traffic is never delayed — a backstop against
+    # a runaway poll loop, not a throttle on ordinary use.
+    cmr_rate_per_sec: float = 20.0
+    harmony_rate_per_sec: float = 10.0
+    appeears_rate_per_sec: float = 10.0
+    opendap_rate_per_sec: float = 10.0
+
     # Logging --------------------------------------------------------------
     log_level: str = "INFO"
 
