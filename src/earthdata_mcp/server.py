@@ -3,8 +3,11 @@
 Phase 5 registered the two handle-minting discovery tools (``search_datasets`` +
 ``describe_dataset``); Phase 6.1–6.2 added the area + coverage surface; Phase 6.3
 adds the durable retrieval tools (``retrieve_data``/``retrieve_subset``/
-``retrieve_timeseries``/``get_retrieval_status``/``cancel_retrieval``). The rest
-arrives in its respective phase. Importing this module must have no DB, network,
+``retrieve_timeseries``/``get_retrieval_status``/``cancel_retrieval``); Phase 7.1–7.2
+adds the preview tools (``preview_dataset``/``summarize_dataset``/
+``inspect_statistics``) and the transform tools (``subset``/``reproject``/
+``resample``/``convert_format``/``align``). The rest arrives in its respective
+phase. Importing this module must have no DB, network,
 or credential side effects — the tools build their dependencies lazily, on first
 call, never at import.
 """
@@ -15,7 +18,15 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from earthdata_mcp.tools import area, coverage, discovery, retrieval, understanding
+from earthdata_mcp.tools import (
+    area,
+    coverage,
+    discovery,
+    preview,
+    retrieval,
+    transform,
+    understanding,
+)
 
 mcp = FastMCP("earthdata-mcp")
 
@@ -186,6 +197,100 @@ async def cancel_retrieval(
 ) -> dict:
     """Cancel a non-terminal retrieval job (illegal once it is already terminal)."""
     return await retrieval.cancel_retrieval(job_handle, workspace_id)
+
+
+@mcp.tool
+async def preview_dataset(
+    dataset_handle: str,
+    time_range: str | None = None,
+    aoi_handle: str | None = None,
+    layer: str | None = None,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+) -> dict:
+    """Build a GIBS visual preview reference for a dataset; mint a ``preview_`` handle.
+
+    Returns ``{handle, gibs_url, layer, bbox, time, format}``. No network call is
+    made — ``gibs_url`` is a request the agent or a browser can fetch.
+    """
+    return await preview.preview_dataset(
+        dataset_handle, time_range, aoi_handle, layer, workspace_id
+    )
+
+
+@mcp.tool
+async def summarize_dataset(
+    handle: str,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+) -> dict:
+    """Structural summary of a ``dataset_`` (metadata) or materialized ``obs_``/``cube_``."""
+    return await preview.summarize_dataset(handle, workspace_id)
+
+
+@mcp.tool
+async def inspect_statistics(
+    handle: str,
+    variables: list[str] | None = None,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+) -> dict:
+    """Descriptive per-variable statistics (min/max/mean/std/count) over a result."""
+    return await preview.inspect_statistics(handle, variables, workspace_id)
+
+
+@mcp.tool
+async def subset(
+    source_handle: str,
+    aoi_handle: str | None = None,
+    variables: list[str] | None = None,
+    time_range: str | None = None,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+) -> dict:
+    """Spatial/variable/temporal subset of a materialized result → a ``cube_`` handle."""
+    return await transform.subset(
+        source_handle, aoi_handle, variables, time_range, workspace_id
+    )
+
+
+@mcp.tool
+async def reproject(
+    source_handle: str,
+    crs: str,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+) -> dict:
+    """Tag a gridded result with a target CRS → a ``cube_`` handle."""
+    return await transform.reproject(source_handle, crs, workspace_id)
+
+
+@mcp.tool
+async def resample(
+    source_handle: str,
+    time_freq: str | None = None,
+    spatial_factor: int | None = None,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+) -> dict:
+    """Temporal and/or spatial resampling of a gridded result → a ``cube_`` handle."""
+    return await transform.resample(
+        source_handle, time_freq, spatial_factor, workspace_id
+    )
+
+
+@mcp.tool
+async def convert_format(
+    source_handle: str,
+    output_format: str,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+) -> dict:
+    """Re-serialize a materialized result to a different media type → a ``cube_`` handle."""
+    return await transform.convert_format(source_handle, output_format, workspace_id)
+
+
+@mcp.tool
+async def align(
+    source_handles: list[str],
+    method: str = "outer",
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+) -> dict:
+    """Align ≥2 gridded results to a common grid → a ``cube_`` handle + alignment report."""
+    return await transform.align(source_handles, method, workspace_id)
 
 
 def main() -> None:
