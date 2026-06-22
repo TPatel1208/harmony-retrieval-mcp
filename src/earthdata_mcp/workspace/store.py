@@ -116,6 +116,11 @@ class WorkspaceStore:
             # Reassign a new dict so SQLAlchemy detects the JSONB change.
             row.payload = {**(row.payload or {}), **payload}
             await session.commit()
+            # ``updated_at`` carries ``onupdate=func.now()``, so the flush expires it
+            # (the server computes the new value) regardless of ``expire_on_commit``.
+            # Refresh here, inside the async context, so building the detached record
+            # below never triggers a sync lazy-load (which raises ``MissingGreenlet``).
+            await session.refresh(row)
             return _to_record(row)
 
     async def list_handles(
