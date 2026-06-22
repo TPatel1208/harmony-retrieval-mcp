@@ -267,6 +267,6 @@ CLAUDE.md              contributor hard rules
 
 ## License
 
-See repository for licensing. This is a NASA-funded OSS effort intended to be
+See repository for licensing. This is a research-project effort intended to be
 maintainable by engineers who did not write it; please keep the hard rules in
 [`CLAUDE.md`](CLAUDE.md) intact.

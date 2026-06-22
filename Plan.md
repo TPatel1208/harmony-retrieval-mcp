@@ -13,7 +13,7 @@ the review found:
 3. The async job model — the real operational core — was hand-waved, and the
    effort estimate (~7 days) was off by a large multiple.
 
-This plan is written for a **NASA-funded OSS server that must survive 5+ years
+This plan is written for a **research-project server that must survive 5+ years
 in the hands of engineers who did not write it.** Every "clever" shortcut that
 trades long-term maintainability for short-term speed has been removed.
 
