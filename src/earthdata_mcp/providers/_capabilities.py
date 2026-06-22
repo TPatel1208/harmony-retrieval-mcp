@@ -22,6 +22,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+# RetrievalPlan's canonical home is providers/base.py (Phase 4 owns it); we
+# re-export it here so the gate's `find_service` and existing imports keep
+# resolving `from ..._capabilities import RetrievalPlan`. The Phase-2 docstring
+# promised this reconciliation. `_capabilities` -> `base` is acyclic.
+from earthdata_mcp.providers.base import RetrievalPlan
+
+__all__ = [
+    "S3DirectAccess",
+    "ServiceCapability",
+    "RetrievalPlan",
+    "CollectionCapabilities",
+    "parse_service_capabilities",
+    "umm_c_layer",
+]
+
 
 @dataclass(frozen=True)
 class S3DirectAccess:
@@ -46,23 +61,6 @@ class ServiceCapability:
     concatenate: bool = False
     reproject: bool = False
     output_formats: frozenset[str] = frozenset()
-
-
-@dataclass(frozen=True)
-class RetrievalPlan:
-    """What a retrieval needs, used to gate against a single service.
-
-    Phase 4 owns the canonical ``RetrievalPlan`` in ``providers/base.py``; this is
-    the minimal version the capability gate needs and is reconciled there.
-    """
-
-    output_format: str
-    needs_bbox: bool = False
-    needs_variable: bool = False
-    needs_temporal: bool = False
-    needs_shape: bool = False
-    needs_dimension: bool = False
-    needs_reproject: bool = False
 
 
 @dataclass

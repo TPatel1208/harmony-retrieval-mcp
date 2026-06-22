@@ -25,6 +25,7 @@ from tenacity import (
 
 from earthdata_mcp.config import Settings, get_settings
 from earthdata_mcp.providers._capabilities import CollectionCapabilities
+from earthdata_mcp.providers.base import ProviderCapabilities
 
 # UMM-JSON endpoints (docs/cmr_patterns.md). All five search tools hit the
 # ``.umm_json`` variants so the response carries typed ``umm`` + CMR ``meta``.
@@ -71,6 +72,17 @@ class CMRProvider:
         self._cmr_base = self._settings.cmr_url.rstrip("/")
         self._harmony_base = self._settings.harmony_url.rstrip("/")
         self._headers = {"Client-Id": self._settings.cmr_client_id}
+
+    def capabilities(self) -> ProviderCapabilities:
+        """CMR is a **metadata-only** provider — it mints no retrieval formats.
+
+        Declaring this (rather than leaving it implicit) is what lets
+        ``CMRProvider`` satisfy :class:`~earthdata_mcp.providers.base.MetadataProvider`
+        without a single throwing stub.
+        """
+        return ProviderCapabilities(
+            name="cmr", kind="metadata", output_formats=frozenset()
+        )
 
     # -- HTTP -------------------------------------------------------------
 

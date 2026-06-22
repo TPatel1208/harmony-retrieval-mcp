@@ -18,6 +18,19 @@ from earthdata_mcp.workspace import (
 )
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the ``live`` marker here too.
+
+    It is declared canonically in ``pyproject.toml``, but that file is baked into
+    the dev image (only ``src``/``tests`` are bind-mounted), so registering it in
+    this mounted conftest keeps ``-m live`` warning-free without an image rebuild.
+    """
+    config.addinivalue_line(
+        "markers",
+        "live: needs real Earthdata Login credentials / network (run on demand, nightly CI)",
+    )
+
+
 @pytest.fixture
 def local_settings(tmp_path: Path) -> Settings:
     """Settings pointing the local storage backend at an isolated tmp dir."""
