@@ -196,5 +196,62 @@ async def test_get_citations_graceful_when_collection_missing(
     }
 
 
+async def test_harmony_capabilities_5xx_returns_empty_dict(
+    httpx_mock, provider: CMRProvider
+) -> None:
+    """A Harmony /capabilities 500 must not crash collection_capabilities.
+
+    Harmony returns 500 when a collection has bogus service associations pointing
+    at a non-existent provider (e.g. XYZ_PROV). The fix catches RetryableError
+    and returns {} so the router can decide from an empty services list.
+    """
+    # CMR collection fetch (needed by collection_capabilities)
+    httpx_mock.add_response(
+        json={
+            "items": [
+                {
+                    "meta": {"concept-id": "C1-X", "provider-id": "X", "associations": {}},
+                    "umm": {"ShortName": "TEMPO_NO2_L3", "ProcessingLevel": {"Id": "3"}},
+                }
+            ]
+        }
+    )
+    # Harmony /capabilities returns 500 four times (retried then re-raised).
+    # No url= filter: pytest-httpx exact-matches including query params, so
+    # collectionid=C1-X&format=json would break it — consume in order instead.
+    for _ in range(4):
+        httpx_mock.add_response(
+            status_code=500,
+            json={"code": "harmony.ServerError", "description": "Error: Internal server error"},
+        )
+    caps = await provider.collection_capabilities("C1-X")
+    # Must not raise; services list is empty.
+    assert caps.services == []
+    assert caps.concept_id == "C1-X"
+
+
+async def test_harmony_capabilities_4xx_returns_empty_dict(
+    httpx_mock, provider: CMRProvider
+) -> None:
+    """A Harmony /capabilities 404 (collection unknown to Harmony) must also return {}."""
+    httpx_mock.add_response(
+        json={
+            "items": [
+                {
+                    "meta": {"concept-id": "C2-X", "provider-id": "X", "associations": {}},
+                    "umm": {"ShortName": "UNKNOWN_COL", "ProcessingLevel": {"Id": "3"}},
+                }
+            ]
+        }
+    )
+    # No url= filter for same reason as the 5xx test above.
+    httpx_mock.add_response(
+        status_code=404,
+        json={"code": "harmony.collectionNotFound"},
+    )
+    caps = await provider.collection_capabilities("C2-X")
+    assert caps.services == []
+
+
 def test_providers_package_importable() -> None:
     assert providers.__doc__  # sanity: package docstring intact

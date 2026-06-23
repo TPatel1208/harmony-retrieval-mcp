@@ -64,6 +64,8 @@ class OPeNDAPProvider:
         capabilities: CollectionCapabilities,
         *,
         opendap_url: str | None = None,
+        coord_lat: str = "lat",
+        coord_lon: str = "lon",
         storage: StorageBackend | None = None,
         settings: Settings | None = None,
         timeout: float = 300.0,
@@ -72,6 +74,11 @@ class OPeNDAPProvider:
         # The granule's OPeNDAP base URL (sans the .dap.nc4 suffix). In production
         # this comes from the granule RelatedUrls; injected directly in tests.
         self._opendap_url = opendap_url.rstrip("/") if opendap_url else None
+        # Coordinate variable names vary by collection (GLDAS uses "lat"/"lon";
+        # TEMPO uses "latitude"/"longitude"). Discovered from CMR UMM-V at planning
+        # time and injected here so the CE uses the correct names.
+        self._coord_lat = coord_lat
+        self._coord_lon = coord_lon
         self._storage = storage
         self._settings = settings or get_settings()
         self._timeout = timeout
@@ -151,7 +158,7 @@ class OPeNDAPProvider:
         spatial/temporal coordinate variables they need), so only the requested
         subset crosses the wire — the whole point of an OPeNDAP fetch.
         """
-        ce = _constraint_expression(plan)
+        ce = _constraint_expression(plan, coord_lat=self._coord_lat, coord_lon=self._coord_lon)
         url = f"{self._opendap_url}{_DAP4_SUFFIX}"
         if ce:
             url = f"{url}?dap4.ce={quote(ce, safe='')}"
@@ -182,13 +189,27 @@ class OPeNDAPProvider:
 # -- helpers ---------------------------------------------------------------
 
 
-def _constraint_expression(plan: RetrievalPlan) -> str:
-    """Build a DAP4 projection CE from the plan's variables + needed coordinates."""
+def _constraint_expression(
+    plan: RetrievalPlan,
+    *,
+    coord_lat: str = "lat",
+    coord_lon: str = "lon",
+) -> str:
+    """Build a DAP4 projection CE from the plan's variables + coordinate variables.
+
+    ``coord_lat`` and ``coord_lon`` are the actual variable names in this
+    collection's netCDF files — they vary (``lat``/``lon`` for GLDAS;
+    ``latitude``/``longitude`` for TEMPO L3; ``Latitude``/``Longitude`` for
+    GES DISC monthly products).
+
+    ``/time`` is intentionally omitted: temporal filtering happens at the CMR
+    granule-search level (selecting which files to fetch), not within a file via
+    DAP4 CE. Many L3 monthly products have no ``time`` variable at all (time is
+    encoded in the filename), so projecting it causes a 400 from Hyrax.
+    """
     projected: list[str] = []
-    if plan.needs_temporal:
-        projected.append("/time")
     if plan.needs_bbox:
-        projected.extend(["/lat", "/lon"])
+        projected.extend([f"/{coord_lat}", f"/{coord_lon}"])
     if plan.transform is not None:
         projected.extend(f"/{v}" for v in plan.transform.variables)
     # Preserve order while dropping duplicate coordinate projections.

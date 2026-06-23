@@ -139,10 +139,12 @@ async def test_submit_builds_dap4_url_with_projected_variables() -> None:
     assert ref.provider_job_url.startswith(OPENDAP_URL + ".dap.nc4?dap4.ce=")
 
     # The constraint expression projects the requested variable + needed coords.
+    # /time is NOT projected — temporal filtering is at CMR granule-search level;
+    # many L3 files have no time variable at all (time is in the filename).
     ce = unquote(ref.provider_job_url.split("dap4.ce=", 1)[1])
     assert "/precipitation" in ce
     assert "/lat" in ce and "/lon" in ce  # needs_bbox
-    assert "/time" in ce  # needs_temporal
+    assert "/time" not in ce
 
 
 @pytest.mark.asyncio

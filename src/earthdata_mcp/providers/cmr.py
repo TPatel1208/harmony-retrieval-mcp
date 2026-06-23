@@ -358,13 +358,25 @@ class CMRProvider:
         return caps
 
     async def _fetch_harmony_capabilities(self, concept_id: str) -> dict:
-        """Fetch Harmony's ``/capabilities`` JSON (public; empty dict if 4xx/none)."""
+        """Fetch Harmony's ``/capabilities`` JSON (Bearer-authenticated; empty dict if 4xx/none).
+
+        Harmony redirects unauthenticated requests to Earthdata Login (returns HTML
+        with status 200), so we must always send the Bearer token.
+        """
         url = f"{self._harmony_base}/capabilities"
         params = {"collectionid": concept_id, "format": "json"}
+        headers: dict[str, str] = {}
+        token = self._settings.earthdata_token
+        if token:
+            headers["Authorization"] = f"Bearer {token.strip()}"
         try:
-            response = await self._request("GET", url, params=params, timeout=30.0)
-        except CMRError:
-            # Collection has no Harmony service / not known to Harmony.
+            response = await self._request("GET", url, params=params, headers=headers, timeout=30.0)
+        except (CMRError, RetryableError, httpx.TimeoutException):
+            # 4xx → collection unknown to Harmony; 5xx → Harmony itself is broken
+            # (e.g. CMR has bogus service associations pointing at a non-existent
+            # provider like XYZ_PROV, causing Harmony to return 500 when it tries to
+            # resolve them). Timeout → Harmony unreachable. Either way: treat as
+            # "no capabilities available" and let the router decide.
             return {}
         try:
             return response.json()
