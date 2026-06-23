@@ -20,7 +20,7 @@ from earthdata_mcp.providers._capabilities import CollectionCapabilities
 from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.harmony import HarmonyProvider
 from earthdata_mcp.providers.opendap import OPeNDAPProvider
-from earthdata_mcp.jobs.worker import _job_id_from_url, _provider_for
+from earthdata_mcp.jobs.worker import _job_id_from_url, _plan_from_spec, _provider_for
 
 
 def _caps() -> CollectionCapabilities:
@@ -92,3 +92,13 @@ def test_job_id_from_url_plain_path() -> None:
 
 def test_job_id_from_url_none() -> None:
     assert _job_id_from_url(None) is None
+
+
+# -- _plan_from_spec: tolerates missing optional fields ---------------------
+
+
+def test_plan_from_spec_tolerates_missing_output_format() -> None:
+    """Old specs without output_format must not KeyError; default to netcdf4."""
+    spec = {"concept_id": "C1-X", "provider": "harmony"}
+    plan = _plan_from_spec(spec)
+    assert plan.output_format == "application/netcdf4"

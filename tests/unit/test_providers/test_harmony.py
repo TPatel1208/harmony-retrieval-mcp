@@ -32,6 +32,8 @@ _FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
 
 SUBSETTER = "l2-subsetter-batchee-stitchee-concise"
 IMAGENATOR = "asdc/imagenator_l2"
+# Reusable placeholder UUID for tests that just need a structurally valid job ID.
+_VALID_UUID = "550e8400-e29b-41d4-a716-446655440000"
 
 
 @pytest.fixture
@@ -129,6 +131,50 @@ async def test_submit_raises_when_no_service_satisfies(l2_caps) -> None:
         await p.submit(plan)
 
 
+@pytest.mark.asyncio
+async def test_harmony_submit_uses_hint_when_caps_empty() -> None:
+    """When caps.services is empty (failed fetch) and hint is set, synthesize and submit."""
+    from earthdata_mcp.providers._capabilities import CollectionCapabilities
+
+    empty_caps = CollectionCapabilities(
+        concept_id="C2-TEST",
+        short_name="TEST",
+        processing_level="3",
+        output_shape="swath",
+        native_formats=frozenset(),
+        direct_s3=None,
+        services=[],
+    )
+    client = MagicMock()
+    client.submit.return_value = "job-xyz"
+    p = _provider(empty_caps, client=client, service_name_hint="my-service")
+    plan = RetrievalPlan(output_format="application/netcdf4", concept_id="C2-TEST")
+    ref = await p.submit(plan)
+
+    assert ref.provider_job_id == "job-xyz"
+    request = client.submit.call_args.args[0]
+    assert request.service_id == "my-service"
+
+
+@pytest.mark.asyncio
+async def test_harmony_submit_still_raises_when_caps_present_but_no_service_satisfies(
+    l2_caps,
+) -> None:
+    """Union-trap: caps non-empty but no service satisfies — hint must not bypass."""
+    p = _provider(l2_caps, client=MagicMock(), service_name_hint=SUBSETTER)
+    plan = RetrievalPlan(output_format="image/png", needs_bbox=True)  # union trap
+    with pytest.raises(ValueError):
+        await p.submit(plan)
+
+
+@pytest.mark.asyncio
+async def test_harmony_poll_rejects_non_uuid_job_id(l2_caps) -> None:
+    p = _provider(l2_caps, client=MagicMock())
+    for bad_id in ("abc", "None"):
+        with pytest.raises(ValueError, match="expected UUID"):
+            await p.poll(JobRef(provider="harmony", provider_job_id=bad_id))
+
+
 # -- poll: Harmony status -> JobState --------------------------------------
 
 
@@ -157,7 +203,7 @@ async def test_poll_maps_status(l2_caps, harmony_status, expected) -> None:
         "data_expiration": expires,
     }
     p = _provider(l2_caps, client=client)
-    status = await p.poll(JobRef(provider="harmony", provider_job_id="j"))
+    status = await p.poll(JobRef(provider="harmony", provider_job_id=_VALID_UUID))
     assert status.state is expected
     assert status.progress == 42
     assert status.output_expires_at == expires
@@ -173,7 +219,7 @@ async def test_poll_failed_surfaces_error(l2_caps) -> None:
         "errors": ["service exploded"],
     }
     p = _provider(l2_caps, client=client)
-    status = await p.poll(JobRef(provider="harmony", provider_job_id="j"))
+    status = await p.poll(JobRef(provider="harmony", provider_job_id=_VALID_UUID))
     assert status.state is JobState.FAILED
     assert "service exploded" in status.error
 
@@ -184,7 +230,7 @@ async def test_poll_invokes_on_progress(l2_caps) -> None:
     client = MagicMock()
     client.status.return_value = {"status": "running", "progress": 10, "message": "m"}
     p = _provider(l2_caps, client=client, on_progress=seen.append)
-    status = await p.poll(JobRef(provider="harmony", provider_job_id="j"))
+    status = await p.poll(JobRef(provider="harmony", provider_job_id=_VALID_UUID))
     assert seen == [status]
     assert seen[0].progress == 10
 
@@ -209,7 +255,7 @@ async def test_materialize_persists_result_to_storage(
 
     p = _provider(l2_caps, client=client, storage=local_backend)
     result = await p.materialize(
-        JobRef(provider="harmony", provider_job_id="job-9", job_handle="job_abc")
+        JobRef(provider="harmony", provider_job_id=_VALID_UUID, job_handle="job_abc")
     )
 
     assert result.size_bytes == len(payload)

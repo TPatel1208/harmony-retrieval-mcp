@@ -251,7 +251,7 @@ async def _provider_for(spec: dict):
     provider = spec.get("provider", "harmony")
     caps = await CMRProvider().collection_capabilities(spec["concept_id"])
     if provider == "harmony":
-        return HarmonyProvider(caps)
+        return HarmonyProvider(caps, service_name_hint=spec.get("service_name"))
     if provider == "appeears":
         # AppEEARS builds its point-task body from the plan alone (no granule URL).
         return AppEEARSProvider(caps)
@@ -266,7 +266,7 @@ def _plan_from_spec(spec: dict) -> RetrievalPlan:
     """Reconstruct the :class:`RetrievalPlan` from a durable request spec."""
     bbox = spec.get("aoi_bbox")
     variables = tuple(spec.get("variables") or ())
-    fmt = spec["output_format"]
+    fmt = spec.get("output_format") or "application/netcdf4"
     return RetrievalPlan(
         output_format=fmt,
         needs_bbox=bool(spec.get("needs_bbox")),

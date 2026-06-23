@@ -105,6 +105,11 @@ class AppEEARSProvider:
                 "AppEEARSProvider only handles point/area sample plans "
                 "(needs_point_sample); the router must not dispatch this here"
             )
+        if not self._settings.earthdata_token:
+            raise ValueError(
+                "AppEEARS submission requires earthdata_token in settings; "
+                "set EARTHDATA_TOKEN environment variable"
+            )
         body = self._build_task(plan)
         await get_limiter(PROVIDER).acquire()
         async with httpx.AsyncClient(timeout=self._timeout) as client:
