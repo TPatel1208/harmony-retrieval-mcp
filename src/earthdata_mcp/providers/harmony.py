@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
+import re
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -52,6 +53,11 @@ logger = logging.getLogger(__name__)
 
 PROVIDER = "harmony"
 
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
 # Harmony job status string -> our durable JobState (PLAN.md §4.3 state machine).
 _STATUS_MAP: dict[str, JobState] = {
     "accepted": JobState.SUBMITTED,
@@ -73,6 +79,7 @@ class HarmonyProvider:
         self,
         capabilities: CollectionCapabilities,
         *,
+        service_name_hint: str | None = None,
         client: "harmony.Client | None" = None,
         auth: EDLAuth | None = None,
         storage: StorageBackend | None = None,
@@ -81,6 +88,7 @@ class HarmonyProvider:
         on_progress: Callable[[JobStatus], None] | None = None,
     ) -> None:
         self._caps = capabilities
+        self._service_name_hint = service_name_hint
         self._injected_client = client
         self._auth = auth
         self._settings = settings or get_settings()
@@ -103,6 +111,13 @@ class HarmonyProvider:
         request no single service can satisfy (the union trap, PLAN.md §4.2).
         """
         svc = self._caps.find_service(plan)
+        if svc is None and self._service_name_hint and not self._caps.services:
+            logger.warning(
+                "Harmony capabilities unavailable for %s; using stored service %s",
+                plan.concept_id,
+                self._service_name_hint,
+            )
+            svc = ServiceCapability(service_name=self._service_name_hint, concept_id="")
         if svc is None:
             raise ValueError(
                 "no single Harmony service satisfies this plan — the router must "
@@ -124,6 +139,11 @@ class HarmonyProvider:
 
     async def poll(self, job: JobRef) -> JobStatus:
         """One status check (the durable worker drives the loop, PLAN.md §4.3)."""
+        if not job.provider_job_id or not _UUID_RE.match(job.provider_job_id):
+            raise ValueError(
+                f"invalid Harmony job ID {job.provider_job_id!r}: expected UUID; "
+                "job was likely created by a test fixture"
+            )
         client = self._client()
         await get_limiter("harmony").acquire()
         raw = await asyncio.to_thread(client.status, job.provider_job_id)
@@ -241,6 +261,11 @@ class HarmonyProvider:
     @staticmethod
     def _download_first(client: "harmony.Client", job: JobRef) -> tuple[str, bytes]:
         """Download the job's result files; return (filename, bytes) of the first."""
+        if not job.provider_job_id or not _UUID_RE.match(job.provider_job_id):
+            raise ValueError(
+                f"invalid Harmony job ID {job.provider_job_id!r}: expected UUID; "
+                "job was likely created by a test fixture"
+            )
         with tempfile.TemporaryDirectory() as tmp:
             futures = list(
                 client.download_all(job.provider_job_id, directory=tmp, overwrite=True)

@@ -126,6 +126,15 @@ async def test_submit_raises_for_non_point_plan() -> None:
         await _provider().submit(_point_plan(needs_point_sample=False))
 
 
+@pytest.mark.asyncio
+async def test_appeears_submit_raises_on_missing_token() -> None:
+    """Missing earthdata_token must fail fast with a clear message, not a 403."""
+    no_token = Settings(_env_file=None, appeears_url=BASE, earthdata_token="")
+    p = AppEEARSProvider(_caps(), settings=no_token)
+    with pytest.raises(ValueError, match="earthdata_token"):
+        await p.submit(_point_plan())
+
+
 # -- poll: AppEEARS status -> JobState -------------------------------------
 
 
