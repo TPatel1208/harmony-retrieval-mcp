@@ -28,6 +28,10 @@ from earthdata_mcp.workspace.models import (
 # staged-output URL are rejected at record time so the rule can't be bypassed.
 _URL_PREFIXES = ("http://", "https://", "s3://", "gs://")
 
+# Keys that may legitimately hold durable (re-materializable) URLs — OPeNDAP
+# granule endpoints are permanent CMR-resolvable references, not staged outputs.
+_DURABLE_URL_KEYS: frozenset[str] = frozenset({"opendap_url"})
+
 # Walk ancestors target -> source. MIN(depth) collapses diamonds; the depth guard
 # makes an accidental cycle terminate. Workspace-scoped at both levels.
 _ANCESTRY_SQL = text(
@@ -227,7 +231,9 @@ def _reject_url_spec(request_spec: dict | None) -> None:
     """
     if not request_spec:
         return
-    for value in request_spec.values():
+    for key, value in request_spec.items():
+        if key in _DURABLE_URL_KEYS:
+            continue
         if isinstance(value, str) and value.lower().startswith(_URL_PREFIXES):
             raise ProvenanceError(
                 "request_spec must be re-materializable, not a staged-output URL"

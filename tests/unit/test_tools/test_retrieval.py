@@ -85,13 +85,61 @@ def _no_service_caps() -> CollectionCapabilities:
     )
 
 
+def _grid_no_service_caps() -> CollectionCapabilities:
+    """A gridded L3 collection with no Harmony services — OPeNDAP is the only path."""
+    return CollectionCapabilities(
+        concept_id=_CONCEPT_ID,
+        short_name="TEMPO_NO2_L3",
+        processing_level="3",
+        output_shape="grid",
+        native_formats=frozenset(),
+        direct_s3=None,
+        services=[],
+        capabilities_version="",
+        advisory=[],
+    )
+
+
 def _make_cmr(caps: CollectionCapabilities) -> CMRProvider:
     """A ``CMRProvider`` whose ``collection_capabilities`` returns ``caps``.
 
     Built with ``__new__`` so no real ``__init__`` (settings/HTTP) runs.
+    ``search_granules`` returns [] by default so OPeNDAP discovery is a no-op.
     """
     cmr = CMRProvider.__new__(CMRProvider)
     cmr.collection_capabilities = AsyncMock(return_value=caps)
+    cmr.search_granules = AsyncMock(return_value=[])
+    return cmr
+
+
+_OPENDAP_URL = (
+    "https://opendap.earthdata.nasa.gov/collections/C1234567890-LPCLOUD"
+    "/granules/TEMPO_NO2_L3_V04_20260616T102844Z_S001.nc"
+)
+
+
+def _make_cmr_with_opendap_granule(caps: CollectionCapabilities) -> CMRProvider:
+    """CMR mock that also returns one granule advertising an OPeNDAP URL.
+
+    ``get_variables`` returns [] so coordinate discovery falls back to the
+    ("lat", "lon") default — adequate for route/spec assertions.
+    """
+    cmr = CMRProvider.__new__(CMRProvider)
+    cmr.collection_capabilities = AsyncMock(return_value=caps)
+    cmr.search_granules = AsyncMock(
+        return_value=[
+            {
+                "related_urls": [
+                    {
+                        "URL": _OPENDAP_URL,
+                        "Type": "USE SERVICE API",
+                        "Subtype": "OPENDAP DATA",
+                    }
+                ]
+            }
+        ]
+    )
+    cmr.get_variables = AsyncMock(return_value=[])
     return cmr
 
 
@@ -237,6 +285,60 @@ async def test_retrieve_data_not_retrievable_raises(
         )
     # Failed at planning time → nothing enqueued, no orphan job.
     mock_enqueue.assert_not_awaited()
+
+
+async def test_retrieve_data_routes_to_opendap_when_no_harmony_services(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """When caps.services == [] but a granule has an OPeNDAP URL, route to opendap.
+
+    This is the TEMPO_NO2_L3 case: Harmony has bogus XYZ_PROV service associations
+    that make its /capabilities return 500, leaving services=[]. OPeNDAP is the
+    only viable transform path and must be auto-wired (router step 3, PLAN.md §4.2).
+    """
+    cmr = _make_cmr_with_opendap_granule(_grid_no_service_caps())
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        cmr=cmr, store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=mock_enqueue,
+    )
+
+    assert out["provider"] == "opendap"
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    spec = job.request_spec
+    assert spec["provider"] == "opendap"
+    assert spec["opendap_url"] == _OPENDAP_URL
+
+
+async def test_retrieve_data_format_defaults_to_netcdf_when_opendap_only(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """Format defaults to netCDF-4 (not Zarr) when OPeNDAP is the only path.
+
+    Zarr is Harmony-specific; OPeNDAP always returns netCDF. When caps.services
+    is empty and OPeNDAP is discovered, the format must be netCDF so
+    OPeNDAPProvider.can_handle returns True (it gates on _is_netcdf).
+    """
+    cmr = _make_cmr_with_opendap_granule(_grid_no_service_caps())
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id, output_format=None,
+        cmr=cmr, store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=mock_enqueue,
+    )
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    spec = job.request_spec
+    assert spec["output_format"] == "application/netcdf4"
+    assert spec["output_shape"] == "grid"
+    assert spec["provider"] == "opendap"
 
 
 # -- retrieve_subset -------------------------------------------------------

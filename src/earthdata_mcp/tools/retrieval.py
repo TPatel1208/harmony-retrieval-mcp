@@ -34,6 +34,7 @@ from earthdata_mcp.providers._capabilities import CollectionCapabilities
 from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, TransformSpec
 from earthdata_mcp.providers.cmr import CMRProvider
+from earthdata_mcp.providers.opendap import OPeNDAPProvider
 from earthdata_mcp.providers.router import Router, RoutingDecision
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.models import HandleType, handle_type_of
@@ -310,12 +311,28 @@ async def _submit_retrieval(
     )
 
     caps = await cmr.collection_capabilities(concept_id)
-    # A point sample is tabular wherever the collection's grid lives: default to
-    # Parquet regardless of output_shape, never a Zarr cube (§4.4).
+
+    # Discover an OPeNDAP URL only when Harmony has no capable services — avoids
+    # an extra CMR granule search on the Harmony-serviced path (the common case).
+    opendap_url: str | None = None
+    if (
+        not needs_point_sample
+        and not caps.services
+        and caps.output_shape in ("grid", "swath")
+        and bbox is not None
+    ):
+        opendap_url = await _discover_opendap_url(cmr, concept_id, bbox, time_range)
+
+    # Format by shape; fall back to netCDF when no Harmony services are available
+    # and OPeNDAP is the only transform path (OPeNDAP returns netCDF, not Zarr).
     if needs_point_sample:
         fmt = output_format or _FORMAT_BY_SHAPE["point"]
+    elif output_format is not None:
+        fmt = output_format
+    elif caps.output_shape == "grid" and not caps.services and opendap_url:
+        fmt = _DEFAULT_FORMAT  # "application/netcdf4" — OPeNDAP produces netCDF, not Zarr
     else:
-        fmt = output_format or _FORMAT_BY_SHAPE.get(caps.output_shape, _DEFAULT_FORMAT)
+        fmt = _FORMAT_BY_SHAPE.get(caps.output_shape, _DEFAULT_FORMAT)
 
     plan = RetrievalPlan(
         output_format=fmt,
@@ -333,10 +350,18 @@ async def _submit_retrieval(
     )
 
     # Plan-time gate: raises NotRetrievable if no single service fits. No fallback.
-    # The AppEEARS provider is wired in so a point-sample plan routes to it (router
-    # step 0); its can_handle keys on needs_point_sample, so non-point plans are
-    # untouched.
-    decision = Router(caps, appeears=AppEEARSProvider(caps)).route(plan)
+    # OPeNDAP is wired when a granule URL was discovered (router step 3, PLAN.md §4.2).
+    # AppEEARS handles point-sample plans (step 0); OPeNDAP handles gridded/swath
+    # bbox+variable+temporal subsets when Harmony has no capable service (step 3).
+    coord_lat, coord_lon = "lat", "lon"
+    if opendap_url:
+        coord_lat, coord_lon = await _discover_coordinate_names(cmr, concept_id)
+    opendap_provider = (
+        OPeNDAPProvider(caps, opendap_url=opendap_url, coord_lat=coord_lat, coord_lon=coord_lon)
+        if opendap_url
+        else None
+    )
+    decision = Router(caps, appeears=AppEEARSProvider(caps), opendap=opendap_provider).route(plan)
     service_name = decision.service.service_name if decision.service else None
 
     # Mint the two handles, then persist the durable spec that ties them together.
@@ -364,6 +389,9 @@ async def _submit_retrieval(
         workspace_id=workspace_id,
         job_handle=job_handle,
         obs_handle=obs_handle,
+        opendap_url=opendap_url,
+        coord_lat=coord_lat if opendap_url else None,
+        coord_lon=coord_lon if opendap_url else None,
     )
 
     job_id = uuid4().hex
@@ -412,12 +440,17 @@ def _build_spec(
     workspace_id: str,
     job_handle: str,
     obs_handle: str,
+    opendap_url: str | None = None,
+    coord_lat: str | None = None,
+    coord_lon: str | None = None,
 ) -> dict:
     """Assemble the durable, re-materializable request spec stored in JSONB.
 
     Everything the worker needs to rebuild the plan and everything provenance
     needs to rebuild the result — and nothing ephemeral. No staged-output URL ever
     enters this dict (the provenance store rejects one if it slips in).
+    ``opendap_url`` is a durable granule endpoint (re-materializable on re-run),
+    not a staged output URL, so it is safe to persist here (PLAN.md §4.5).
     """
     return {
         "concept_id": concept_id,
@@ -433,6 +466,9 @@ def _build_spec(
         "variables": list(variables),
         "provider": decision.path,
         "service_name": service_name,
+        "opendap_url": opendap_url,
+        "coord_lat": coord_lat,
+        "coord_lon": coord_lon,
         "workspace_id": workspace_id,
         "job_handle": job_handle,
         "obs_handle": obs_handle,
@@ -478,6 +514,70 @@ def _cache_key(
         ]
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+_LAT_CANONICAL = frozenset({"lat", "latitude"})
+_LON_CANONICAL = frozenset({"lon", "longitude"})
+
+
+async def _discover_coordinate_names(
+    cmr: CMRProvider,
+    concept_id: str,
+) -> tuple[str, str]:
+    """Return ``(lat_name, lon_name)`` from CMR UMM-V for this collection.
+
+    Priority:
+    1. Variable whose ``standard_name`` is ``"latitude"`` / ``"longitude"``.
+    2. Variable whose ``name`` itself is a canonical coordinate name (covers
+       collections where UMM-V has no StandardName but the variable is named
+       ``"latitude"``/``"longitude"``).
+    3. Default ``("lat", "lon")`` when UMM-V has no coordinate metadata or
+       the lookup fails.
+    """
+    try:
+        variables = await cmr.get_variables(concept_id)
+    except Exception:
+        return "lat", "lon"
+    lat_name, lon_name = "lat", "lon"
+    for var in variables:
+        sn = (var.get("standard_name") or "").lower()
+        name = var.get("name") or ""
+        if not name:
+            continue
+        name_lower = name.lower()
+        if sn == "latitude" or (sn == "" and name_lower in _LAT_CANONICAL):
+            lat_name = name
+        elif sn == "longitude" or (sn == "" and name_lower in _LON_CANONICAL):
+            lon_name = name
+    return lat_name, lon_name
+
+
+async def _discover_opendap_url(
+    cmr: CMRProvider,
+    concept_id: str,
+    bbox: tuple[float, float, float, float] | None,
+    time_range: str,
+) -> str | None:
+    """Search one granule and extract its OPeNDAP access URL from RelatedUrls.
+
+    Mirrors the discovery pattern in ``tests/live/test_opendap_subset.py``.
+    Returns ``None`` if no granules are found or none advertise an OPeNDAP URL.
+    """
+    bbox_str = ",".join(str(c) for c in bbox) if bbox is not None else None
+    granules = await cmr.search_granules(
+        concept_id,
+        bounding_box=bbox_str,
+        temporal=time_range or None,
+        limit=1,
+    )
+    if not granules:
+        return None
+    for entry in granules[0].get("related_urls", []):
+        url = str(entry.get("URL", ""))
+        subtype = str(entry.get("Subtype", "")).upper()
+        if "OPENDAP" in subtype or "opendap" in url.lower():
+            return url[: -len(".html")] if url.endswith(".html") else url
+    return None
 
 
 async def _resolve_handles(
