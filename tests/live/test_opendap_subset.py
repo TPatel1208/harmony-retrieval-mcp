@@ -24,6 +24,7 @@ from earthdata_mcp.config import Settings
 from earthdata_mcp.providers.base import JobRef, RetrievalPlan, TransformSpec
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.providers.opendap import OPeNDAPProvider
+from earthdata_mcp.tools._dataio import NETCDF_BUNDLE_MEDIA_TYPE, open_result
 
 pytestmark = pytest.mark.live
 
@@ -60,14 +61,19 @@ def test_live_opendap_dap4_subset() -> None:
         concept_id = collections[0]["concept_id"]
         caps = await cmr.collection_capabilities(concept_id)
 
-        granules = await cmr.search_granules(concept_id, limit=1)
+        # Pull several granules so the multi-granule bundle path is exercised.
+        granules = await cmr.search_granules(concept_id, limit=3)
         if not granules:
             pytest.skip(f"{SHORT_NAME} has no granules right now")
-        url = _opendap_url(granules[0].get("related_urls", []))
-        if not url:
-            pytest.skip(f"{SHORT_NAME} granule advertises no OPeNDAP URL")
+        urls = [
+            u
+            for u in (_opendap_url(g.get("related_urls", [])) for g in granules)
+            if u
+        ]
+        if not urls:
+            pytest.skip(f"{SHORT_NAME} granules advertise no OPeNDAP URL")
 
-        provider = OPeNDAPProvider(caps, opendap_url=url, settings=Settings())
+        provider = OPeNDAPProvider(caps, opendap_urls=urls, settings=Settings())
         plan = RetrievalPlan(
             output_format=NETCDF,
             needs_variable=True,
@@ -80,7 +86,7 @@ def test_live_opendap_dap4_subset() -> None:
         assert ref.provider_job_url and ".dap.nc4?dap4.ce=" in ref.provider_job_url
         status = await provider.poll(ref)
         assert status.state.value == "ready"  # OPeNDAP is synchronous
-        # materialize reads the constraint URL back off the JobRef.
+        # materialize reads the constraint URLs back off the JobRef and bundles them.
         result = await provider.materialize(
             JobRef(
                 provider="opendap",
@@ -88,7 +94,12 @@ def test_live_opendap_dap4_subset() -> None:
                 job_handle="job_live_opendap",
             )
         )
-        return await provider._storage_backend().get(result.storage_key)
+        assert result.media_type == NETCDF_BUNDLE_MEDIA_TYPE
+        bundle = await provider._storage_backend().get(result.storage_key)
+        return bundle, len(urls)
 
-    data = asyncio.run(_run())
-    assert data, "OPeNDAP subset returned no bytes"
+    bundle, n_granules = asyncio.run(_run())
+    assert bundle, "OPeNDAP subset returned no bytes"
+    # The bundle opens and concatenates the granules on the time axis.
+    ds = open_result(bundle, NETCDF_BUNDLE_MEDIA_TYPE)
+    assert ds.sizes.get("time", 0) >= n_granules

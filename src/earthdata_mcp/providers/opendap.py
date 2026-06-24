@@ -14,21 +14,25 @@ the subset through :class:`~earthdata_mcp.storage.backend.StorageBackend`.
 
 OPeNDAP is a **synchronous** service: there is no provider-side job to poll. We
 still honour the durable submit → poll → materialize seam (PLAN.md §4.3 sync path):
-``submit`` builds the constraint URL — the durable, re-materializable coordinate —
-and stores it on ``JobRef.provider_job_url``; ``poll`` reports ``READY``
-immediately; ``materialize`` reads the URL **back off the JobRef** (never rebuilds
-it) and fetches the bytes. The constraint URL is the *spec*, not an ephemeral
-staged-output URL (PLAN.md §4.5): re-running the same GET re-materialises the
-subset.
+``submit`` builds **one constraint URL per granule** in the window — the durable,
+re-materializable coordinates — and stores them newline-joined on
+``JobRef.provider_job_url``; ``poll`` reports ``READY`` immediately; ``materialize``
+reads the URLs **back off the JobRef** (never rebuilds them), fetches each subset, and
+**bundles** them into one zip. The constraint URLs are the *spec*, not ephemeral
+staged-output URLs (PLAN.md §4.5): re-running the same GETs re-materialises the subset.
 
-Gridded output stays netCDF here, exactly as ``HarmonyProvider.materialize`` leaves
-its result — the format-by-shape Zarr conversion is the Phase 6 worker's job, not
-the provider's.
+Gridded output stays netCDF here. A single-granule request yields a one-member bundle;
+a multi-day request yields all the window's granule subsets in one zip, which
+``tools/_dataio`` opens and concatenates on the time axis. No Zarr conversion happens
+in the provider — the read path understands netCDF directly.
 """
 
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
+import zipfile
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -53,7 +57,11 @@ PROVIDER = "opendap"
 #: DAP4 binary-subset response suffix Hyrax appends to a granule URL.
 _DAP4_SUFFIX = ".dap.nc4"
 _NETCDF_MEDIA_TYPE = "application/x-netcdf"
+#: Multi-granule result: a zip of netCDF subsets. Must match ``tools/_dataio``.
+_NETCDF_BUNDLE_MEDIA_TYPE = "application/netcdf-bundle+zip"
 _GRIDDED_SHAPES = frozenset({"grid", "swath"})
+#: Separator for the per-granule constraint URLs carried on ``provider_job_url``.
+_URL_SEP = "\n"
 
 
 class OPeNDAPProvider:
@@ -63,7 +71,7 @@ class OPeNDAPProvider:
         self,
         capabilities: CollectionCapabilities,
         *,
-        opendap_url: str | None = None,
+        opendap_urls: list[str] | None = None,
         coord_lat: str = "lat",
         coord_lon: str = "lon",
         storage: StorageBackend | None = None,
@@ -71,9 +79,9 @@ class OPeNDAPProvider:
         timeout: float = 300.0,
     ) -> None:
         self._caps = capabilities
-        # The granule's OPeNDAP base URL (sans the .dap.nc4 suffix). In production
-        # this comes from the granule RelatedUrls; injected directly in tests.
-        self._opendap_url = opendap_url.rstrip("/") if opendap_url else None
+        # The window's granule OPeNDAP base URLs (sans the .dap.nc4 suffix). In
+        # production these come from the granules' RelatedUrls; injected in tests.
+        self._opendap_urls = [u.rstrip("/") for u in (opendap_urls or []) if u]
         # Coordinate variable names vary by collection (GLDAS uses "lat"/"lon";
         # TEMPO uses "latitude"/"longitude"). Discovered from CMR UMM-V at planning
         # time and injected here so the CE uses the correct names.
@@ -91,11 +99,11 @@ class OPeNDAPProvider:
         False for: a point/area sample (AppEEARS owns that), a non-gridded
         collection, a "data as-is" plan (no subset → direct fetch), a non-netCDF
         output (png belongs to a Harmony imagenator), or a collection with no
-        OPeNDAP endpoint bound.
+        OPeNDAP endpoints bound.
         """
         if plan.needs_point_sample:
             return False
-        if self._opendap_url is None:
+        if not self._opendap_urls:
             return False
         if self._caps.output_shape not in _GRIDDED_SHAPES:
             return False
@@ -106,60 +114,75 @@ class OPeNDAPProvider:
     # -- lifecycle --------------------------------------------------------
 
     async def submit(self, plan: RetrievalPlan) -> JobRef:
-        """Build the DAP4 constraint URL and carry it on the JobRef.
+        """Build one DAP4 constraint URL per granule and carry them on the JobRef.
 
         The router gates this, but we re-check: a provider must never build a
-        request it cannot satisfy. The constraint URL is the durable coordinate —
-        it flows through ``provider_job_url`` so ``materialize`` reads it back
-        rather than recomputing it.
+        request it cannot satisfy. The constraint URLs are the durable coordinates —
+        they flow newline-joined through ``provider_job_url`` so ``materialize`` reads
+        them back rather than recomputing them.
         """
         if not self.can_handle(plan):
             raise ValueError(
                 "OPeNDAPProvider cannot handle this plan — the router must not "
                 "dispatch it here (PLAN.md §4.2, no fallback)"
             )
-        url = self._build_dap4_url(plan)
-        logger.info("OPeNDAP subset request built: %s", url)
-        return JobRef(provider=PROVIDER, provider_job_url=url)
+        urls = [self._build_dap4_url(plan, base) for base in self._opendap_urls]
+        logger.info("OPeNDAP subset request built: %d granule(s)", len(urls))
+        return JobRef(provider=PROVIDER, provider_job_url=_URL_SEP.join(urls))
 
     async def poll(self, job: JobRef) -> JobStatus:
         """OPeNDAP is synchronous — the subset is ready as soon as it is built."""
         return JobStatus(state=JobState.READY, progress=100)
 
     async def materialize(self, job: JobRef) -> MaterializedResult:
-        """Fetch the DAP4 subset off the JobRef's URL and persist it.
+        """Fetch each DAP4 subset off the JobRef and persist them as one zip bundle.
 
         Reads ``provider_job_url`` straight off the :class:`JobRef` (the durable
-        coordinate ``submit`` stored) — it never rebuilds the constraint, so a
-        resumed job materialises from exactly what was persisted.
+        coordinates ``submit`` stored) — it never rebuilds the constraints, so a
+        resumed job materialises from exactly what was persisted. The members are
+        bundled into a single :class:`StorageBackend` object so one obs handle maps to
+        one key, matching how every other provider stores one result; ``tools/_dataio``
+        opens the bundle and concatenates the granules on read.
         """
-        url = job.provider_job_url
-        if not url:
+        joined = job.provider_job_url
+        if not joined:
             raise ValueError(
                 "OPeNDAP JobRef carries no constraint URL — submit must store it on "
                 "provider_job_url (the durable coordinate, PLAN.md §4.5)"
             )
-        data = await self._fetch(url)
+        urls = [u for u in joined.split(_URL_SEP) if u]
+        # Fetch all granules concurrently; order is preserved by asyncio.gather.
+        chunks = await asyncio.gather(*[self._fetch(u) for u in urls])
+        buf = io.BytesIO()
+        total = 0
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for url, data in zip(urls, chunks):
+                total += len(data)
+                zf.writestr(_filename_from_url(url), data)
+        bundle = buf.getvalue()
+
         storage = self._storage_backend()
         handle = job.job_handle or "result"
-        name = _filename_from_url(url)
-        key = f"{PROVIDER}/{handle}/{name}"
-        await storage.put(key, data)
+        key = f"{PROVIDER}/{handle}/subset.nc.zip"
+        await storage.put(key, bundle)
         return MaterializedResult(
-            storage_key=key, media_type=_NETCDF_MEDIA_TYPE, size_bytes=len(data)
+            storage_key=key,
+            media_type=_NETCDF_BUNDLE_MEDIA_TYPE,
+            size_bytes=len(bundle),
+            extra={"granule_count": len(urls), "uncompressed_bytes": total},
         )
 
     # -- DAP4 request mapping (the only logic we own) ---------------------
 
-    def _build_dap4_url(self, plan: RetrievalPlan) -> str:
-        """Map a plan onto ``<granule>.dap.nc4?dap4.ce=<projection>``.
+    def _build_dap4_url(self, plan: RetrievalPlan, base_url: str) -> str:
+        """Map a plan + one granule onto ``<granule>.dap.nc4?dap4.ce=<projection>``.
 
         The constraint expression projects the requested variables (and the
         spatial/temporal coordinate variables they need), so only the requested
         subset crosses the wire — the whole point of an OPeNDAP fetch.
         """
         ce = _constraint_expression(plan, coord_lat=self._coord_lat, coord_lon=self._coord_lon)
-        url = f"{self._opendap_url}{_DAP4_SUFFIX}"
+        url = f"{base_url}{_DAP4_SUFFIX}"
         if ce:
             url = f"{url}?dap4.ce={quote(ce, safe='')}"
         return url
@@ -207,11 +230,14 @@ def _constraint_expression(
     DAP4 CE. Many L3 monthly products have no ``time`` variable at all (time is
     encoded in the filename), so projecting it causes a 400 from Hyrax.
     """
+    # No variables requested → no CE; OPeNDAP returns the full file.
+    if plan.transform is None or not plan.transform.variables:
+        return ""
+
     projected: list[str] = []
     if plan.needs_bbox:
         projected.extend([f"/{coord_lat}", f"/{coord_lon}"])
-    if plan.transform is not None:
-        projected.extend(f"/{v}" for v in plan.transform.variables)
+    projected.extend(f"/{v}" for v in plan.transform.variables)
     # Preserve order while dropping duplicate coordinate projections.
     seen: set[str] = set()
     unique = [p for p in projected if not (p in seen or seen.add(p))]

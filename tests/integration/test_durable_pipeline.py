@@ -20,11 +20,16 @@ Two paths are covered:
 from __future__ import annotations
 
 import io
+import os
+import tempfile
+import zipfile
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import xarray as xr
 
 from earthdata_mcp.jobs import crud
 from earthdata_mcp.jobs import worker as worker_mod
@@ -36,6 +41,7 @@ from earthdata_mcp.providers._capabilities import (
 from earthdata_mcp.providers.base import JobRef, JobStatus, MaterializedResult
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.tools import discovery as discovery_mod
+from earthdata_mcp.tools._dataio import NETCDF_BUNDLE_MEDIA_TYPE, open_result
 from earthdata_mcp.tools.provenance import get_provenance
 from earthdata_mcp.tools.retrieval import retrieve_data, retrieve_timeseries
 from earthdata_mcp.workspace.models import HandleType
@@ -73,7 +79,66 @@ def _grid_caps() -> CollectionCapabilities:
 def _make_cmr() -> CMRProvider:
     cmr = CMRProvider.__new__(CMRProvider)
     cmr.collection_capabilities = AsyncMock(return_value=_grid_caps())
+    # OPeNDAP discovery now runs for every grid+bbox retrieval (before routing picks
+    # Harmony); an empty granule list keeps this collection on the Harmony path.
+    cmr.search_granules = AsyncMock(return_value=[])
     return cmr
+
+
+def _grid_no_service_caps() -> CollectionCapabilities:
+    """A gridded L3 collection with no Harmony service — OPeNDAP is the only path."""
+    return CollectionCapabilities(
+        concept_id=_CONCEPT_ID,
+        short_name="TEMPO_HCHO_L3",
+        processing_level="3",
+        output_shape="grid",
+        native_formats=frozenset(),
+        direct_s3=None,
+        services=[],
+        capabilities_version="",
+        advisory=[],
+    )
+
+
+_OPENDAP_URLS = [
+    "https://opendap.earthdata.nasa.gov/collections/C1234567890-LPCLOUD"
+    f"/granules/TEMPO_HCHO_L3_V03_2024010{day}T102914Z_S001.nc"
+    for day in (1, 2)
+]
+
+
+def _make_cmr_opendap_window() -> CMRProvider:
+    """CMR stub: no capable Harmony service, but two granules with OPeNDAP URLs."""
+    cmr = CMRProvider.__new__(CMRProvider)
+    cmr.collection_capabilities = AsyncMock(return_value=_grid_no_service_caps())
+    cmr.search_granules = AsyncMock(
+        return_value=[
+            {"related_urls": [{"URL": url, "Subtype": "OPENDAP DATA"}]}
+            for url in _OPENDAP_URLS
+        ]
+    )
+    cmr.get_variables = AsyncMock(return_value=[])
+    return cmr
+
+
+def _netcdf_bundle_bytes() -> bytes:
+    """A zip of two single-time netCDF granule subsets (what OPeNDAP materialises)."""
+
+    def _granule(time_value: int, x_value: float) -> bytes:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "g.nc")
+            xr.Dataset(
+                {"x": ("time", np.array([x_value], dtype="float64"))},
+                coords={"time": np.array([time_value], dtype="int64")},
+            ).to_netcdf(path, engine="h5netcdf", mode="w")
+            with open(path, "rb") as f:
+                return f.read()
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("g0.nc", _granule(0, 10.0))
+        zf.writestr("g1.nc", _granule(1, 20.0))
+    return buf.getvalue()
 
 
 # -- a fake RetrievalProvider that materialises real bytes to real storage --
@@ -241,3 +306,49 @@ async def test_appeears_point_path_materialises_parquet(
     assert obs.payload["media_type"] == "application/x-parquet"
     read_back = pq.read_table(io.BytesIO(await local_backend.get(obs.payload["storage_key"])))
     assert read_back.column_names == ["date", "ndvi"]
+
+
+# -- the OPeNDAP bundle path (hold-firm: provider==opendap AND a readable bundle) --
+
+
+async def test_opendap_bundle_path_runs_to_ready_and_opens(
+    workspace_store, provenance_store, session_factory, patch_worker_seam,
+    local_backend, workspace_id,
+) -> None:
+    """A no-Harmony-service grid collection routes to OPeNDAP, materialises a netCDF
+    bundle, and the obs handle opens back into one time-concatenated dataset."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    patch_worker_seam(
+        _FakeProvider(
+            "opendap", NETCDF_BUNDLE_MEDIA_TYPE, _netcdf_bundle_bytes(), local_backend
+        )
+    )
+
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        cmr=_make_cmr_opendap_window(), store=workspace_store,
+        provenance=provenance_store, session_factory=session_factory,
+        enqueue_fn=AsyncMock(),
+    )
+    # Routed to OPeNDAP at planning time, carrying every granule in the window.
+    assert out["provider"] == "opendap"
+    async with session_factory() as session:
+        job = await crud.get_job_by_handle(session, out["job_handle"])
+        job_id = job.job_id
+        assert job.request_spec["opendap_urls"] == _OPENDAP_URLS
+    await _drive_to_ready(session_factory, job_id)
+
+    # Hold-firm: the durable row records OPeNDAP, not just READY.
+    async with session_factory() as session:
+        job = await crud.get_job_by_handle(session, out["job_handle"])
+    assert job.state == JobState.READY.value
+    assert job.provider == "opendap"
+
+    # The obs handle resolves to a netCDF bundle that opens + concatenates on time.
+    obs = await workspace_store.get_handle(workspace_id, out["obs_handle"])
+    assert obs.payload["media_type"] == NETCDF_BUNDLE_MEDIA_TYPE
+    bundle = await local_backend.get(obs.payload["storage_key"])
+    result = open_result(bundle, NETCDF_BUNDLE_MEDIA_TYPE)
+    assert result.sizes["time"] == 2
+    assert result["x"].values.tolist() == [10.0, 20.0]

@@ -60,10 +60,10 @@ def _settings() -> Settings:
     return Settings(_env_file=None, earthdata_token="tok")
 
 
-def _provider(caps=None, *, opendap_url=OPENDAP_URL, storage=None) -> OPeNDAPProvider:
+def _provider(caps=None, *, opendap_urls=(OPENDAP_URL,), storage=None) -> OPeNDAPProvider:
     return OPeNDAPProvider(
         caps or _grid_caps(),
-        opendap_url=opendap_url,
+        opendap_urls=list(opendap_urls),
         storage=storage,
         settings=_settings(),
     )
@@ -118,7 +118,7 @@ def test_can_handle_false_for_point_shaped_collection() -> None:
 
 
 def test_can_handle_false_without_opendap_endpoint() -> None:
-    assert _provider(opendap_url=None).can_handle(_subset_plan()) is False
+    assert _provider(opendap_urls=[]).can_handle(_subset_plan()) is False
 
 
 # -- submit: plan -> DAP4 constraint URL on the JobRef ---------------------
@@ -164,31 +164,66 @@ async def test_poll_is_ready_immediately() -> None:
     assert status.progress == 100
 
 
-# -- materialize: fetch off the JobRef URL, persist to storage -------------
+# -- submit: multiple granules -> newline-joined constraint URLs -----------
 
 
 @pytest.mark.asyncio
-async def test_materialize_reads_url_off_jobref_and_persists(
+async def test_submit_builds_one_constraint_url_per_granule() -> None:
+    url2 = (
+        "https://opendap.earthdata.nasa.gov/collections/C1-GES_DISC/granules/"
+        "GLDAS_NOAH025_3H.A20240101.0300.021.nc4"
+    )
+    p = _provider(opendap_urls=[OPENDAP_URL, url2])
+    ref = await p.submit(_subset_plan())
+
+    parts = ref.provider_job_url.split("\n")
+    assert len(parts) == 2
+    assert parts[0].startswith(OPENDAP_URL + ".dap.nc4?dap4.ce=")
+    assert parts[1].startswith(url2 + ".dap.nc4?dap4.ce=")
+
+
+# -- materialize: fetch each subset off the JobRef, persist one zip bundle --
+
+
+@pytest.mark.asyncio
+async def test_materialize_bundles_granules_into_one_zip(
     httpx_mock, local_backend
 ) -> None:
-    payload = b"CDF\x01netcdf-subset-bytes"
-    url = OPENDAP_URL + ".dap.nc4?dap4.ce=%2Fprecipitation"
-    httpx_mock.add_response(url=url, content=payload)
+    import zipfile
+    from io import BytesIO
+
+    url1 = OPENDAP_URL + ".dap.nc4?dap4.ce=%2Fprecipitation"
+    url2 = (
+        "https://opendap.earthdata.nasa.gov/collections/C1-GES_DISC/granules/"
+        "GLDAS_NOAH025_3H.A20240101.0300.021.nc4.dap.nc4?dap4.ce=%2Fprecipitation"
+    )
+    httpx_mock.add_response(url=url1, content=b"granule-one")
+    httpx_mock.add_response(url=url2, content=b"granule-two")
 
     p = _provider(storage=local_backend)
-    # The constraint URL is supplied on the JobRef — materialize must NOT rebuild it.
-    ref = JobRef(provider="opendap", provider_job_url=url, job_handle="job_abc")
+    # Both constraint URLs are supplied on the JobRef — materialize must NOT rebuild.
+    ref = JobRef(
+        provider="opendap",
+        provider_job_url=f"{url1}\n{url2}",
+        job_handle="job_abc",
+    )
     result = await p.materialize(ref)
 
-    assert result.media_type == NETCDF
-    assert result.size_bytes == len(payload)
-    assert (
-        result.storage_key == "opendap/job_abc/GLDAS_NOAH025_3H.A20240101.0000.021.nc4"
-    )
-    assert await local_backend.get(result.storage_key) == payload
+    assert result.media_type == "application/netcdf-bundle+zip"
+    assert result.storage_key == "opendap/job_abc/subset.nc.zip"
+    assert result.extra["granule_count"] == 2
 
-    # Bearer token from settings was sent.
-    assert httpx_mock.get_requests()[0].headers.get("Authorization") == "Bearer tok"
+    # The stored object is a zip carrying both granule subsets under granule names.
+    bundle = await local_backend.get(result.storage_key)
+    with zipfile.ZipFile(BytesIO(bundle)) as zf:
+        contents = {n: zf.read(n) for n in zf.namelist()}
+    assert set(contents.values()) == {b"granule-one", b"granule-two"}
+
+    # Bearer token from settings was sent on each fetch.
+    assert all(
+        r.headers.get("Authorization") == "Bearer tok"
+        for r in httpx_mock.get_requests()
+    )
 
 
 @pytest.mark.asyncio

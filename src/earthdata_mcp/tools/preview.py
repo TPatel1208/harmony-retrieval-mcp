@@ -23,6 +23,8 @@ from __future__ import annotations
 import math
 import urllib.parse
 
+import numpy as np
+
 import pyarrow as pa
 import pyarrow.compute as pc
 import xarray as xr
@@ -302,6 +304,10 @@ def _statistics(obj: xr.Dataset | pa.Table, variables: list[str] | None) -> dict
         names = variables or [str(v) for v in obj.data_vars]
         for name in names:
             da = obj[name]
+            if not np.issubdtype(da.dtype, np.number):
+                # Non-numeric (datetime, string, object): count only.
+                stats[name] = {"count": int(da.count()), "dtype": str(da.dtype)}
+                continue
             stats[name] = {
                 "min": _finite(da.min()),
                 "max": _finite(da.max()),

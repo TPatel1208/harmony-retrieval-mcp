@@ -58,11 +58,25 @@ async def test_provider_for_appeears() -> None:
     assert isinstance(provider, AppEEARSProvider)
 
 
-async def test_provider_for_opendap_passes_url() -> None:
+async def test_provider_for_opendap_passes_urls() -> None:
+    spec = _spec(
+        "opendap",
+        opendap_urls=["https://hyrax.example/g1", "https://hyrax.example/g2"],
+    )
+    provider = await _provider_for_with_mock_caps(spec)
+    assert isinstance(provider, OPeNDAPProvider)
+    assert provider._opendap_urls == [
+        "https://hyrax.example/g1",
+        "https://hyrax.example/g2",
+    ]
+
+
+async def test_provider_for_opendap_falls_back_to_singular_url() -> None:
+    """A spec written before multi-granule support carries only ``opendap_url``."""
     spec = _spec("opendap", opendap_url="https://hyrax.example/granule")
     provider = await _provider_for_with_mock_caps(spec)
     assert isinstance(provider, OPeNDAPProvider)
-    assert provider._opendap_url == "https://hyrax.example/granule"
+    assert provider._opendap_urls == ["https://hyrax.example/granule"]
 
 
 async def test_provider_for_defaults_to_harmony_when_absent() -> None:
