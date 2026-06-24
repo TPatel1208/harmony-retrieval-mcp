@@ -12,9 +12,15 @@ vocabulary the Phase 6 retrieval engine uses:
   append-only ``ZipStore``, which cannot overwrite the group attrs xarray writes).
 * tabular → **Parquet**.
 
-Only the guaranteed stack is used (``xarray`` + ``zarr``, ``pyarrow`` + ``pandas``);
-no netCDF engine is assumed, so an unopenable media type fails loudly rather than
-silently guessing.
+It also **reads** (never writes) netCDF-4: Harmony subsetters and OPeNDAP DAP4 both
+deliver netCDF, and grid retrieval now stores it as-is (few Harmony services produce
+Zarr natively). Grouped products (TEMPO/OMI keep science vars under ``product/…`` and
+``geolocation/…``) are flattened into one dataset via ``xr.open_groups`` so the
+existing preview/transform tools consume them unchanged. A multi-granule retrieval is
+carried as a **zip bundle of netCDF members** and concatenated on read.
+
+Only the guaranteed stack is used (``xarray`` + ``zarr`` + ``h5netcdf``, ``pyarrow`` +
+``pandas``); an unopenable media type fails loudly rather than silently guessing.
 """
 
 from __future__ import annotations
@@ -32,6 +38,23 @@ import xarray as xr
 ZARR_MEDIA_TYPE = "application/zarr"
 PARQUET_MEDIA_TYPE = "application/x-parquet"
 
+#: netCDF-4 media types we can *read* (Harmony subset / OPeNDAP DAP4 outputs). Several
+#: spellings reach us: harmony-py guesses from the filename, OPeNDAP sets x-netcdf.
+NETCDF_MEDIA_TYPES = frozenset(
+    {"application/netcdf4", "application/x-netcdf", "application/x-netcdf4"}
+)
+
+#: A multi-granule retrieval: a zip whose members are netCDF granule subsets, opened
+#: and concatenated on the time axis. Produced by ``OPeNDAPProvider`` (Part 3).
+NETCDF_BUNDLE_MEDIA_TYPE = "application/netcdf-bundle+zip"
+
+#: Dimension concatenated across bundle members. TEMPO/OMI L3 carry a length-1 ``time``
+#: per granule; stacking on it reconstructs the time series for the window.
+_BUNDLE_CONCAT_DIM = "time"
+
+#: netCDF read engine — pure-Python h5py-based, no C library (see pyproject).
+_NETCDF_ENGINE = "h5netcdf"
+
 
 class UnsupportedMediaType(ValueError):
     """A media type this server cannot open or serialize in-process."""
@@ -47,9 +70,14 @@ def open_result(data: bytes, media_type: str) -> xr.Dataset | pa.Table:
         return _open_zarr_zip(data)
     if media_type == PARQUET_MEDIA_TYPE:
         return pq.read_table(io.BytesIO(data))
+    if media_type in NETCDF_MEDIA_TYPES:
+        return _open_netcdf_flattened(data)
+    if media_type == NETCDF_BUNDLE_MEDIA_TYPE:
+        return _open_netcdf_bundle(data)
     raise UnsupportedMediaType(
-        f"cannot open media type {media_type!r} in-process "
-        f"(supported: {ZARR_MEDIA_TYPE!r}, {PARQUET_MEDIA_TYPE!r})"
+        f"cannot open media type {media_type!r} in-process (supported: "
+        f"{ZARR_MEDIA_TYPE!r}, {PARQUET_MEDIA_TYPE!r}, "
+        f"{NETCDF_BUNDLE_MEDIA_TYPE!r}, and netCDF-4)"
     )
 
 
@@ -94,6 +122,87 @@ def _open_zarr_zip(data: bytes) -> xr.Dataset:
             zf.extractall(store_dir)
         # .load() pulls everything into memory before the temp dir is removed.
         return xr.open_zarr(store_dir, consolidated=False).load()
+
+
+def _open_netcdf_flattened(data: bytes) -> xr.Dataset:
+    """Open one netCDF-4 blob, flattening all groups into a single dataset.
+
+    TEMPO/OMI L3 keep science variables in subgroups (``/product/vertical_column``,
+    ``/geolocation/latitude``); a plain ``xr.open_dataset`` reads only the root group
+    and surfaces no data. We open every group with ``xr.open_groups`` and merge them
+    into one dataset, prefixing each non-root group's variables and non-dimension
+    coordinates with the group path (``product__vertical_column``). The prefix both
+    records provenance and prevents collisions (several groups define ``latitude``).
+    """
+    # h5netcdf opens an in-memory buffer directly, so no temp file (and no Windows
+    # file-handle race on cleanup). Load eagerly, then close the group handles.
+    groups = xr.open_groups(
+        io.BytesIO(data), engine=_NETCDF_ENGINE, decode_times=False
+    )
+    try:
+        return _merge_groups(groups).load()
+    finally:
+        for ds in groups.values():
+            ds.close()
+
+
+def _merge_groups(groups: dict[str, xr.Dataset]) -> xr.Dataset:
+    """Merge an ``xr.open_groups`` mapping into one dataset with group-prefixed names.
+
+    Root-group (``"/"``) names are kept verbatim; every other group contributes
+    ``<group_path>__<name>`` for its data variables and non-dimension coordinates.
+    Dimension coordinates are left unprefixed so shared axes still align on merge.
+    """
+    renamed: list[xr.Dataset] = []
+    for group_path, ds in groups.items():
+        prefix = group_path.strip("/").replace("/", "__")
+        if not prefix:
+            renamed.append(ds)
+            continue
+        mapping = {
+            name: f"{prefix}__{name}"
+            for name in (*ds.data_vars, *ds.coords)
+            if name not in ds.dims  # keep dimension coords as shared axes
+        }
+        renamed.append(ds.rename(mapping))
+    # compat="override" lets shared dimension coords (e.g. latitude/longitude grids
+    # repeated per group) merge without an exact-equality check across groups.
+    return xr.merge(renamed, compat="override", join="outer")
+
+
+def _open_netcdf_bundle(data: bytes) -> xr.Dataset:
+    """Open a zip of netCDF granule subsets and concat them on the time axis.
+
+    Each member is flattened by :func:`_open_netcdf_flattened`; members are then
+    concatenated on ``time`` in filename order (granule names sort chronologically).
+    Coordinate ``units``/``calendar`` attrs are stripped before concat so granules
+    written at different times don't trip xarray's attribute-equality check — the
+    same append-safety guard TTA applies in ``zarr_normalization``.
+    """
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = sorted(n for n in zf.namelist() if not n.endswith("/"))
+        members = [_open_netcdf_flattened(zf.read(n)) for n in names]
+    if not members:
+        raise UnsupportedMediaType("netCDF bundle is empty")
+    if len(members) == 1:
+        return members[0]
+    normalized = [_strip_unsafe_coord_attrs(ds) for ds in members]
+    return xr.concat(normalized, dim=_BUNDLE_CONCAT_DIM).load()
+
+
+def _strip_unsafe_coord_attrs(ds: xr.Dataset) -> xr.Dataset:
+    """Drop ``units``/``calendar`` from coords so cross-granule concat doesn't choke.
+
+    Ported from TTA's ``_strip_zarr_unsafe_coord_attrs``
+    (``Backend/preprocessing/zarr_normalization.py``): coordinate attribute drift
+    across granules makes ``xr.concat`` raise on its equality check.
+    """
+    ds = ds.copy()
+    for coord in ds.coords:
+        for attr in ("units", "calendar"):
+            ds[coord].attrs.pop(attr, None)
+            ds[coord].encoding.pop(attr, None)
+    return ds
 
 
 def _dataset_to_table(obj: xr.Dataset | pa.Table) -> pa.Table:

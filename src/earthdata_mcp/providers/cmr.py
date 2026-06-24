@@ -372,11 +372,10 @@ class CMRProvider:
         try:
             response = await self._request("GET", url, params=params, headers=headers, timeout=30.0)
         except (CMRError, RetryableError, httpx.TimeoutException):
-            # 4xx → collection unknown to Harmony; 5xx → Harmony itself is broken
-            # (e.g. CMR has bogus service associations pointing at a non-existent
-            # provider like XYZ_PROV, causing Harmony to return 500 when it tries to
-            # resolve them). Timeout → Harmony unreachable. Either way: treat as
-            # "no capabilities available" and let the router decide.
+            # 4xx → collection unknown to Harmony; 5xx → Harmony internal error;
+            # timeout → Harmony unreachable. Treat all as "no capabilities" and
+            # let the router decide. A collection with no Harmony services returns
+            # 200 with "services":[] — that is the normal path, not this branch.
             return {}
         try:
             return response.json()

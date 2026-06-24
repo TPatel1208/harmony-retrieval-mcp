@@ -100,6 +100,32 @@ def _grid_no_service_caps() -> CollectionCapabilities:
     )
 
 
+def _grid_caps_with_nonbbox_service() -> CollectionCapabilities:
+    """A gridded L3 collection with a service that cannot bbox-subset (TEMPO HCHO L3).
+
+    Harmony returned 200 with a real LARC_CLOUD service, but that service only
+    supports temporal subsetting — no bbox. OPeNDAP is the only viable transform path.
+    """
+    svc = ServiceCapability(
+        service_name="larc-temporal-only",
+        concept_id="S3616918458-LARC_CLOUD",
+        subset_bbox=False,
+        subset_temporal=True,
+        output_formats=frozenset({"application/netcdf4"}),
+    )
+    return CollectionCapabilities(
+        concept_id=_CONCEPT_ID,
+        short_name="TEMPO_HCHO_L3",
+        processing_level="3",
+        output_shape="grid",
+        native_formats=frozenset(),
+        direct_s3=None,
+        services=[svc],
+        capabilities_version="2",
+        advisory=[],
+    )
+
+
 def _make_cmr(caps: CollectionCapabilities) -> CMRProvider:
     """A ``CMRProvider`` whose ``collection_capabilities`` returns ``caps``.
 
@@ -137,6 +163,35 @@ def _make_cmr_with_opendap_granule(caps: CollectionCapabilities) -> CMRProvider:
                     }
                 ]
             }
+        ]
+    )
+    cmr.get_variables = AsyncMock(return_value=[])
+    return cmr
+
+
+_OPENDAP_URLS = [
+    "https://opendap.earthdata.nasa.gov/collections/C1234567890-LPCLOUD"
+    f"/granules/TEMPO_HCHO_L3_V03_2024060{day}T102914Z_S001.nc"
+    for day in (1, 2, 3)
+]
+
+
+def _make_cmr_with_opendap_window(caps: CollectionCapabilities) -> CMRProvider:
+    """CMR mock that returns several granules, each advertising an OPeNDAP URL.
+
+    Exercises the multi-granule bundle path: a multi-day request must collect every
+    granule's OPeNDAP URL, not just the first.
+    """
+    cmr = CMRProvider.__new__(CMRProvider)
+    cmr.collection_capabilities = AsyncMock(return_value=caps)
+    cmr.search_granules = AsyncMock(
+        return_value=[
+            {
+                "related_urls": [
+                    {"URL": url, "Type": "USE SERVICE API", "Subtype": "OPENDAP DATA"}
+                ]
+            }
+            for url in _OPENDAP_URLS
         ]
     )
     cmr.get_variables = AsyncMock(return_value=[])
@@ -252,10 +307,13 @@ async def test_retrieve_data_stores_request_spec_not_url(
             assert not value.lower().startswith(("http://", "https://", "s3://"))
 
 
-async def test_retrieve_data_defaults_zarr_for_grid(
+async def test_retrieve_data_defaults_netcdf_for_grid(
     grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
     workspace_id,
 ) -> None:
+    """Grid defaults to netCDF-4, not Zarr: few Harmony services advertise Zarr, so a
+    Zarr default rejected most subset-able L3 collections. netCDF routes broadly and
+    ``_dataio`` reads it back (flattening groups)."""
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
 
@@ -266,7 +324,7 @@ async def test_retrieve_data_defaults_zarr_for_grid(
 
     async with session_factory() as session:
         job = await get_job_by_handle(session, out["job_handle"])
-    assert job.request_spec["output_format"] == "application/zarr"
+    assert job.request_spec["output_format"] == "application/netcdf4"
     assert job.request_spec["output_shape"] == "grid"
 
 
@@ -339,6 +397,60 @@ async def test_retrieve_data_format_defaults_to_netcdf_when_opendap_only(
     assert spec["output_format"] == "application/netcdf4"
     assert spec["output_shape"] == "grid"
     assert spec["provider"] == "opendap"
+
+
+async def test_retrieve_data_routes_to_opendap_when_service_lacks_bbox(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """When a Harmony service exists but cannot bbox-subset, OPeNDAP is the fallback.
+
+    This is the TEMPO HCHO L3 case: Harmony returns 200 with a LARC_CLOUD service
+    that only supports temporal subsetting (no bbox). The router must fall through
+    to OPeNDAP (step 3, PLAN.md §4.2) after the format is retried as netCDF-4.
+    """
+    cmr = _make_cmr_with_opendap_granule(_grid_caps_with_nonbbox_service())
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        cmr=cmr, store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=mock_enqueue,
+    )
+
+    assert out["provider"] == "opendap"
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    spec = job.request_spec
+    assert spec["provider"] == "opendap"
+    assert spec["opendap_url"] == _OPENDAP_URL
+    assert spec["output_format"] == "application/netcdf4"
+
+
+async def test_retrieve_data_collects_all_window_granules_for_opendap(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """A multi-day OPeNDAP request carries every granule's URL, not just the first.
+
+    Without this the 3-day TEMPO request silently dropped to one scan cycle (Part 3).
+    """
+    cmr = _make_cmr_with_opendap_window(_grid_no_service_caps())
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        cmr=cmr, store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=mock_enqueue,
+    )
+
+    assert out["provider"] == "opendap"
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    spec = job.request_spec
+    assert spec["opendap_urls"] == _OPENDAP_URLS
+    # The singular key stays populated (first URL) for backward-compatible readers.
+    assert spec["opendap_url"] == _OPENDAP_URLS[0]
 
 
 # -- retrieve_subset -------------------------------------------------------

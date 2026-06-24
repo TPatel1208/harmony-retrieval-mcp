@@ -30,7 +30,8 @@ _URL_PREFIXES = ("http://", "https://", "s3://", "gs://")
 
 # Keys that may legitimately hold durable (re-materializable) URLs — OPeNDAP
 # granule endpoints are permanent CMR-resolvable references, not staged outputs.
-_DURABLE_URL_KEYS: frozenset[str] = frozenset({"opendap_url"})
+# Both the singular endpoint and the multi-granule list are allowed.
+_DURABLE_URL_KEYS: frozenset[str] = frozenset({"opendap_url", "opendap_urls"})
 
 # Walk ancestors target -> source. MIN(depth) collapses diamonds; the depth guard
 # makes an accidental cycle terminate. Workspace-scoped at both levels.
@@ -234,7 +235,11 @@ def _reject_url_spec(request_spec: dict | None) -> None:
     for key, value in request_spec.items():
         if key in _DURABLE_URL_KEYS:
             continue
-        if isinstance(value, str) and value.lower().startswith(_URL_PREFIXES):
-            raise ProvenanceError(
-                "request_spec must be re-materializable, not a staged-output URL"
-            )
+        # Scan strings and the strings inside list values, so a URL can't be smuggled
+        # past the rule by wrapping it in a list.
+        candidates = value if isinstance(value, list) else [value]
+        for item in candidates:
+            if isinstance(item, str) and item.lower().startswith(_URL_PREFIXES):
+                raise ProvenanceError(
+                    "request_spec must be re-materializable, not a staged-output URL"
+                )

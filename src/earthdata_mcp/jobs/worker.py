@@ -256,13 +256,17 @@ async def _provider_for(spec: dict):
         # AppEEARS builds its point-task body from the plan alone (no granule URL).
         return AppEEARSProvider(caps)
     if provider == "opendap":
-        # The granule's OPeNDAP URL and coordinate variable names are discovered at
-        # planning time and carried on the spec so the CE is rebuilt correctly on
+        # The granules' OPeNDAP URLs and coordinate variable names are discovered at
+        # planning time and carried on the spec so the CEs are rebuilt correctly on
         # resume (coordinate names vary by collection: GLDAS uses lat/lon, TEMPO uses
-        # latitude/longitude — PLAN.md §4.2 step 3).
+        # latitude/longitude — PLAN.md §4.2 step 3). Fall back to the singular
+        # ``opendap_url`` key for specs written before multi-granule support.
+        urls = spec.get("opendap_urls")
+        if not urls and spec.get("opendap_url"):
+            urls = [spec["opendap_url"]]
         return OPeNDAPProvider(
             caps,
-            opendap_url=spec.get("opendap_url"),
+            opendap_urls=urls or [],
             coord_lat=spec.get("coord_lat") or "lat",
             coord_lon=spec.get("coord_lon") or "lon",
         )
