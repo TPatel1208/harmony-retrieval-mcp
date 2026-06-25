@@ -29,6 +29,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import xarray as xr
 
+from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.storage import StorageBackend, get_storage_backend
 from earthdata_mcp.tools._dataio import open_result
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
@@ -46,6 +47,11 @@ _LAT_NAMES = ("lat", "latitude", "y")
 
 _storage: StorageBackend | None = None
 
+# In-process GIBS layer cache: concept_id → authoritative layer name.
+# Concurrent coroutines may race to populate the same key but will write the
+# same value — worst outcome is one extra CMR call, never a correctness issue.
+_gibs_layer_cache: dict[str, str] = {}
+
 
 def _default_storage() -> StorageBackend:
     """Process-wide storage backend, built lazily so import has no side effects."""
@@ -53,6 +59,51 @@ def _default_storage() -> StorageBackend:
     if _storage is None:
         _storage = get_storage_backend()
     return _storage
+
+
+# -- GIBS layer resolution -------------------------------------------------
+
+
+def _select_gibs_layer(layers: list[dict]) -> str | None:
+    """Pick the best GIBS layer from a collection's EDSC tag data array.
+
+    Preference order (highest first):
+    1. Non-polar layers (arctic/antarctic flags absent or False) — polar-projection
+       layers render blank at EPSG:4326 global extents.
+    2. Within that pool, non-night layers (name does not contain ``_Night``) —
+       daytime composites are the canonical preview product for most sensors.
+    3. First entry as a last resort when all candidates share the same traits.
+
+    Returns ``None`` when ``layers`` is empty or no entry has a ``"layer"`` field.
+    """
+    candidates = [l for l in layers if l.get("layer")]
+    if not candidates:
+        return None
+    non_polar = [l for l in candidates if not (l.get("arctic") or l.get("antarctic"))]
+    pool = non_polar if non_polar else candidates
+    day_pool = [l for l in pool if "_Night" not in l["layer"]]
+    chosen = day_pool[0] if day_pool else pool[0]
+    return chosen["layer"]
+
+
+async def _discover_gibs_layer(
+    concept_id: str, cmr: CMRProvider
+) -> tuple[str | None, str | None]:
+    """Authoritative GIBS layer lookup via CMR EDSC tags.
+
+    Returns ``(layer_name, failure_reason)``. ``layer_name`` is ``None`` when not found.
+    Populates ``_gibs_layer_cache`` on success to avoid repeat CMR calls.
+    """
+    if concept_id in _gibs_layer_cache:
+        return _gibs_layer_cache[concept_id], None
+    layers = await cmr.fetch_gibs_layers(concept_id)
+    if not layers:
+        return None, "no edsc.extra.serverless.gibs tag on CMR record"
+    layer_name = _select_gibs_layer(layers)
+    if not layer_name:
+        return None, "edsc.extra.serverless.gibs tag has no 'layer' field"
+    _gibs_layer_cache[concept_id] = layer_name
+    return layer_name, None
 
 
 # -- preview_dataset -------------------------------------------------------
@@ -66,6 +117,7 @@ async def preview_dataset(
     workspace_id: str = DEFAULT_WORKSPACE,
     *,
     store: WorkspaceStore | None = None,
+    cmr: CMRProvider | None = None,
 ) -> dict:
     """Build a GIBS visual preview reference for a dataset and mint a ``preview_`` handle.
 
@@ -84,14 +136,43 @@ async def preview_dataset(
     collection = record.payload.get("collection", {})
     short_name = collection.get("short_name") or record.payload.get("short_name")
 
-    # Layer: explicit > payload hint > short_name. Flag when it's a best guess so a
-    # caller knows the GIBS layer name was not authoritatively resolved.
-    resolved_layer = layer or record.payload.get("gibs_layer") or short_name
-    layer_is_guess = layer is None and "gibs_layer" not in record.payload
+    # Layer resolution priority: explicit param → handle payload cache →
+    # authoritative CMR EDSC tag lookup → short_name heuristic (last resort).
+    lookup_source: str
+    lookup_failure_reason: str | None = None
+
+    if layer is not None:
+        resolved_layer = layer
+        lookup_source = "explicit"
+    elif "gibs_layer" in record.payload:
+        resolved_layer = record.payload["gibs_layer"]
+        lookup_source = "handle_payload"
+    else:
+        concept_id = record.payload.get("concept_id")
+        if concept_id:
+            _cmr = cmr or CMRProvider()
+            cmr_layer, failure = await _discover_gibs_layer(concept_id, _cmr)
+            if cmr_layer:
+                resolved_layer = cmr_layer
+                lookup_source = "cmr_tags"
+                # Write-through: persist so future calls skip the CMR round-trip.
+                await store.update_handle(
+                    workspace_id, dataset_handle, {"gibs_layer": cmr_layer}
+                )
+            else:
+                resolved_layer = short_name
+                lookup_source = "short_name_guess"
+                lookup_failure_reason = failure
+        else:
+            resolved_layer = short_name
+            lookup_source = "short_name_guess"
+            lookup_failure_reason = "handle has no concept_id"
+
+    layer_is_guess = lookup_source == "short_name_guess"
     if not resolved_layer:
         raise ValueError(
-            f"dataset handle {dataset_handle!r} has no GIBS layer, short_name, or "
-            "explicit layer to preview"
+            f"dataset handle {dataset_handle!r} has no GIBS layer — tried "
+            f"{lookup_source}: {lookup_failure_reason}"
         )
 
     bbox = _preview_bbox(collection, await _aoi_bbox(aoi_handle, workspace_id, store))
@@ -111,6 +192,8 @@ async def preview_dataset(
         "gibs_url": _gibs_url(resolved_layer, bbox, time),
         "layer": resolved_layer,
         "layer_is_guess": layer_is_guess,
+        "lookup_source": lookup_source,
+        "lookup_failure_reason": lookup_failure_reason,
         "bbox": list(bbox),
         "time": time,
         "format": "image/png",

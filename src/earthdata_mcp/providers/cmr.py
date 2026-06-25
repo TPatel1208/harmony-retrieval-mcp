@@ -35,6 +35,10 @@ _GRANULES = "/search/granules.umm_json"
 _VARIABLES = "/search/variables.umm_json"
 _SERVICES = "/search/services.umm_json"
 
+# Legacy .json feed — the only CMR endpoint that exposes EDSC tags such as
+# edsc.extra.serverless.gibs (docs/cmr_patterns.md §Common HTTP conventions).
+_COLLECTIONS_JSON = "/search/collections.json"
+
 # CMR caps user-facing limits low; mirror NASA's defaults.
 _DEFAULT_LIMIT = 10
 _MAX_LIMIT = 50
@@ -193,6 +197,31 @@ class CMRProvider:
             _COLLECTIONS, {"concept_id": concept_id}, limit=1
         )
         return items[0] if items else None
+
+    async def fetch_gibs_layers(self, concept_id: str) -> list[dict]:
+        """Return GIBS layer objects from the CMR EDSC tag for one collection.
+
+        Hits the legacy ``.json`` endpoint with ``include_tags=edsc.extra.serverless.gibs``
+        (the only CMR endpoint that exposes EDSC tags; docs/cmr_patterns.md §endpoints).
+        Parses ``feed.entry[0].tags["edsc.extra.serverless.gibs"].data``.
+        Returns ``[]`` on any failure — 4xx, 5xx, timeout, or missing tag.
+        """
+        url = f"{self._cmr_base}{_COLLECTIONS_JSON}"
+        params = {"concept_id": concept_id, "include_tags": "edsc.extra.serverless.gibs"}
+        try:
+            response = await self._request("GET", url, params=params, timeout=30.0)
+        except (CMRError, RetryableError, httpx.TimeoutException):
+            return []
+        try:
+            feed = response.json()
+        except ValueError:
+            return []
+        entries = feed.get("feed", {}).get("entry", [])
+        if not entries:
+            return []
+        tags = entries[0].get("tags", {})
+        data = tags.get("edsc.extra.serverless.gibs", {}).get("data", [])
+        return data if isinstance(data, list) else []
 
     # -- Granules ---------------------------------------------------------
 

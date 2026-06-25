@@ -1,13 +1,16 @@
-"""Capability-gated router decision tree (PLAN.md §4.2, Phase 4.5 gate).
+"""Harmony-first router decision (Phase 4.5 gate).
 
 Drives the router with the saved Phase-2 union-trap fixtures:
   * tests/fixtures/tempo_no2_l2_capabilities.json  — two disjoint services
   * tests/fixtures/tempo_no2_l3_umm_c.json          — gridded, direct S3, no service
 
-The load-bearing assertions: bbox+png is NotRetrievable (neither service does
-both) with both services reported as ``available``; bbox+netcdf routes to the
-subsetter; the L3 direct-S3 case routes to direct fetch and **never** submits to
-Harmony.
+Harmony is tried first for every transform plan when wired: bbox+netcdf pins the
+subsetter; bbox+png — where no single service satisfies the whole plan — routes to
+Harmony unpinned (server picks chain) rather than raising NotRetrievable. The
+worker's Harmony→OPeNDAP fallback catches any runtime failure. The only non-Harmony
+shortcut is direct-S3 for a "data as-is" plan, and only when actually connected to
+the DAAC's S3 (in-region + enabled); otherwise even data-as-is goes to Harmony.
+NotRetrievable is only raised when Harmony is not wired and no other path fits.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from earthdata_mcp.config import Settings
 from earthdata_mcp.providers._capabilities import CollectionCapabilities
 from earthdata_mcp.providers.base import RetrievalPlan
 from earthdata_mcp.providers.router import NotRetrievable, Router
@@ -43,16 +47,28 @@ def l3_caps() -> CollectionCapabilities:
 # -- the union trap: bbox + png is satisfiable by NEITHER service ----------
 
 
-def test_bbox_plus_png_is_not_retrievable_and_never_submits(l2_caps) -> None:
+def test_bbox_plus_png_with_harmony_wired_routes_to_harmony_unpinned(l2_caps) -> None:
+    # Neither service handles bbox+png, but Harmony is wired — step 1.5 routes to
+    # Harmony unpinned (server picks its default chain) rather than failing at
+    # planning time. The worker's Harmony→OPeNDAP fallback handles any runtime failure.
     harmony = MagicMock()
     router = Router(l2_caps, harmony=harmony)
     plan = RetrievalPlan(output_format="image/png", needs_bbox=True)
+    decision = router.route(plan)
+    assert decision.path == "harmony"
+    assert decision.service is None  # no pinned service — server picks
+    assert decision.provider is harmony
+    harmony.submit.assert_not_called()  # route decides, does not submit
 
+
+def test_bbox_plus_png_without_harmony_is_not_retrievable(l2_caps) -> None:
+    # Without Harmony wired, no path can satisfy bbox+png — fails at planning time.
+    # ``available`` reports BOTH services' real, disjoint capabilities so the agent
+    # can relax the request — not the rolled-up union.
+    router = Router(l2_caps)
+    plan = RetrievalPlan(output_format="image/png", needs_bbox=True)
     with pytest.raises(NotRetrievable) as exc:
         router.route(plan)
-
-    # `available` reports BOTH services' real, disjoint capabilities so the agent
-    # can relax the request — not the rolled-up union.
     available = {s.service_name: s for s in exc.value.available}
     assert set(available) == {SUBSETTER, IMAGENATOR}
     assert available[SUBSETTER].subset_bbox is True
@@ -60,10 +76,6 @@ def test_bbox_plus_png_is_not_retrievable_and_never_submits(l2_caps) -> None:
     assert "image/png" not in available[SUBSETTER].output_formats
     assert available[IMAGENATOR].subset_bbox is False
     assert available[IMAGENATOR].output_formats == frozenset({"image/png"})
-
-    # Routing decided NOT to submit anything — the planning-time failure is the
-    # whole point (no opaque submit-time failure, no Harmony fallback).
-    harmony.submit.assert_not_called()
 
 
 def test_bbox_plus_netcdf_routes_to_subsetter(l2_caps) -> None:
@@ -87,14 +99,31 @@ def test_variable_plus_png_routes_to_imagenator(l2_caps) -> None:
     assert decision.service.service_name == IMAGENATOR
 
 
-# -- direct-fetch path: L3, data as-is, in-region S3 -----------------------
+# -- direct-fetch path: L3, data as-is, only when connected to S3 -----------
 
 
-def test_l3_data_as_is_routes_to_direct_fetch_no_harmony(l3_caps) -> None:
+def test_l3_data_as_is_routes_to_harmony_when_s3_not_connected(l3_caps) -> None:
+    # "Data as-is" L3 with an S3 prefix, but S3 direct is off by default (not
+    # in-region) — so we do NOT take the direct path; Harmony is tried first.
     harmony = MagicMock()
-    router = Router(l3_caps, harmony=harmony)
-    # "Data as-is": no transforms requested; the COMPLETE gridded netCDF-4 L3
-    # collection with an S3 prefix is the direct-fetch case.
+    router = Router(l3_caps, harmony=harmony, settings=Settings(s3_direct_enabled=False))
+    plan = RetrievalPlan(output_format="application/netcdf")
+
+    decision = router.route(plan)
+    assert decision.path == "harmony"
+    assert decision.service is None  # no services on L3 — server picks the chain
+    assert decision.provider is harmony
+    harmony.submit.assert_not_called()
+
+
+def test_l3_data_as_is_routes_to_direct_when_s3_connected(l3_caps, monkeypatch) -> None:
+    # Same data-as-is plan, but now S3 direct is enabled AND we are in the bucket's
+    # region — the direct-fetch shortcut fires and skips Harmony.
+    region = l3_caps.direct_s3.region
+    assert region  # fixture carries a DirectDistributionInformation region
+    monkeypatch.setenv("AWS_REGION", region)
+    harmony = MagicMock()
+    router = Router(l3_caps, harmony=harmony, settings=Settings(s3_direct_enabled=True))
     plan = RetrievalPlan(output_format="application/netcdf")
 
     decision = router.route(plan)
@@ -103,10 +132,21 @@ def test_l3_data_as_is_routes_to_direct_fetch_no_harmony(l3_caps) -> None:
     harmony.submit.assert_not_called()
 
 
-def test_l3_with_a_transform_need_is_not_direct(l3_caps) -> None:
-    # A transform need disqualifies direct fetch; with no service and no OPeNDAP,
-    # the plan is NotRetrievable rather than silently routed to direct.
-    router = Router(l3_caps, harmony=MagicMock())
+def test_l3_with_a_transform_need_routes_to_harmony_when_wired(l3_caps) -> None:
+    # A transform need disqualifies direct fetch; with Harmony wired, step 1.5
+    # routes to Harmony unpinned (server picks chain) before OPeNDAP/NotRetrievable.
+    harmony = MagicMock()
+    router = Router(l3_caps, harmony=harmony)
+    plan = RetrievalPlan(output_format="application/netcdf", needs_bbox=True)
+    decision = router.route(plan)
+    assert decision.path == "harmony"
+    assert decision.service is None  # no pinned service — server picks
+    assert decision.provider is harmony
+
+
+def test_l3_with_a_transform_need_is_not_retrievable_without_harmony(l3_caps) -> None:
+    # Without Harmony wired and no OPeNDAP, a transform need still fails fast.
+    router = Router(l3_caps)
     plan = RetrievalPlan(output_format="application/netcdf", needs_bbox=True)
     with pytest.raises(NotRetrievable):
         router.route(plan)
@@ -115,16 +155,29 @@ def test_l3_with_a_transform_need_is_not_direct(l3_caps) -> None:
 # -- OPeNDAP structural hook (dormant until Phase 7) -----------------------
 
 
-def test_opendap_path_taken_when_provider_can_handle(l3_caps) -> None:
-    # No Harmony service and a transform need (so not direct) — but an OPeNDAP
-    # provider that can_handle the plan is selected before NotRetrievable.
+def test_opendap_path_taken_when_harmony_not_wired(l3_caps) -> None:
+    # No Harmony wired and a transform need (so not direct) — OPeNDAP is reached.
     opendap = MagicMock()
     opendap.can_handle.return_value = True
-    router = Router(l3_caps, harmony=MagicMock(), opendap=opendap)
+    router = Router(l3_caps, opendap=opendap)
     plan = RetrievalPlan(output_format="application/netcdf", needs_variable=True)
     decision = router.route(plan)
     assert decision.path == "opendap"
     assert decision.provider is opendap
+
+
+def test_harmony_preferred_over_opendap_when_no_services(l3_caps) -> None:
+    # Harmony is wired and no single service matches — step 1.5 routes to Harmony
+    # unpinned before OPeNDAP even when OPeNDAP can_handle the plan.
+    harmony = MagicMock()
+    opendap = MagicMock()
+    opendap.can_handle.return_value = True
+    router = Router(l3_caps, harmony=harmony, opendap=opendap)
+    plan = RetrievalPlan(output_format="application/netcdf", needs_variable=True)
+    decision = router.route(plan)
+    assert decision.path == "harmony"
+    assert decision.service is None
+    assert decision.provider is harmony
 
 
 # -- AppEEARS point/area-sample path (Phase 7.4) ---------------------------

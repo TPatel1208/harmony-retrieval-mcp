@@ -1,16 +1,22 @@
 # Earthdata MCP Server — project rules
 
 ## Spec
-PLAN.md is the spec and the single source of truth. Before any task, read the
-PLAN.md section the current prompt names, plus this file. If a prompt and PLAN.md
-disagree, PLAN.md wins — flag the conflict, don't silently pick one.
+This file is the source of truth for project rules. Routing canon lives in the
+hard rules below and in `src/earthdata_mcp/providers/router.py`. (PLAN.md, the old
+phased spec, has been removed; ignore any lingering `PLAN.md §…` citations in
+docstrings — they are stale references, not authority.)
 
 ## Hard rules (never violate)
 - Use the official harmony-py client; do NOT hand-roll a Harmony client.
-- Check service capability via get_services and CollectionCapabilities.find_service
-  before any Harmony submit. Match ONE whole service. Never trust the rolled-up
-  top-level capability booleans (they are an unsatisfiable union). Never "fall
-  back" to Harmony for a collection no service can handle.
+- Harmony is always tried first for any transform plan. Check service capability via
+  get_services and CollectionCapabilities.find_service first: when ONE whole service
+  satisfies the plan, pin it; when none does — including the union-trap case (the
+  rolled-up top-level capability booleans are an unsatisfiable union; never trust
+  them) and collections with no registered services — submit Harmony UNPINNED and let
+  the server pick the chain. Never union across services to build a service_id.
+  OPeNDAP is the worker's runtime fallback when a real Harmony submit fails; it is not
+  a planning-time choice. The one non-Harmony shortcut is direct-S3 for a "data as-is"
+  plan, and only when actually connected to the DAAC's S3 (in-region + enabled).
 - All retrieval is a durable job: state persisted in Postgres, resumable on
   restart. No in-memory background tasks for anything that matters.
 - Provenance records the request SPEC (re-materializable), never an ephemeral

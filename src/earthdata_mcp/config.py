@@ -2,7 +2,7 @@
 
 Storage backend selection is config-only (``EARTHDATA_STORAGE``): the rest of the
 system speaks to the ``StorageBackend`` interface and never imports a concrete
-backend. See PLAN.md §4.4.
+backend.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # CMR / Harmony / KMS (metadata services, Phase 2) --------------------
-    # Canon is CMR's public API + UMM schemas (PLAN.md §1).
+    # Canon is CMR's public API + UMM schemas.
     cmr_url: str = "https://cmr.earthdata.nasa.gov"
     harmony_url: str = "https://harmony.earthdata.nasa.gov"
     # AppEEARS point/area sample API (Phase 7.4; Bearer-authenticated with the EDL
@@ -34,9 +34,14 @@ class Settings(BaseSettings):
     # Storage --------------------------------------------------------------
     # `local` (default) or an `s3://bucket/prefix` URL.
     earthdata_storage: str = "local"
+    # Enable the direct-S3 fetch shortcut for "data as-is" plans. Off by default:
+    # direct S3 reads work only from within the DAAC's AWS region, so we route to
+    # Harmony unless this is explicitly turned on AND we are in-region. Env:
+    # EARTHDATA_S3_DIRECT.
+    s3_direct_enabled: bool = False
     # Root for the local filesystem backend.
     earthdata_data_dir: str = "./data"
-    # Materialization cache eviction cap (bytes); default ~5 GiB (§4.4).
+    # Materialization cache eviction cap (bytes); default ~5 GiB
     earthdata_cache_max_bytes: int = 5 * 1024**3
 
     # Database -------------------------------------------------------------
@@ -47,12 +52,12 @@ class Settings(BaseSettings):
     # Worker broker (Arq / Redis) -----------------------------------------
     redis_url: str = "redis://localhost:6379/0"
 
-    # Earthdata Login (used from Phase 4) ---------------------------------
+    # Earthdata Login ---------------------------------
     edl_username: str = ""
     edl_password: str = ""
     earthdata_token: str = ""
 
-    # Per-provider rate limiting (Phase 8 hardening, §8) ------------------
+    # Per-provider rate limiting ------------------
     # Token-bucket refill rate in requests/sec at each provider's HTTP boundary.
     # Generous by default so normal traffic is never delayed — a backstop against
     # a runaway poll loop, not a throttle on ordinary use.
