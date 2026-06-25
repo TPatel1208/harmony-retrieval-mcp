@@ -124,11 +124,19 @@ async def test_submit_variable_png_pins_the_imagenator(l2_caps) -> None:
 
 
 @pytest.mark.asyncio
-async def test_submit_raises_when_no_service_satisfies(l2_caps) -> None:
-    p = _provider(l2_caps, client=MagicMock())
+async def test_submit_unpinned_when_no_service_satisfies(l2_caps) -> None:
+    """Union trap (services exist, none match) → submit UNPINNED; server picks chain."""
+    client = MagicMock()
+    client.submit.return_value = "job-unpinned"
+    p = _provider(l2_caps, client=client)
     plan = RetrievalPlan(output_format="image/png", needs_bbox=True)  # union trap
-    with pytest.raises(ValueError):
-        await p.submit(plan)
+
+    ref = await p.submit(plan)
+
+    assert ref.provider_job_id == "job-unpinned"
+    client.submit.assert_called_once()
+    request = client.submit.call_args.args[0]
+    assert request.service_id is None  # no service pinned — Harmony picks the chain
 
 
 @pytest.mark.asyncio
@@ -157,14 +165,20 @@ async def test_harmony_submit_uses_hint_when_caps_empty() -> None:
 
 
 @pytest.mark.asyncio
-async def test_harmony_submit_still_raises_when_caps_present_but_no_service_satisfies(
+async def test_harmony_submit_ignores_hint_when_caps_present_but_no_match(
     l2_caps,
 ) -> None:
-    """Union-trap: caps non-empty but no service satisfies — hint must not bypass."""
-    p = _provider(l2_caps, client=MagicMock(), service_name_hint=SUBSETTER)
+    """Union-trap with caps present: a stored hint is NOT reused (it only covers a
+    failed caps fetch). We submit UNPINNED and let the server pick the chain."""
+    client = MagicMock()
+    client.submit.return_value = "job-unpinned"
+    p = _provider(l2_caps, client=client, service_name_hint=SUBSETTER)
     plan = RetrievalPlan(output_format="image/png", needs_bbox=True)  # union trap
-    with pytest.raises(ValueError):
-        await p.submit(plan)
+
+    await p.submit(plan)
+
+    request = client.submit.call_args.args[0]
+    assert request.service_id is None
 
 
 @pytest.mark.asyncio

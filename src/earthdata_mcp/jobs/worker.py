@@ -71,7 +71,13 @@ def _session_factory(ctx: dict[str, Any]):
 
 
 async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
-    """Submit a ``PENDING`` job to its provider and advance to ``SUBMITTED``."""
+    """Submit a ``PENDING`` job to its provider and advance to ``SUBMITTED``.
+
+    If the provider is Harmony and the submit fails, and OPeNDAP URLs are present
+    in the spec, the job is transparently re-routed to OPeNDAP: the spec's
+    ``provider`` field is updated to ``"opendap"`` in Postgres and ``submit_job``
+    is re-enqueued so the worker retries via OPeNDAP on the next pass.
+    """
     session_factory = _session_factory(ctx)
     async with session_factory() as session:
         job = await crud.get_job(session, job_id)
@@ -81,7 +87,27 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
 
     provider = await _provider_for(spec)
     plan = _plan_from_spec(spec)
-    ref = await provider.submit(plan)
+    try:
+        ref = await provider.submit(plan)
+    except Exception as exc:
+        opendap_urls = spec.get("opendap_urls") or []
+        if spec.get("provider") != "harmony" or not opendap_urls:
+            raise
+        logger.warning(
+            "Harmony submit failed for job %s (%s); falling back to OPeNDAP",
+            job_id,
+            exc,
+        )
+        async with session_factory() as session:
+            job = await crud.get_job(session, job_id)
+            if job is None:
+                return
+            new_spec = {**dict(job.request_spec), "provider": "opendap"}
+            job.provider = "opendap"
+            job.request_spec = new_spec
+            await session.commit()
+        await ctx["redis"].enqueue_job("submit_job", job_id)
+        return
 
     async with session_factory() as session:
         await crud.transition_state(

@@ -154,8 +154,9 @@ async def retrieve_subset(
 ) -> dict:
     """Retrieve a variable + bbox + temporal subset as a durable job.
 
-    Routes only to a single service that does all the requested transforms; fails
-    fast if none can (no Harmony fallback). Returns the job/obs handles.
+    Harmony is tried first: a single service that does all the requested transforms
+    is pinned; if none does, Harmony is submitted unpinned (server picks the chain).
+    OPeNDAP is the worker's runtime fallback. Returns the job/obs handles.
     """
     return await retrieval.retrieve_subset(
         dataset_handle, aoi_handle, time_range, variables, workspace_id, output_format

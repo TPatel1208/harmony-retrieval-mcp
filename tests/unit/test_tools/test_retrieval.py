@@ -28,7 +28,6 @@ from earthdata_mcp.providers._capabilities import (
     ServiceCapability,
 )
 from earthdata_mcp.providers.cmr import CMRProvider
-from earthdata_mcp.providers.router import NotRetrievable
 from earthdata_mcp.tools.retrieval import (
     cancel_retrieval,
     get_retrieval_status,
@@ -328,31 +327,34 @@ async def test_retrieve_data_defaults_netcdf_for_grid(
     assert job.request_spec["output_shape"] == "grid"
 
 
-async def test_retrieve_data_not_retrievable_raises(
+async def test_retrieve_data_routes_to_harmony_when_no_services(
     workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
 ) -> None:
+    # No Harmony service and no OPeNDAP — Harmony is tried unpinned (step 1.5).
+    # The worker falls back to OPeNDAP if Harmony fails at runtime.
     cmr = _make_cmr(_no_service_caps())
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
 
-    with pytest.raises(NotRetrievable):
-        await retrieve_data(
-            ds, aoi, _TIME, workspace_id=workspace_id,
-            cmr=cmr, store=workspace_store, provenance=provenance_store,
-            session_factory=session_factory, enqueue_fn=mock_enqueue,
-        )
-    # Failed at planning time → nothing enqueued, no orphan job.
-    mock_enqueue.assert_not_awaited()
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        cmr=cmr, store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=mock_enqueue,
+    )
+    assert out["provider"] == "harmony"
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    assert job.request_spec["service_name"] is None  # unpinned — server picks
+    mock_enqueue.assert_awaited_once()
 
 
-async def test_retrieve_data_routes_to_opendap_when_no_harmony_services(
+async def test_retrieve_data_routes_to_harmony_when_no_services_opendap_in_spec(
     workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
 ) -> None:
-    """When caps.services == [] but a granule has an OPeNDAP URL, route to opendap.
+    """Harmony is primary even when caps.services == [] (step 1.5 — server picks chain).
 
-    This is the TEMPO_NO2_L3 case: Harmony has bogus XYZ_PROV service associations
-    that make its /capabilities return 500, leaving services=[]. OPeNDAP is the
-    only viable transform path and must be auto-wired (router step 3, PLAN.md §4.2).
+    This is the TEMPO_NO2_L3 case. The OPeNDAP URL is still discovered and stored in
+    the spec so the worker can fall back to OPeNDAP if Harmony fails at runtime.
     """
     cmr = _make_cmr_with_opendap_granule(_grid_no_service_caps())
     ds = await _seed_dataset(workspace_store, workspace_id)
@@ -364,22 +366,24 @@ async def test_retrieve_data_routes_to_opendap_when_no_harmony_services(
         session_factory=session_factory, enqueue_fn=mock_enqueue,
     )
 
-    assert out["provider"] == "opendap"
+    assert out["provider"] == "harmony"
     async with session_factory() as session:
         job = await get_job_by_handle(session, out["job_handle"])
     spec = job.request_spec
-    assert spec["provider"] == "opendap"
+    assert spec["provider"] == "harmony"
+    assert spec["service_name"] is None  # unpinned
+    # OPeNDAP URL is still carried for the worker's Harmony→OPeNDAP fallback.
     assert spec["opendap_url"] == _OPENDAP_URL
 
 
-async def test_retrieve_data_format_defaults_to_netcdf_when_opendap_only(
+async def test_retrieve_data_format_defaults_to_netcdf_for_grid_no_service(
     workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
 ) -> None:
-    """Format defaults to netCDF-4 (not Zarr) when OPeNDAP is the only path.
+    """Format defaults to netCDF-4 (not Zarr) for a gridded collection with no service.
 
-    Zarr is Harmony-specific; OPeNDAP always returns netCDF. When caps.services
-    is empty and OPeNDAP is discovered, the format must be netCDF so
-    OPeNDAPProvider.can_handle returns True (it gates on _is_netcdf).
+    Zarr is Harmony-specific; OPeNDAP always returns netCDF. netCDF is the format
+    that routes broadly through both Harmony and OPeNDAP, so it is the correct
+    default for collections where no service is pinned.
     """
     cmr = _make_cmr_with_opendap_granule(_grid_no_service_caps())
     ds = await _seed_dataset(workspace_store, workspace_id)
@@ -396,17 +400,18 @@ async def test_retrieve_data_format_defaults_to_netcdf_when_opendap_only(
     spec = job.request_spec
     assert spec["output_format"] == "application/netcdf4"
     assert spec["output_shape"] == "grid"
-    assert spec["provider"] == "opendap"
+    assert spec["provider"] == "harmony"  # Harmony primary; OPeNDAP URL in spec for fallback
 
 
-async def test_retrieve_data_routes_to_opendap_when_service_lacks_bbox(
+async def test_retrieve_data_routes_to_harmony_unpinned_when_service_lacks_bbox(
     workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
 ) -> None:
-    """When a Harmony service exists but cannot bbox-subset, OPeNDAP is the fallback.
+    """When a Harmony service exists but cannot bbox-subset, Harmony is tried unpinned.
 
     This is the TEMPO HCHO L3 case: Harmony returns 200 with a LARC_CLOUD service
-    that only supports temporal subsetting (no bbox). The router must fall through
-    to OPeNDAP (step 3, PLAN.md §4.2) after the format is retried as netCDF-4.
+    that only supports temporal subsetting (no bbox). find_service returns None, so
+    step 1.5 routes to Harmony unpinned (server picks chain). The OPeNDAP URL is
+    still stored in the spec for the worker's Harmony→OPeNDAP fallback.
     """
     cmr = _make_cmr_with_opendap_granule(_grid_caps_with_nonbbox_service())
     ds = await _seed_dataset(workspace_store, workspace_id)
@@ -418,21 +423,24 @@ async def test_retrieve_data_routes_to_opendap_when_service_lacks_bbox(
         session_factory=session_factory, enqueue_fn=mock_enqueue,
     )
 
-    assert out["provider"] == "opendap"
+    assert out["provider"] == "harmony"
     async with session_factory() as session:
         job = await get_job_by_handle(session, out["job_handle"])
     spec = job.request_spec
-    assert spec["provider"] == "opendap"
-    assert spec["opendap_url"] == _OPENDAP_URL
+    assert spec["provider"] == "harmony"
+    assert spec["service_name"] is None  # unpinned
+    assert spec["opendap_url"] == _OPENDAP_URL  # carried for worker fallback
     assert spec["output_format"] == "application/netcdf4"
 
 
-async def test_retrieve_data_collects_all_window_granules_for_opendap(
+async def test_retrieve_data_collects_all_window_granules_for_opendap_fallback(
     workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
 ) -> None:
-    """A multi-day OPeNDAP request carries every granule's URL, not just the first.
+    """All granule OPeNDAP URLs in the window are stored in the spec for the worker fallback.
 
-    Without this the 3-day TEMPO request silently dropped to one scan cycle (Part 3).
+    Harmony is the primary (step 1.5), but every granule's OPeNDAP URL is still
+    collected and stored so the worker can fall back to OPeNDAP if Harmony fails.
+    Without this a multi-day request would silently drop to one scan cycle (Part 3).
     """
     cmr = _make_cmr_with_opendap_window(_grid_no_service_caps())
     ds = await _seed_dataset(workspace_store, workspace_id)
@@ -444,7 +452,7 @@ async def test_retrieve_data_collects_all_window_granules_for_opendap(
         session_factory=session_factory, enqueue_fn=mock_enqueue,
     )
 
-    assert out["provider"] == "opendap"
+    assert out["provider"] == "harmony"
     async with session_factory() as session:
         job = await get_job_by_handle(session, out["job_handle"])
     spec = job.request_spec

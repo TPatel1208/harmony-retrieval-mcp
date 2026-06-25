@@ -10,9 +10,10 @@ Harmony — it plans, persists a durable job, and hands the agent two handles:
 
 The out-of-process worker (``jobs/worker.py``) drives submit → poll → materialize.
 The tool's job is the **planning** half: resolve handles, fetch the merged
-:class:`CollectionCapabilities`, route the plan to one service (fail fast with
-:class:`NotRetrievable` if none fits — never a Harmony fallback), persist the
+:class:`CollectionCapabilities`, route the plan (Harmony-first — pin a matched
+service, else submit unpinned and let the server pick the chain), persist the
 **durable request spec** (re-materializable, never a staged URL), and enqueue.
+OPeNDAP is the worker's runtime fallback if a real Harmony submit fails.
 
 Format follows shape (§4.4): a gridded collection defaults to Zarr, a point
 collection to Parquet, everything else to netCDF-4 — we never force tabular data
@@ -34,6 +35,7 @@ from earthdata_mcp.providers._capabilities import CollectionCapabilities
 from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, TransformSpec
 from earthdata_mcp.providers.cmr import CMRProvider
+from earthdata_mcp.providers.harmony import HarmonyProvider
 from earthdata_mcp.providers.opendap import OPeNDAPProvider
 from earthdata_mcp.providers.router import Router, RoutingDecision
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
@@ -149,8 +151,11 @@ async def retrieve_subset(
     session_factory=None,
     enqueue_fn: EnqueueFn | None = None,
 ) -> dict:
-    """Retrieve a variable + bbox + temporal subset; routes only to a service that
-    does all three (PLAN.md §4.2 — one whole service, never the union)."""
+    """Retrieve a variable + bbox + temporal subset.
+
+    Harmony is tried first: a single service that does all three is pinned; if none
+    does (the union-trap case), Harmony is submitted unpinned and the server picks
+    the chain. OPeNDAP is the worker's runtime fallback if that submit fails."""
     return await _submit_retrieval(
         dataset_handle=dataset_handle,
         aoi_handle=aoi_handle,
@@ -365,6 +370,7 @@ async def _submit_retrieval(
     coord_lat, coord_lon = "lat", "lon"
     if opendap_urls:
         coord_lat, coord_lon = await _discover_coordinate_names(cmr, concept_id)
+    harmony_provider = HarmonyProvider(caps)
     opendap_provider = (
         OPeNDAPProvider(
             caps, opendap_urls=opendap_urls, coord_lat=coord_lat, coord_lon=coord_lon
@@ -373,7 +379,10 @@ async def _submit_retrieval(
         else None
     )
     decision = Router(
-        caps, appeears=AppEEARSProvider(caps), opendap=opendap_provider
+        caps,
+        harmony=harmony_provider,
+        appeears=AppEEARSProvider(caps),
+        opendap=opendap_provider,
     ).route(plan)
     service_name = decision.service.service_name if decision.service else None
 

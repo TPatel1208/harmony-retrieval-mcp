@@ -1,4 +1,4 @@
-"""HarmonyProvider — wraps the official harmony-py client (PLAN.md §4.3, hard rule).
+"""HarmonyProvider — wraps the official harmony-py client (CLAUDE.md hard rule).
 
 A :class:`~earthdata_mcp.providers.base.RetrievalProvider`. Our code is *only* the
 :class:`RetrievalPlan` → :class:`harmony.Request` mapping, the Harmony-status →
@@ -58,7 +58,7 @@ _UUID_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Harmony job status string -> our durable JobState (PLAN.md §4.3 state machine).
+# Harmony job status string -> our durable JobState (the durable state machine).
 _STATUS_MAP: dict[str, JobState] = {
     "accepted": JobState.SUBMITTED,
     "running": JobState.RUNNING,
@@ -105,32 +105,40 @@ class HarmonyProvider:
     # -- lifecycle --------------------------------------------------------
 
     async def submit(self, plan: RetrievalPlan) -> JobRef:
-        """Submit the matched service's Harmony job. Raises if no service matches.
+        """Submit a Harmony job — always tried first; pin a service when one matches.
 
-        The router gates this, but we re-check: a provider must never build a
-        request no single service can satisfy (the union trap, PLAN.md §4.2).
+        Harmony is the primary path for every transform plan. When ``find_service``
+        matches one whole service, we pin it via ``service_id``. When it returns
+        ``None`` — whether the collection has no CMR-registered Harmony services or
+        has services none of which satisfy the whole plan (the union-trap case, e.g.
+        TEMPO L3) — we submit **unpinned** and let the Harmony server pick its default
+        chain. We never union across services to build a ``service_id``; we simply let
+        the server decide. If this real submit fails at runtime, the worker falls back
+        to OPeNDAP (the runtime-only fallback).
         """
         svc = self._caps.find_service(plan)
         if svc is None and self._service_name_hint and not self._caps.services:
+            # Capabilities fetch came back empty (transient failure) but we stored a
+            # matched service name on a prior pass — pin it rather than guess.
             logger.warning(
                 "Harmony capabilities unavailable for %s; using stored service %s",
                 plan.concept_id,
                 self._service_name_hint,
             )
             svc = ServiceCapability(service_name=self._service_name_hint, concept_id="")
-        if svc is None:
-            raise ValueError(
-                "no single Harmony service satisfies this plan — the router must "
-                "not dispatch it to Harmony (PLAN.md §4.2, no union/fallback)"
-            )
+        # svc may still be None here — no single service matches (union trap) or the
+        # collection has no registered services. Submit UNPINNED and let the Harmony
+        # server pick its chain. OPeNDAP is the worker's runtime fallback if this fails.
         request = self._build_request(plan, svc)
         client = self._client()
         await get_limiter("harmony").acquire()
         job_id = await asyncio.to_thread(client.submit, request)
         logger.info(
-            "Harmony job submitted: service=%s job_id=%s", svc.service_name, job_id
+            "Harmony job submitted: service=%s job_id=%s",
+            svc.service_name if svc else "<server-default>",
+            job_id,
         )
-        # Durable coordinates only — never a staged-output URL (PLAN.md §4.5).
+        # Durable coordinates only — never a staged-output URL.
         return JobRef(
             provider=PROVIDER,
             provider_job_id=str(job_id),
@@ -138,7 +146,7 @@ class HarmonyProvider:
         )
 
     async def poll(self, job: JobRef) -> JobStatus:
-        """One status check (the durable worker drives the loop, PLAN.md §4.3)."""
+        """One status check (the durable worker drives the loop)."""
         if not job.provider_job_id or not _UUID_RE.match(job.provider_job_id):
             raise ValueError(
                 f"invalid Harmony job ID {job.provider_job_id!r}: expected UUID; "
@@ -173,19 +181,20 @@ class HarmonyProvider:
     # -- harmony-py request mapping (the only logic we own) ---------------
 
     def _build_request(
-        self, plan: RetrievalPlan, svc: ServiceCapability
+        self, plan: RetrievalPlan, svc: ServiceCapability | None
     ) -> "harmony.Request":
         """Map a :class:`RetrievalPlan` onto a harmony-py :class:`Request`.
 
-        Pins the matched service via ``service_id`` (harmony-py accepts a service
-        chain name there) so Harmony runs *that* service, not the wrong one.
+        When ``svc`` is not ``None`` the matched service is pinned via
+        ``service_id`` so Harmony runs that chain. When ``svc`` is ``None`` (no
+        single service matches — the union-trap case — or no registered services)
+        ``service_id`` is omitted and the Harmony server picks its default chain.
         """
         import harmony
 
-        kwargs: dict[str, object] = {
-            "format": plan.output_format,
-            "service_id": svc.service_name,
-        }
+        kwargs: dict[str, object] = {"format": plan.output_format}
+        if svc is not None:
+            kwargs["service_id"] = svc.service_name
         if plan.aoi is not None and plan.aoi.bbox is not None:
             kwargs["spatial"] = harmony.BBox(*plan.aoi.bbox)
         if plan.time_range is not None:
@@ -200,8 +209,8 @@ class HarmonyProvider:
             if transform.reproject:
                 kwargs["crs"] = transform.reproject
         # Concatenate long swath time-series only when the matched service offers
-        # it (PLAN.md §4.2: L2 stitchee machinery). Never assume the union.
-        if svc.concatenate:
+        # it (L2 stitchee machinery). Never assume the union.
+        if svc is not None and svc.concatenate:
             kwargs["concatenate"] = True
         collection_id = plan.concept_id or self._caps.concept_id
         return harmony.Request(harmony.Collection(id=collection_id), **kwargs)
