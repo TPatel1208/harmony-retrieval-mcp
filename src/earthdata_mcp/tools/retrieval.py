@@ -36,7 +36,7 @@ from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, TransformSpec
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.providers.harmony import HarmonyProvider
-from earthdata_mcp.providers.opendap import OPeNDAPProvider
+from earthdata_mcp.providers.opendap import OPeNDAPProvider, _resolve_from_cmr
 from earthdata_mcp.providers.router import Router, RoutingDecision
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.models import HandleType, handle_type_of
@@ -367,9 +367,15 @@ async def _submit_retrieval(
     # OPeNDAP is wired when a granule URL was discovered (router step 3, PLAN.md §4.2).
     # AppEEARS handles point-sample plans (step 0); OPeNDAP handles gridded/swath
     # bbox+variable+temporal subsets when Harmony has no capable service (step 3).
+    #
+    # When OPeNDAP URLs are present we resolve variable names to their full UMM-V
+    # paths in one get_variables call: bare leaf names become /<group>/<leaf> for
+    # grouped collections (TEMPO), coordinate names are discovered in the same pass.
+    # Resolved names flow into both the Harmony primary submit and the OPeNDAP
+    # fallback via the durable spec, so neither path re-derives them.
     coord_lat, coord_lon = "lat", "lon"
     if opendap_urls:
-        coord_lat, coord_lon = await _discover_coordinate_names(cmr, concept_id)
+        coord_lat, coord_lon, variables = await _resolve_from_cmr(cmr, concept_id, variables)
     harmony_provider = HarmonyProvider(caps)
     opendap_provider = (
         OPeNDAPProvider(
@@ -538,42 +544,6 @@ def _cache_key(
         ]
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
-
-
-_LAT_CANONICAL = frozenset({"lat", "latitude"})
-_LON_CANONICAL = frozenset({"lon", "longitude"})
-
-
-async def _discover_coordinate_names(
-    cmr: CMRProvider,
-    concept_id: str,
-) -> tuple[str, str]:
-    """Return ``(lat_name, lon_name)`` from CMR UMM-V for this collection.
-
-    Priority:
-    1. Variable whose ``standard_name`` is ``"latitude"`` / ``"longitude"``.
-    2. Variable whose ``name`` itself is a canonical coordinate name (covers
-       collections where UMM-V has no StandardName but the variable is named
-       ``"latitude"``/``"longitude"``).
-    3. Default ``("lat", "lon")`` when UMM-V has no coordinate metadata or
-       the lookup fails.
-    """
-    try:
-        variables = await cmr.get_variables(concept_id)
-    except Exception:
-        return "lat", "lon"
-    lat_name, lon_name = "lat", "lon"
-    for var in variables:
-        sn = (var.get("standard_name") or "").lower()
-        name = var.get("name") or ""
-        if not name:
-            continue
-        name_lower = name.lower()
-        if sn == "latitude" or (sn == "" and name_lower in _LAT_CANONICAL):
-            lat_name = name
-        elif sn == "longitude" or (sn == "" and name_lower in _LON_CANONICAL):
-            lon_name = name
-    return lat_name, lon_name
 
 
 #: Cap on granules pulled into a single OPeNDAP bundle (one DAP4 bbox subset each).

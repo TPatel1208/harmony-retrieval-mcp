@@ -212,6 +212,11 @@ class OPeNDAPProvider:
 # -- helpers ---------------------------------------------------------------
 
 
+def _fqn(name: str) -> str:
+    """Return ``name`` as a DAP4 fully-qualified name (leading slash)."""
+    return name if name.startswith("/") else f"/{name}"
+
+
 def _constraint_expression(
     plan: RetrievalPlan,
     *,
@@ -220,10 +225,13 @@ def _constraint_expression(
 ) -> str:
     """Build a DAP4 projection CE from the plan's variables + coordinate variables.
 
+    Every projected name is emitted as a DAP4 fully-qualified name (leading slash):
+    ``/var`` for a root variable; ``/<group>/<leaf>`` for a grouped variable.
+    This is the canonical form for both flat and grouped netCDF4 collections.
+
     ``coord_lat`` and ``coord_lon`` are the actual variable names in this
     collection's netCDF files — they vary (``lat``/``lon`` for GLDAS;
-    ``latitude``/``longitude`` for TEMPO L3; ``Latitude``/``Longitude`` for
-    GES DISC monthly products).
+    ``/product/latitude``/``/product/longitude`` for TEMPO L2 grouped).
 
     ``/time`` is intentionally omitted: temporal filtering happens at the CMR
     granule-search level (selecting which files to fetch), not within a file via
@@ -236,12 +244,78 @@ def _constraint_expression(
 
     projected: list[str] = []
     if plan.needs_bbox:
-        projected.extend([f"/{coord_lat}", f"/{coord_lon}"])
-    projected.extend(f"/{v}" for v in plan.transform.variables)
+        projected.extend([coord_lat, coord_lon])
+    projected.extend(plan.transform.variables)
     # Preserve order while dropping duplicate coordinate projections.
     seen: set[str] = set()
     unique = [p for p in projected if not (p in seen or seen.add(p))]
-    return ";".join(unique)
+    return ";".join(_fqn(v) for v in unique)
+
+
+async def _resolve_from_cmr(
+    cmr: object,
+    concept_id: str,
+    variables: tuple[str, ...],
+) -> tuple[str, str, tuple[str, ...]]:
+    """Resolve variable names and discover coordinate names from CMR UMM-V.
+
+    Makes exactly one ``get_variables()`` call for the collection. Returns
+    ``(lat_name, lon_name, resolved_variables)`` where each resolved path is
+    the full CMR UMM-V ``Name`` value for that variable.
+
+    Variable matching:
+    * Already a full path (starts with ``/``) → used as-is, no lookup.
+    * Bare name → case-insensitive match against the last segment of each CMR
+      variable's ``Name``.  Zero matches → pass through unchanged.
+      Exactly one match → substitute the full CMR path.
+      More than one match → raise ``ValueError`` naming all conflicting paths.
+
+    Falls back to ``("lat", "lon", variables_as_passed)`` on any network or
+    CMR error. The ambiguity ``ValueError`` is raised *after* the try block so
+    it is never swallowed by the network-error handler.
+    """
+    try:
+        cmr_vars = await cmr.get_variables(concept_id)  # type: ignore[attr-defined]
+    except Exception:
+        return ("lat", "lon", variables)
+
+    # Discover coordinate variable names from CMR UMM-V standard_name or
+    # canonical leaf name.
+    lat_name = "lat"
+    lon_name = "lon"
+    for var in cmr_vars:
+        name: str = var.get("name") or ""
+        std = (var.get("standard_name") or "").lower()
+        leaf = name.rsplit("/", 1)[-1].lower()
+        if std == "latitude" or leaf in ("lat", "latitude"):
+            lat_name = name
+        elif std == "longitude" or leaf in ("lon", "longitude"):
+            lon_name = name
+
+    # Resolve data variable names: exact full paths pass through; bare names
+    # are matched against CMR leaf segments (case-insensitive).
+    resolved: list[str] = []
+    for user_var in variables:
+        if user_var.startswith("/"):
+            resolved.append(user_var)
+            continue
+        leaf_lower = user_var.lower()
+        matches = [
+            v["name"]
+            for v in cmr_vars
+            if (v.get("name") or "").rsplit("/", 1)[-1].lower() == leaf_lower
+        ]
+        if len(matches) == 1:
+            resolved.append(matches[0])
+        elif not matches:
+            resolved.append(user_var)
+        else:
+            raise ValueError(
+                f"Variable {user_var!r} is ambiguous — it appears at multiple "
+                f"paths: {', '.join(matches)}"
+            )
+
+    return (lat_name, lon_name, tuple(resolved))
 
 
 def _is_netcdf(output_format: str) -> bool:
