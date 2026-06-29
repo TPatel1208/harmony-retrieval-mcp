@@ -142,8 +142,8 @@ async def test_submit_builds_dap4_url_with_projected_variables() -> None:
     # /time is NOT projected — temporal filtering is at CMR granule-search level;
     # many L3 files have no time variable at all (time is in the filename).
     ce = unquote(ref.provider_job_url.split("dap4.ce=", 1)[1])
-    assert "/precipitation" in ce
-    assert "/lat" in ce and "/lon" in ce  # needs_bbox
+    assert "precipitation" in ce
+    assert "lat" in ce and "lon" in ce  # needs_bbox
     assert "/time" not in ce
 
 
@@ -192,10 +192,10 @@ async def test_materialize_bundles_granules_into_one_zip(
     import zipfile
     from io import BytesIO
 
-    url1 = OPENDAP_URL + ".dap.nc4?dap4.ce=%2Fprecipitation"
+    url1 = OPENDAP_URL + ".dap.nc4?dap4.ce=precipitation"
     url2 = (
         "https://opendap.earthdata.nasa.gov/collections/C1-GES_DISC/granules/"
-        "GLDAS_NOAH025_3H.A20240101.0300.021.nc4.dap.nc4?dap4.ce=%2Fprecipitation"
+        "GLDAS_NOAH025_3H.A20240101.0300.021.nc4.dap.nc4?dap4.ce=precipitation"
     )
     httpx_mock.add_response(url=url1, content=b"granule-one")
     httpx_mock.add_response(url=url2, content=b"granule-two")
@@ -230,3 +230,131 @@ async def test_materialize_bundles_granules_into_one_zip(
 async def test_materialize_raises_without_constraint_url() -> None:
     with pytest.raises(ValueError, match="provider_job_url"):
         await _provider().materialize(JobRef(provider="opendap"))
+
+
+# -- _resolve_from_cmr: variable path resolution ---------------------------
+
+
+class _CmrStub:
+    """Minimal CMR stub: returns a fixed variable list or raises on demand."""
+
+    def __init__(self, vars_or_exc: list[dict] | BaseException) -> None:
+        self._vars = vars_or_exc
+
+    async def get_variables(self, concept_id: str, **_: object) -> list[dict]:
+        if isinstance(self._vars, BaseException):
+            raise self._vars
+        return list(self._vars)
+
+
+from earthdata_mcp.providers.opendap import _constraint_expression, _resolve_from_cmr  # noqa: E402
+
+
+# -- _constraint_expression: DAP4 FQN serialization ------------------------
+
+
+def test_constraint_expression_root_variable_gets_leading_slash() -> None:
+    """Root-level variable names are prefixed with '/' to form a DAP4 FQN."""
+    plan = _subset_plan()  # variables=("precipitation",)
+    ce = _constraint_expression(plan)
+    assert ce == "/precipitation"
+
+
+def test_constraint_expression_grouped_variable_preserves_existing_slash() -> None:
+    """A variable already carrying a group path (leading '/') is used as-is."""
+    plan = RetrievalPlan(
+        output_format=NETCDF,
+        needs_variable=True,
+        concept_id="C1-GES_DISC",
+        transform=TransformSpec(
+            output_format=NETCDF, variables=("/product/vertical_column_total",)
+        ),
+    )
+    ce = _constraint_expression(plan)
+    assert ce == "/product/vertical_column_total"
+
+
+def test_constraint_expression_bbox_emits_fqn_for_flat_coords() -> None:
+    """Flat collection coord names (bare 'lat'/'lon') get a leading slash."""
+    plan = RetrievalPlan(
+        output_format=NETCDF,
+        needs_variable=True,
+        needs_bbox=True,
+        concept_id="C1-GES_DISC",
+        aoi=AOI(bbox=(-105.0, 37.0, -104.0, 38.0)),
+        transform=TransformSpec(output_format=NETCDF, variables=("precipitation",)),
+    )
+    ce = _constraint_expression(plan, coord_lat="lat", coord_lon="lon")
+    parts = ce.split(";")
+    assert "/lat" in parts
+    assert "/lon" in parts
+    assert "/precipitation" in parts
+
+
+def test_constraint_expression_bbox_emits_fqn_for_grouped_coords() -> None:
+    """Grouped collection coord names already start with '/' and pass through."""
+    plan = RetrievalPlan(
+        output_format=NETCDF,
+        needs_variable=True,
+        needs_bbox=True,
+        concept_id="C1-TEMPO",
+        aoi=AOI(bbox=(-105.0, 37.0, -104.0, 38.0)),
+        transform=TransformSpec(
+            output_format=NETCDF, variables=("/product/vertical_column_total",)
+        ),
+    )
+    ce = _constraint_expression(
+        plan,
+        coord_lat="/product/latitude",
+        coord_lon="/product/longitude",
+    )
+    parts = ce.split(";")
+    assert "/product/latitude" in parts
+    assert "/product/longitude" in parts
+    assert "/product/vertical_column_total" in parts
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_cmr_grouped_file() -> None:
+    """A bare leaf name is resolved to its full grouped CMR path (case-insensitive)."""
+    cmr = _CmrStub([{"name": "/product/ScienceData", "standard_name": None}])
+    lat, lon, resolved = await _resolve_from_cmr(cmr, "C1", ("sciencedata",))
+    assert resolved == ("/product/ScienceData",)
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_cmr_exact_path_passthrough() -> None:
+    """A variable name that already starts with '/' is used as-is, no CMR lookup."""
+    cmr = _CmrStub([{"name": "/product/ScienceData", "standard_name": None}])
+    lat, lon, resolved = await _resolve_from_cmr(cmr, "C1", ("/product/ScienceData",))
+    assert resolved == ("/product/ScienceData",)
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_cmr_ambiguity_raises() -> None:
+    """A bare name matched by multiple CMR paths raises ValueError naming all paths."""
+    cmr = _CmrStub([
+        {"name": "/a/ndvi", "standard_name": None},
+        {"name": "/b/ndvi", "standard_name": None},
+    ])
+    with pytest.raises(ValueError) as exc_info:
+        await _resolve_from_cmr(cmr, "C1", ("ndvi",))
+    msg = str(exc_info.value)
+    assert "/a/ndvi" in msg and "/b/ndvi" in msg
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_cmr_cmr_failure_fallback() -> None:
+    """On any CMR exception the bare name flows through and no exception propagates."""
+    cmr = _CmrStub(RuntimeError("network down"))
+    lat, lon, resolved = await _resolve_from_cmr(cmr, "C1", ("precipitation",))
+    assert resolved == ("precipitation",)
+    assert lat == "lat" and lon == "lon"
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_cmr_not_found_passthrough() -> None:
+    """A bare name absent from CMR variables passes through unchanged."""
+    cmr = _CmrStub([{"name": "/product/other_var", "standard_name": None}])
+    lat, lon, resolved = await _resolve_from_cmr(cmr, "C1", ("myvar",))
+    assert resolved == ("myvar",)

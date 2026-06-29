@@ -197,6 +197,73 @@ def _make_cmr_with_opendap_window(caps: CollectionCapabilities) -> CMRProvider:
     return cmr
 
 
+_GROUPED_VARS = [
+    {"name": "/product/vertical_column_total", "standard_name": None},
+    {"name": "/product/latitude", "standard_name": "latitude"},
+    {"name": "/product/longitude", "standard_name": "longitude"},
+]
+
+_AMBIGUOUS_VARS = [
+    {"name": "/a/ndvi", "standard_name": None},
+    {"name": "/b/ndvi", "standard_name": None},
+]
+
+
+def _make_cmr_with_grouped_vars(caps: CollectionCapabilities) -> CMRProvider:
+    """CMR mock returning grouped UMM-V variables and one OPeNDAP granule.
+
+    The OPeNDAP granule triggers variable resolution so we can assert the spec
+    carries the resolved full group paths, not the bare leaf names.
+    """
+    cmr = CMRProvider.__new__(CMRProvider)
+    cmr.collection_capabilities = AsyncMock(return_value=caps)
+    cmr.search_granules = AsyncMock(
+        return_value=[
+            {
+                "related_urls": [
+                    {"URL": _OPENDAP_URL, "Type": "USE SERVICE API", "Subtype": "OPENDAP DATA"}
+                ]
+            }
+        ]
+    )
+    cmr.get_variables = AsyncMock(return_value=_GROUPED_VARS)
+    return cmr
+
+
+def _make_cmr_with_ambiguous_vars(caps: CollectionCapabilities) -> CMRProvider:
+    """CMR mock where the requested variable name maps to multiple group paths."""
+    cmr = CMRProvider.__new__(CMRProvider)
+    cmr.collection_capabilities = AsyncMock(return_value=caps)
+    cmr.search_granules = AsyncMock(
+        return_value=[
+            {
+                "related_urls": [
+                    {"URL": _OPENDAP_URL, "Type": "USE SERVICE API", "Subtype": "OPENDAP DATA"}
+                ]
+            }
+        ]
+    )
+    cmr.get_variables = AsyncMock(return_value=_AMBIGUOUS_VARS)
+    return cmr
+
+
+def _make_cmr_with_var_lookup_error(caps: CollectionCapabilities) -> CMRProvider:
+    """CMR mock whose get_variables raises (simulates a network failure)."""
+    cmr = CMRProvider.__new__(CMRProvider)
+    cmr.collection_capabilities = AsyncMock(return_value=caps)
+    cmr.search_granules = AsyncMock(
+        return_value=[
+            {
+                "related_urls": [
+                    {"URL": _OPENDAP_URL, "Type": "USE SERVICE API", "Subtype": "OPENDAP DATA"}
+                ]
+            }
+        ]
+    )
+    cmr.get_variables = AsyncMock(side_effect=RuntimeError("network error"))
+    return cmr
+
+
 @pytest.fixture
 def grid_cmr() -> CMRProvider:
     return _make_cmr(_grid_caps())
@@ -667,3 +734,118 @@ async def test_cancel_cross_workspace_denied(
             out["job_handle"], workspace_id="ws-intruder",
             store=workspace_store, session_factory=session_factory,
         )
+
+
+# -- variable path resolution wired through planning -----------------------
+
+
+async def test_retrieve_subset_resolves_bare_leaf_to_grouped_path(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """A bare leaf name is resolved to its full UMM-V group path in the durable spec.
+
+    This is the TEMPO case: 'vertical_column_total' → '/product/vertical_column_total'.
+    The OPeNDAP granule in the CMR mock triggers resolution; the resolved path
+    must appear in spec['variables'] so the OPeNDAP worker fallback builds the
+    correct DAP4 CE without a second CMR round-trip.
+    """
+    cmr = _make_cmr_with_grouped_vars(_grid_no_service_caps())
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_subset(
+        ds, aoi, _TIME, ["vertical_column_total"], workspace_id=workspace_id,
+        cmr=cmr, store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=mock_enqueue,
+    )
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    spec = job.request_spec
+    assert spec["variables"] == ["/product/vertical_column_total"]
+    assert spec["coord_lat"] == "/product/latitude"
+    assert spec["coord_lon"] == "/product/longitude"
+
+
+async def test_retrieve_subset_passes_through_already_qualified_path(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """A variable already starting with '/' is used as-is — no second lookup."""
+    cmr = _make_cmr_with_grouped_vars(_grid_no_service_caps())
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_subset(
+        ds, aoi, _TIME, ["/product/vertical_column_total"], workspace_id=workspace_id,
+        cmr=cmr, store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=mock_enqueue,
+    )
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    assert job.request_spec["variables"] == ["/product/vertical_column_total"]
+
+
+async def test_retrieve_subset_passes_through_unmatched_variable(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """A bare name absent from CMR UMM-V passes through unchanged (degrade, no fail)."""
+    cmr = _make_cmr_with_grouped_vars(_grid_no_service_caps())
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_subset(
+        ds, aoi, _TIME, ["unknown_var"], workspace_id=workspace_id,
+        cmr=cmr, store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=mock_enqueue,
+    )
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    assert job.request_spec["variables"] == ["unknown_var"]
+
+
+async def test_retrieve_subset_raises_fast_on_ambiguous_variable(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """A bare name matching multiple group paths raises ValueError at planning time.
+
+    The error names all conflicting paths so the user can disambiguate, and no
+    orphan job is created.
+    """
+    cmr = _make_cmr_with_ambiguous_vars(_grid_no_service_caps())
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    with pytest.raises(ValueError) as exc_info:
+        await retrieve_subset(
+            ds, aoi, _TIME, ["ndvi"], workspace_id=workspace_id,
+            cmr=cmr, store=workspace_store, provenance=provenance_store,
+            session_factory=session_factory, enqueue_fn=mock_enqueue,
+        )
+    msg = str(exc_info.value)
+    assert "/a/ndvi" in msg and "/b/ndvi" in msg
+
+
+async def test_retrieve_subset_cmr_error_falls_back_gracefully(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """When get_variables raises, variables pass through unchanged and no error propagates."""
+    cmr = _make_cmr_with_var_lookup_error(_grid_no_service_caps())
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_subset(
+        ds, aoi, _TIME, ["vertical_column_total"], workspace_id=workspace_id,
+        cmr=cmr, store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=mock_enqueue,
+    )
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    spec = job.request_spec
+    # Falls back to the bare name — degrade, not fail.
+    assert spec["variables"] == ["vertical_column_total"]
+    # Coordinate defaults are used on CMR failure.
+    assert spec["coord_lat"] == "lat"
+    assert spec["coord_lon"] == "lon"
