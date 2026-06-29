@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -40,3 +41,11 @@ class StorageBackend(ABC):
     @abstractmethod
     async def stat(self, key: str) -> StatResult:
         """Return metadata for ``key``; raise ``KeyError`` if absent."""
+
+    def path(self, key: str) -> "Path | None":
+        """Filesystem ``Path`` for ``key``, or ``None`` if not path-addressable (e.g. S3).
+
+        The default returns ``None``; ``LocalFilesystemBackend`` overrides this so
+        callers can open the file directly with xarray/dask without reading bytes first.
+        """
+        return None

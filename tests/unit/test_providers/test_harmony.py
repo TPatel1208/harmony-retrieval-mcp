@@ -275,3 +275,43 @@ async def test_materialize_persists_result_to_storage(
     assert result.size_bytes == len(payload)
     assert result.storage_key.startswith("harmony/job_abc/")
     assert await local_backend.get(result.storage_key) == payload
+
+
+@pytest.mark.asyncio
+async def test_materialize_bundles_multiple_granules(
+    l2_caps, local_backend, tmp_path
+) -> None:
+    # A multi-granule Harmony result (one file per input granule) is bundled into a
+    # single netCDF-bundle zip so the whole request materializes — not just the first
+    # granule — matching OPeNDAPProvider and what tools/_dataio concatenates on read.
+    import io
+    import zipfile
+
+    members = {
+        "TEMPO_NO2_L3_S002.nc4": b"\x89granule-002",
+        "TEMPO_NO2_L3_S003.nc4": b"\x89granule-003",
+        "TEMPO_NO2_L3_S004.nc4": b"\x89granule-004",
+    }
+    futures = []
+    for name, data in members.items():
+        path = tmp_path / name
+        path.write_bytes(data)
+        future = MagicMock()
+        future.result.return_value = str(path)
+        futures.append(future)
+    client = MagicMock()
+    client.download_all.return_value = iter(futures)
+
+    p = _provider(l2_caps, client=client, storage=local_backend)
+    result = await p.materialize(
+        JobRef(provider="harmony", provider_job_id=_VALID_UUID, job_handle="job_xyz")
+    )
+
+    assert result.media_type == "application/netcdf-bundle+zip"
+    assert result.storage_key == "harmony/job_xyz/result.nc.zip"
+    assert result.extra["granule_count"] == 3
+    bundle = await local_backend.get(result.storage_key)
+    with zipfile.ZipFile(io.BytesIO(bundle)) as zf:
+        assert sorted(zf.namelist()) == sorted(members)
+        for name, data in members.items():
+            assert zf.read(name) == data

@@ -314,3 +314,35 @@ async def test_inspect_statistics_cross_workspace_denied(
             cube, workspace_id="ws-intruder",
             store=workspace_store, storage=local_backend,
         )
+
+
+def test_statistics_fused_matches_eager():
+    """_statistics_fused on a chunked dataset agrees with _statistics (eager)."""
+    from earthdata_mcp.tools.preview import _statistics, _statistics_fused
+
+    ds_eager = _grid()
+    ds_lazy = ds_eager.chunk({"lat": 1, "lon": 1})
+    eager = _statistics(ds_eager, None)
+    fused = _statistics_fused(ds_lazy, None)
+    assert fused["ndvi"]["min"] == pytest.approx(eager["ndvi"]["min"])
+    assert fused["ndvi"]["max"] == pytest.approx(eager["ndvi"]["max"])
+    assert fused["ndvi"]["mean"] == pytest.approx(eager["ndvi"]["mean"])
+    assert fused["ndvi"]["count"] == eager["ndvi"]["count"]
+
+
+async def test_inspect_statistics_takes_fused_path(
+    workspace_store, local_backend, workspace_id, monkeypatch
+):
+    """inspect_statistics calls _statistics_fused (not _statistics) for a local backend."""
+    import earthdata_mcp.tools.preview as mod
+
+    called = []
+    orig = mod._statistics_fused
+    monkeypatch.setattr(
+        mod, "_statistics_fused", lambda o, v: called.append(1) or orig(o, v)
+    )
+    handle = await _seed_cube(workspace_store, local_backend, workspace_id, _grid())
+    await inspect_statistics(
+        handle, workspace_id=workspace_id, store=workspace_store, storage=local_backend
+    )
+    assert called, "_statistics_fused was not called — lazy path not taken"

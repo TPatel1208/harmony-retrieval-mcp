@@ -25,10 +25,15 @@ Only the guaranteed stack is used (``xarray`` + ``zarr`` + ``h5netcdf``, ``pyarr
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import tempfile
 import zipfile
+from pathlib import Path
+
+import zarr
+import zarr.storage
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -79,6 +84,83 @@ def open_result(data: bytes, media_type: str) -> xr.Dataset | pa.Table:
         f"{ZARR_MEDIA_TYPE!r}, {PARQUET_MEDIA_TYPE!r}, "
         f"{NETCDF_BUNDLE_MEDIA_TYPE!r}, and netCDF-4)"
     )
+
+
+@contextlib.contextmanager
+def open_result_lazy(
+    path: Path, media_type: str, variables: list[str] | None = None
+):
+    """Open a stored result lazily (dask-backed) from a filesystem path.
+
+    Context manager: keeps file handles and temp dirs alive while the caller
+    computes statistics.  For Parquet, ``variables`` drives column projection at
+    read time.  All other paths ignore ``variables`` — variable selection happens
+    at the statistics layer on the already-lazy array.
+
+    Raises :class:`UnsupportedMediaType` for unrecognised ``media_type``.
+    """
+    if media_type == ZARR_MEDIA_TYPE:
+        # ZipStore in read mode: zarr reads individual chunk blobs on demand —
+        # no full extraction to a temp dir.  The write path still avoids ZipStore
+        # (it can't overwrite group attrs that xarray writes), but reading is fine.
+        store = zarr.storage.ZipStore(str(path), mode="r")
+        try:
+            yield xr.open_zarr(store, chunks="auto", consolidated=False)
+        finally:
+            store.close()
+
+    elif media_type in NETCDF_MEDIA_TYPES:
+        # xr.open_groups propagates chunks= to each internal open_dataset call,
+        # so both plain and grouped (TEMPO/OMI) netCDF come back dask-backed.
+        groups = xr.open_groups(
+            path, engine=_NETCDF_ENGINE, chunks="auto", decode_times=False
+        )
+        try:
+            yield _merge_groups(groups)
+        finally:
+            for ds in groups.values():
+                ds.close()
+
+    elif media_type == NETCDF_BUNDLE_MEDIA_TYPE:
+        # Extract to temp, open with open_mfdataset — dask defers chunk reads
+        # until compute time, which happens before the temp dir is removed.
+        with tempfile.TemporaryDirectory() as tmp:
+            with zipfile.ZipFile(path) as zf:
+                zf.extractall(tmp)
+            member_paths = sorted(p for p in Path(tmp).iterdir() if p.is_file())
+            if not member_paths:
+                raise UnsupportedMediaType("netCDF bundle is empty")
+            if len(member_paths) == 1:
+                ds = xr.open_dataset(
+                    member_paths[0],
+                    engine=_NETCDF_ENGINE,
+                    chunks="auto",
+                    decode_times=False,
+                )
+                try:
+                    yield ds
+                finally:
+                    ds.close()
+            else:
+                ds = xr.open_mfdataset(
+                    member_paths,
+                    engine=_NETCDF_ENGINE,
+                    chunks="auto",
+                    concat_dim=_BUNDLE_CONCAT_DIM,
+                    combine="nested",
+                    preprocess=_strip_unsafe_coord_attrs,
+                    decode_times=False,
+                )
+                try:
+                    yield ds
+                finally:
+                    ds.close()
+
+    elif media_type == PARQUET_MEDIA_TYPE:
+        yield pq.read_table(path, columns=variables)
+
+    else:
+        raise UnsupportedMediaType(f"cannot lazily open media type {media_type!r}")
 
 
 def serialize_result(obj: xr.Dataset | pa.Table, media_type: str) -> tuple[str, bytes]:

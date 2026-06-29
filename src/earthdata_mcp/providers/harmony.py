@@ -21,10 +21,12 @@ key (§4.4), and worker wiring are deliberately **not** built here.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import mimetypes
 import re
 import tempfile
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -53,10 +55,25 @@ logger = logging.getLogger(__name__)
 
 PROVIDER = "harmony"
 
+# mimetypes.guess_type doesn't know NetCDF/HDF5 extensions on Windows or most
+# Linux systems without a MIME database — patch the gap so Harmony .nc outputs
+# aren't stored as opaque octet-stream blobs that open_result() can't read.
+_EXT_MEDIA_TYPES: dict[str, str] = {
+    ".nc": "application/netcdf4",
+    ".nc4": "application/netcdf4",
+    ".h5": "application/netcdf4",
+    ".hdf5": "application/netcdf4",
+}
+
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+
+# A multi-granule Harmony result (one output file per input granule) is bundled as a
+# zip of netCDF members under this media type, identical to OPeNDAPProvider's output,
+# so tools/_dataio opens it and concatenates the granules on the time axis on read.
+_NETCDF_BUNDLE_MEDIA_TYPE = "application/netcdf-bundle+zip"
 
 # Harmony job status string -> our durable JobState (the durable state machine).
 _STATUS_MAP: dict[str, JobState] = {
@@ -161,21 +178,46 @@ class HarmonyProvider:
         return status
 
     async def materialize(self, job: JobRef) -> MaterializedResult:
-        """Persist the finished job's result through ``StorageBackend``.
+        """Persist the finished job's result(s) through ``StorageBackend``.
 
-        Thin by design (Phase 4): harmony-py downloads the result files; we lift
-        the first one's bytes into the backend under a job-scoped key and return a
-        :class:`MaterializedResult`. Format-by-shape and cache-keying are Phase 6.
+        A Harmony job emits **one output file per input granule**. A single-file
+        result is stored as-is, preserving its detected media type (covers single
+        netCDF/Parquet/Zarr outputs). A multi-granule result is **bundled** into one
+        zip of netCDF members under :data:`_NETCDF_BUNDLE_MEDIA_TYPE` — identical to
+        :meth:`OPeNDAPProvider.materialize`, so one obs handle maps to one key and
+        the whole request is materialized (not just the first granule);
+        ``tools/_dataio`` concatenates the members on the time axis on read.
         """
         client = self._client()
         storage = self._storage_backend()
-        name, data = await asyncio.to_thread(self._download_first, client, job)
+        files = await asyncio.to_thread(self._download_all, client, job)
         handle = job.job_handle or job.provider_job_id or "result"
-        key = f"{PROVIDER}/{handle}/{name}"
-        await storage.put(key, data)
-        media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+        if len(files) == 1:
+            name, data = files[0]
+            key = f"{PROVIDER}/{handle}/{name}"
+            await storage.put(key, data)
+            return MaterializedResult(
+                storage_key=key,
+                media_type=self._media_type_for(name),
+                size_bytes=len(data),
+            )
+
+        # Multiple granule outputs: bundle them so one obs handle maps to one key.
+        buf = io.BytesIO()
+        total = 0
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, data in files:
+                total += len(data)
+                zf.writestr(name, data)
+        bundle = buf.getvalue()
+        key = f"{PROVIDER}/{handle}/result.nc.zip"
+        await storage.put(key, bundle)
         return MaterializedResult(
-            storage_key=key, media_type=media_type, size_bytes=len(data)
+            storage_key=key,
+            media_type=_NETCDF_BUNDLE_MEDIA_TYPE,
+            size_bytes=len(bundle),
+            extra={"granule_count": len(files), "uncompressed_bytes": total},
         )
 
     # -- harmony-py request mapping (the only logic we own) ---------------
@@ -268,8 +310,24 @@ class HarmonyProvider:
         return None
 
     @staticmethod
-    def _download_first(client: "harmony.Client", job: JobRef) -> tuple[str, bytes]:
-        """Download the job's result files; return (filename, bytes) of the first."""
+    def _media_type_for(name: str) -> str:
+        """Media type for a result filename, patching the netCDF/HDF5 MIME gap."""
+        guessed = mimetypes.guess_type(name)[0]
+        if guessed is None:
+            suffix = Path(name).suffix.lower()
+            guessed = _EXT_MEDIA_TYPES.get(suffix, "application/octet-stream")
+        return guessed
+
+    @staticmethod
+    def _download_all(
+        client: "harmony.Client", job: JobRef
+    ) -> list[tuple[str, bytes]]:
+        """Download the job's result files; return ``(filename, bytes)`` for each.
+
+        Every output file is kept (a Harmony job emits one per input granule), so a
+        multi-granule request materializes in full rather than discarding all but the
+        first — the caller bundles them when there is more than one.
+        """
         if not job.provider_job_id or not _UUID_RE.match(job.provider_job_id):
             raise ValueError(
                 f"invalid Harmony job ID {job.provider_job_id!r}: expected UUID; "
@@ -284,5 +342,4 @@ class HarmonyProvider:
                 raise RuntimeError(
                     f"Harmony job {job.provider_job_id} produced no result files"
                 )
-            first = paths[0]
-            return first.name, first.read_bytes()
+            return [(p.name, p.read_bytes()) for p in paths]

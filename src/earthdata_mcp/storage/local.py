@@ -26,6 +26,10 @@ class LocalFilesystemBackend(StorageBackend):
             raise ValueError(f"key escapes storage root: {key!r}")
         return path
 
+    def path(self, key: str) -> Path:
+        """Public path for ``key`` — delegates to the traversal-checked ``_path``."""
+        return self._path(key)
+
     async def put(self, key: str, data: bytes) -> None:
         def _write() -> None:
             path = self._path(key)

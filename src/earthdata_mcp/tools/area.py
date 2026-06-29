@@ -5,7 +5,10 @@ Accepts the forms an agent naturally has on hand and resolves each to a bbox
 
 * a bbox string ``"-105,37,-104,38"`` (W,S,E,N decimal degrees),
 * a GeoJSON geometry/Feature (string or dict),
-* a place name, HUC watershed, or FIPS code — geocoded via **Nominatim**.
+* a HUC watershed code (all-digit string, even length 2–12) — resolved via
+  the **USGS Watershed Boundary Dataset (WBD) REST API** (auth-free).
+* a place/watershed/basin name — tried first against **Nominatim** (OSM), then
+  against the USGS WBD name search (HUC2 → HUC12); raises if both fail.
 
 The handle ``payload`` is the **re-materializable spec** (CLAUDE.md hard rule):
 the resolved ``bbox``, the source kind, the original ``geojson`` when supplied,
@@ -16,6 +19,8 @@ all metadata, fast, and auth-free: no Harmony, no downloads (PLAN.md §6).
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -29,6 +34,24 @@ from earthdata_mcp.workspace.store import WorkspaceStore
 #: callers to ~1 req/sec, which is fine for a per-invocation tool.
 _NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 _NOMINATIM_HEADERS = {"User-Agent": "earthdata-mcp/0.1 (NASA Earthdata MCP server)"}
+
+#: Curated region lookup table — checked before Nominatim for continent-scale
+#: and informal-region queries that the OSM geocoder mishandles silently.
+_REGIONS_PATH = Path(__file__).parent / "data" / "regions.json"
+_region_table: dict[str, tuple[float, float, float, float]] | None = None
+
+#: USGS National Map Watershed Boundary Dataset (WBD) REST API — auth-free.
+#: Layer N corresponds to HUC level 2N (e.g. layer 1 = HUC2, layer 4 = HUC8).
+_WBD_BASE_URL = "https://hydro.nationalmap.gov/arcgis/rest/services/wbd/MapServer"
+#: Valid HUC code lengths — even digits in [2, 12].
+_HUC_LENGTHS: frozenset[int] = frozenset({2, 4, 6, 8, 10, 12})
+
+#: Matches "HUC-2 10", "HUC2 14", "HUC 01010001", "huc-8 14080101", etc.
+#: Stated level digits are advisory only; code length determines the WBD layer.
+_HUC_PREFIX_RE = re.compile(r"(?i)^huc[-]?\d*\s+(\d+)$")
+
+#: Stopwords stripped before AND-token WBD search.
+_WBD_STOPWORDS: frozenset[str] = frozenset({"river", "basin", "watershed", "region"})
 
 
 async def define_area_of_interest(
@@ -63,14 +86,71 @@ async def define_area_of_interest(
     }
 
 
+def _load_region_table() -> dict[str, tuple[float, float, float, float]]:
+    """Load and cache the curated region lookup table from ``regions.json``.
+
+    Primary keys and aliases are both stored in lowercase so lookup is
+    case-insensitive after a single ``.lower()`` call on the query.
+    The result is module-level cached after the first call.
+    """
+    global _region_table
+    if _region_table is not None:
+        return _region_table
+    raw: dict = json.loads(_REGIONS_PATH.read_text(encoding="utf-8"))
+    table: dict[str, tuple[float, float, float, float]] = {}
+    for key, entry in raw.items():
+        if key.startswith("_"):
+            continue  # skip metadata keys such as "_comment"
+        w, s, e, n = entry["bbox"]
+        bbox: tuple[float, float, float, float] = (float(w), float(s), float(e), float(n))
+        table[key] = bbox  # key is already lowercase in the JSON
+        for alias in entry.get("aliases", []):
+            table[alias.lower()] = bbox
+    _region_table = table
+    return table
+
+
+def _lookup_region(query: str) -> tuple[float, float, float, float] | None:
+    """Return the curated bbox for ``query`` (case-insensitive), or ``None``."""
+    return _load_region_table().get(query.lower().strip())
+
+
+def _is_huc_code(s: str) -> bool:
+    """Return True iff ``s`` is an all-digit string whose length is in {2,4,6,8,10,12}."""
+    return s.isdigit() and len(s) in _HUC_LENGTHS
+
+
+def _normalize_huc_prefix(s: str) -> str | None:
+    """Strip a HUC prefix from ``s`` and return the trailing digit string, or None.
+
+    Accepts forms like ``"HUC-2 10"``, ``"HUC2 14"``, ``"HUC 01010001"``,
+    ``"huc-8 14080101"`` (case-insensitive).  Leading zeros in the digit portion
+    are preserved verbatim.  Returns ``None`` when no prefix pattern matches.
+    """
+    m = _HUC_PREFIX_RE.match(s.strip())
+    return m.group(1) if m else None
+
+
 async def _resolve_location(
     location: str | dict,
 ) -> tuple[tuple[float, float, float, float], dict | None, str, str | None]:
     """Dispatch on input shape → ``(bbox, geojson, source, query)``.
 
-    First match wins: dict/GeoJSON-string → geojson; 4-comma string → bbox
-    (re-raises on bad values rather than guessing it's a place name); anything
-    else → Nominatim.
+    Resolution order:
+    1. dict / GeoJSON string → geojson branch.
+    2. Four-comma string → bbox branch (raises on bad values; never geocodes).
+    3. All-digit even-length string (2–12 chars) → USGS WBD by HUC code; raises
+       immediately if WBD returns nothing (no Nominatim fallback for HUC inputs).
+    4. Curated region table (``tools/data/regions.json``) — continents and
+       informal regions that Nominatim mishandles; matched case-insensitively
+       including aliases.  Returns immediately; Nominatim is never called.
+    5. Plain-English name → Nominatim first:
+       - Polygon/MultiPolygon result → return immediately, source ``"nominatim"``.
+       - Point/LineString result (``geo is None``) → try USGS WBD name search first:
+         - WBD hit → return it, source ``"usgs_wbd"`` (fixes basin/watershed names).
+         - WBD miss → return the Nominatim point bbox, source ``"nominatim_point"``.
+       - Nominatim raises (no results at all) → try USGS WBD name search (HUC2 →
+         HUC12, first non-empty layer); if both fail, raises ValueError naming both.
     """
     if isinstance(location, dict):
         return _bbox_from_geojson(location), location, "geojson", None
@@ -84,8 +164,41 @@ async def _resolve_location(
     if location.count(",") == 3:
         return _parse_bbox_string(location), None, "bbox", None
 
-    bbox = await _geocode_nominatim(location)
-    return bbox, None, "nominatim", location
+    huc_digits = _normalize_huc_prefix(location)
+    if huc_digits is not None and _is_huc_code(huc_digits):
+        bbox, geometry = await _query_wbd_by_huc(huc_digits)
+        return bbox, geometry, "usgs_wbd", huc_digits
+
+    if _is_huc_code(location):
+        bbox, geometry = await _query_wbd_by_huc(location)
+        return bbox, geometry, "usgs_wbd", location
+
+    region_bbox = _lookup_region(location)
+    if region_bbox is not None:
+        return region_bbox, None, "region_table", location
+
+    nominatim_err: ValueError | None = None
+    nominatim_point_bbox: tuple[float, float, float, float] | None = None
+    try:
+        bbox, geo = await _geocode_nominatim(location)
+        if geo is not None:
+            return bbox, geo, "nominatim", location
+        # geo is None → Point or LineString; fall through to WBD before committing.
+        nominatim_point_bbox = bbox
+    except ValueError as exc:
+        nominatim_err = exc
+
+    result = await _query_wbd_by_name(location)
+    if result is not None:
+        wbd_bbox, geometry = result
+        return wbd_bbox, geometry, "usgs_wbd", location
+
+    if nominatim_point_bbox is not None:
+        return nominatim_point_bbox, None, "nominatim_point", location
+
+    raise ValueError(
+        f"Neither Nominatim nor USGS WBD found results for location {location!r}"
+    ) from nominatim_err
 
 
 def _try_parse_json(s: str) -> Any:
@@ -185,29 +298,192 @@ def _extract_pairs(coords: Any) -> list[list[float]]:
     return pairs
 
 
+# -- USGS WBD REST API --------------------------------------------------------
+
+
+async def _query_wbd_by_huc(
+    huc_code: str,
+) -> tuple[tuple[float, float, float, float], dict]:
+    """Query USGS WBD by exact HUC code. Raises ``ValueError`` if not found.
+
+    Leading zeros are preserved verbatim — never strip them before sending.
+    """
+    n = len(huc_code)
+    layer = n // 2
+    field = f"huc{n}"
+    url = f"{_WBD_BASE_URL}/{layer}/query"
+    params = {
+        "f": "geojson",
+        "where": f"{field}='{huc_code}'",
+        "outFields": "*",
+        "returnGeometry": "true",
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(url, params=params)
+        response.raise_for_status()
+        fc = response.json()
+    features = fc.get("features", [])
+    if not features:
+        raise ValueError(f"USGS WBD found no watershed for HUC code {huc_code!r}")
+    geometry = features[0]["geometry"]
+    return _bbox_from_geojson(geometry), geometry
+
+
+async def _query_wbd_by_name(
+    query: str,
+) -> tuple[tuple[float, float, float, float], dict] | None:
+    """Search USGS WBD by name: LIKE phase first, then token phase.
+
+    LIKE returns on exactly 1 match at the coarsest non-empty layer; >1 or 0
+    results fall through to token search.  Token search strips stopwords, builds
+    an AND WHERE clause, and raises ``ValueError`` for multiple candidates.
+    Returns ``None`` when both phases find nothing.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        result = await _query_wbd_by_like(query, client)
+        if result is not None:
+            return result
+        return await _query_wbd_by_tokens(query, client)
+
+
+async def _query_wbd_by_like(
+    query: str,
+    client: httpx.AsyncClient,
+) -> tuple[tuple[float, float, float, float], dict] | None:
+    """LIKE substring search across HUC2→HUC12 layers, coarsest-first.
+
+    Returns ``(bbox, geometry)`` only when exactly 1 feature matches at the
+    first non-empty layer.  Returns ``None`` for 0 total matches or >1 at the
+    first non-empty layer (caller falls through to token search).
+    """
+    safe_query = query.replace("'", "''")
+    for layer in range(1, 7):
+        url = f"{_WBD_BASE_URL}/{layer}/query"
+        params = {
+            "f": "geojson",
+            "where": f"UPPER(name) LIKE UPPER('%{safe_query}%')",
+            "outFields": "name",
+            "returnGeometry": "true",
+        }
+        response = await client.get(url, params=params)
+        response.raise_for_status()
+        features = response.json().get("features", [])
+        if features:
+            if len(features) == 1:
+                geometry = features[0]["geometry"]
+                return _bbox_from_geojson(geometry), geometry
+            return None  # >1 at first non-empty layer; fall through to token
+    return None
+
+
+async def _query_wbd_by_tokens(
+    query: str,
+    client: httpx.AsyncClient,
+) -> tuple[tuple[float, float, float, float], dict] | None:
+    """AND-token WBD search after stopword removal, coarsest-first.
+
+    Strips ``{river, basin, watershed, region}`` and requires all remaining
+    tokens to appear in the WBD name.  Stops at the first non-empty layer.
+    Raises ``ValueError`` naming candidates when multiple features match.
+    Returns ``None`` when the token list is empty or all layers return nothing.
+    """
+    tokens = [t for t in query.lower().split() if t not in _WBD_STOPWORDS]
+    if not tokens:
+        return None
+    safe_tokens = [t.replace("'", "''") for t in tokens]
+    conditions = " AND ".join(
+        f"UPPER(name) LIKE UPPER('%{t}%')" for t in safe_tokens
+    )
+    for layer in range(1, 7):
+        huc_level = layer * 2
+        huc_field = f"huc{huc_level}"
+        url = f"{_WBD_BASE_URL}/{layer}/query"
+        params = {
+            "f": "geojson",
+            "where": conditions,
+            "outFields": f"name,{huc_field}",
+            "returnGeometry": "true",
+        }
+        response = await client.get(url, params=params)
+        response.raise_for_status()
+        features = response.json().get("features", [])
+        if not features:
+            continue
+        if len(features) == 1:
+            geometry = features[0]["geometry"]
+            return _bbox_from_geojson(geometry), geometry
+        candidates = [
+            f"{f['properties'].get('name', '?')} ({f['properties'].get(huc_field, '?')})"
+            for f in features
+        ]
+        first_code = features[0]["properties"].get(huc_field, "?")
+        raise ValueError(
+            f"Ambiguous location {query!r}: {len(candidates)} HUC-{huc_level}"
+            f" regions match — {', '.join(candidates)}."
+            f" Provide a HUC code directly (e.g. {first_code!r}) to be precise."
+        )
+    return None
+
+
 # -- Nominatim -------------------------------------------------------------
 
 
-async def _geocode_nominatim(query: str) -> tuple[float, float, float, float]:
-    """Geocode ``query`` to ``(W, S, E, N)`` via Nominatim. Raises on no match.
+async def _geocode_nominatim(
+    query: str,
+) -> tuple[tuple[float, float, float, float], dict | None]:
+    """Geocode ``query`` via Nominatim. Returns ``((W, S, E, N), geojson|None)``.
 
-    Nominatim returns ``boundingbox`` as ``["S", "N", "W", "E"]`` strings, which
-    we reorder to the ``(W, S, E, N)`` convention CMR and our ``AOI`` use.
+    Sends two requests when necessary:
+    1. ``featuretype=relation`` — prefers OSM administrative boundary relations
+       (basins, national forests, country borders) over POI nodes.
+    2. Unrestricted fallback — used when the first call returns nothing, so
+       city names and landmarks that OSM stores as nodes or ways still resolve.
+
+    ``polygon_geojson=1`` is included on both calls. The returned geojson is
+    set only for ``Polygon`` / ``MultiPolygon`` results; ``Point`` and
+    ``LineString`` results yield ``None`` so callers can treat ``None`` as
+    "no polygon; use bbox only".
+
+    Nominatim returns ``boundingbox`` as ``["S", "N", "W", "E"]`` strings,
+    reordered here to the ``(W, S, E, N)`` convention used by CMR and AOI.
     """
+    base_params: dict = {
+        "q": query,
+        "format": "json",
+        "limit": 1,
+        "polygon_geojson": 1,
+    }
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.get(
             _NOMINATIM_URL,
-            params={"q": query, "format": "json", "limit": 1},
+            params={**base_params, "featuretype": "relation"},
             headers=_NOMINATIM_HEADERS,
         )
-    response.raise_for_status()
-    results = response.json()
+        response.raise_for_status()
+        results = response.json()
+
+        if not results:
+            # Fallback: unrestricted search for nodes/ways (cities, landmarks).
+            response = await client.get(
+                _NOMINATIM_URL,
+                params=base_params,
+                headers=_NOMINATIM_HEADERS,
+            )
+            response.raise_for_status()
+            results = response.json()
+
     if not results:
         raise ValueError(f"Nominatim found no results for location {query!r}")
-    box = results[0].get("boundingbox")
+
+    result = results[0]
+    box = result.get("boundingbox")
     if not box or len(box) != 4:
         raise ValueError(
             f"Nominatim result for {query!r} has no usable bounding box"
         )
     south, north, west, east = (float(v) for v in box)
-    return (west, south, east, north)
+
+    raw_geo = result.get("geojson")
+    geojson = raw_geo if raw_geo and raw_geo.get("type") in ("Polygon", "MultiPolygon") else None
+
+    return (west, south, east, north), geojson

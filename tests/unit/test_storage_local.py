@@ -71,3 +71,25 @@ def test_local_rejects_path_traversal(tmp_path) -> None:
     backend = _make_local(tmp_path)
     with pytest.raises(ValueError):
         backend._path("../escape.bin")
+
+
+def test_path_resolves_key_to_filesystem_path(tmp_path) -> None:
+    b = _make_local(tmp_path)
+    assert b.path("a/b.nc") == b.root / "a" / "b.nc"
+
+
+def test_path_rejects_traversal(tmp_path) -> None:
+    b = _make_local(tmp_path)
+    with pytest.raises(ValueError):
+        b.path("../escape.bin")
+
+
+def test_base_backend_path_returns_none() -> None:
+    class _Stub(StorageBackend):
+        async def put(self, k, d): ...  # type: ignore[override]
+        async def get(self, k): ...  # type: ignore[override]
+        async def delete(self, k): ...  # type: ignore[override]
+        async def list(self, prefix=""): ...  # type: ignore[override]
+        async def stat(self, k): ...  # type: ignore[override]
+
+    assert _Stub().path("any_key") is None
