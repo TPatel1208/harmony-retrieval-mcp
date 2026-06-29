@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 import urllib.parse
 
+import dask
 import numpy as np
 
 import pyarrow as pa
@@ -31,7 +32,7 @@ import xarray as xr
 
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.storage import StorageBackend, get_storage_backend
-from earthdata_mcp.tools._dataio import open_result
+from earthdata_mcp.tools._dataio import open_result, open_result_lazy
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.models import HandleType, handle_type_of
 from earthdata_mcp.workspace.store import WorkspaceStore
@@ -372,12 +373,87 @@ async def inspect_statistics(
     if payload.get("status") != "ready" or not payload.get("storage_key"):
         raise ValueError(f"handle {handle!r} is not a materialized result")
 
-    data = await storage.get(payload["storage_key"])
-    obj = open_result(data, payload["media_type"])
+    storage_key = payload["storage_key"]
+    media_type = payload["media_type"]
+
+    local_path = storage.path(storage_key)
+    if local_path is not None:
+        # Fast path: open lazily from disk, fuse all reductions into one dask.compute().
+        with open_result_lazy(local_path, media_type, variables) as obj:
+            stats = (
+                _statistics_fused(obj, variables)
+                if isinstance(obj, xr.Dataset)
+                else _statistics(obj, variables)  # pa.Table Parquet path
+            )
+        return {"handle": handle, "statistics": stats}
+
+    # Fallback: S3 or any non-path-addressable backend — bytes → eager open.
+    data = await storage.get(storage_key)
+    obj = open_result(data, media_type)
     return {
         "handle": handle,
         "statistics": _statistics(obj, variables),
     }
+
+
+def _statistics_fused(obj: xr.Dataset, variables: list[str] | None) -> dict:
+    """Per-variable stats via a single dask.compute() spanning all variables.
+
+    Builds lazy xarray reductions (min/max/mean/std/count) for every numeric
+    variable and lazy count for non-numeric ones, then calls dask.compute() once
+    so the scheduler executes the entire graph in a single pass — each chunk of
+    each dask-backed array is read from the storage layer only once per variable
+    (the scheduler sees the shared source nodes and avoids redundant I/O).
+    """
+    names = variables or [str(v) for v in obj.data_vars]
+    numeric = [n for n in names if np.issubdtype(obj[n].dtype, np.number)]
+    other = [n for n in names if not np.issubdtype(obj[n].dtype, np.number)]
+
+    lazy_vals: list = []
+    schedule: list[tuple[str, str]] = []  # parallel to lazy_vals
+
+    for name in numeric:
+        da = obj[name]
+        for stat, reduction in (
+            ("min",   da.min()),
+            ("max",   da.max()),
+            ("mean",  da.mean()),
+            ("std",   da.std()),
+            ("count", da.count()),
+        ):
+            lazy_vals.append(reduction)
+            schedule.append((name, stat))
+
+    for name in other:
+        lazy_vals.append(obj[name].count())
+        schedule.append((name, "count"))
+
+    computed = dask.compute(*lazy_vals)
+
+    out: dict[str, dict] = {}
+    for (name, stat), value in zip(schedule, computed):
+        entry = out.setdefault(name, {})
+        entry[stat] = int(value) if stat == "count" else _finite_scalar(value)
+
+    for name in other:
+        out[name]["dtype"] = str(obj[name].dtype)
+
+    return out
+
+
+def _finite_scalar(value) -> float | None:
+    """Normalize any numeric scalar (numpy, Python, 0-d array) to ``float | None``.
+
+    Accepts: numpy floats/ints, Python numbers, 0-d ndarrays, xr.DataArray scalars.
+    Returns ``None`` for NaN.  Returns ``None`` (rather than raising) for any type
+    that can't be coerced to float (complex, object) — callers should guard with
+    ``np.issubdtype`` before passing non-numeric values.
+    """
+    try:
+        v = float(np.asarray(value).flat[0])
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(v) else v
 
 
 def _statistics(obj: xr.Dataset | pa.Table, variables: list[str] | None) -> dict:

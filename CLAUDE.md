@@ -27,6 +27,20 @@ docstrings — they are stale references, not authority.)
   young and refactoring). Cite a pinned commit when borrowing a pattern.
 - No analysis tools (correlation, trend, anomaly, hotspot, risk, narrative).
 
+## Running tests
+All tests run inside the `mcp` container, which has Postgres, Redis, and the
+source/tests bind-mounted. The local Python environment does not have the
+project dependencies installed — do not use it.
+
+```
+docker compose exec mcp python -m pytest tests/unit -v          # unit suite
+docker compose exec mcp python -m pytest tests/unit/test_tools/test_area.py -v  # single file
+```
+
+The compose stack must be up (`docker compose up -d`) before running tests.
+`-m "not live"` is the default (live tests need real Earthdata credentials and
+are opt-in).
+
 ## Working discipline
 - One prompt = one session = one commit. Do the tasks, run the gate commands
   exactly as written, and only when they pass, commit with the message the prompt

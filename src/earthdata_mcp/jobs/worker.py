@@ -91,23 +91,27 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
         ref = await provider.submit(plan)
     except Exception as exc:
         opendap_urls = spec.get("opendap_urls") or []
-        if spec.get("provider") != "harmony" or not opendap_urls:
-            raise
-        logger.warning(
-            "Harmony submit failed for job %s (%s); falling back to OPeNDAP",
-            job_id,
-            exc,
-        )
+        if spec.get("provider") == "harmony" and opendap_urls:
+            logger.warning(
+                "Harmony submit failed for job %s (%s); falling back to OPeNDAP",
+                job_id,
+                exc,
+            )
+            async with session_factory() as session:
+                job = await crud.get_job(session, job_id)
+                if job is None:
+                    return
+                new_spec = {**dict(job.request_spec), "provider": "opendap"}
+                job.provider = "opendap"
+                job.request_spec = new_spec
+                await session.commit()
+            await ctx["redis"].enqueue_job("submit_job", job_id)
+            return
         async with session_factory() as session:
-            job = await crud.get_job(session, job_id)
-            if job is None:
-                return
-            new_spec = {**dict(job.request_spec), "provider": "opendap"}
-            job.provider = "opendap"
-            job.request_spec = new_spec
-            await session.commit()
-        await ctx["redis"].enqueue_job("submit_job", job_id)
-        return
+            await crud.transition_state(
+                session, job_id, JobState.FAILED, error=str(exc)
+            )
+        raise
 
     async with session_factory() as session:
         await crud.transition_state(
@@ -138,7 +142,14 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
         provider_job_id=_job_id_from_url(url),
         provider_job_url=url,
     )
-    status = await provider.poll(ref)
+    try:
+        status = await provider.poll(ref)
+    except Exception as exc:
+        async with session_factory() as session:
+            await crud.transition_state(
+                session, job_id, JobState.FAILED, error=str(exc)
+            )
+        raise
 
     async with session_factory() as session:
         job = await crud.get_job(session, job_id)
@@ -170,7 +181,16 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
         provider_job_url=url,
         job_handle=spec.get("job_handle"),
     )
-    result = await provider.materialize(ref)
+    try:
+        result = await provider.materialize(ref)
+    except BaseException as exc:
+        # BaseException catches CancelledError (raised when Arq's job_timeout fires
+        # inside asyncio.to_thread) which Exception alone does not.
+        async with session_factory() as session:
+            await crud.transition_state(
+                session, job_id, JobState.FAILED, error=str(exc) or type(exc).__name__
+            )
+        raise
 
     # Resolve the pending obs_ handle to the durable storage key (not a URL).
     obs_handle = spec.get("obs_handle")
@@ -344,3 +364,5 @@ class WorkerSettings:
     functions = [submit_job, poll_job, materialize_job, healthcheck]
     on_startup = startup
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
+    # Harmony downloads can be large (100s of MB); give them up to 1 hour.
+    job_timeout = 3600

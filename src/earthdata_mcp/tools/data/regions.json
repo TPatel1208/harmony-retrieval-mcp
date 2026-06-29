@@ -1,0 +1,71 @@
+{
+  "_comment": "Coordinate order: [W, S, E, N] (west longitude, south latitude, east longitude, north latitude) in decimal degrees. This matches the (W, S, E, N) convention used throughout this system (see area.py). Continent bboxes are derived from Natural Earth admin-0 boundaries (see scripts/extract_natural_earth_bboxes.py). Informal-region bboxes are manually curated. Keys and aliases are lowercase; the lookup normalizes queries to lowercase before matching.",
+  "africa": {
+    "bbox": [-17.7, -34.9, 51.3, 37.4],
+    "aliases": ["african continent"]
+  },
+  "europe": {
+    "bbox": [-24.5, 27.6, 69.1, 81.9],
+    "aliases": ["european continent"]
+  },
+  "asia": {
+    "bbox": [26.0, -11.2, 169.7, 77.7],
+    "aliases": ["asian continent"]
+  },
+  "north america": {
+    "bbox": [-168.1, 7.2, -52.6, 83.6],
+    "aliases": ["northern america"]
+  },
+  "south america": {
+    "bbox": [-81.3, -55.9, -34.8, 13.4],
+    "aliases": ["southern america"]
+  },
+  "oceania": {
+    "bbox": [112.9, -47.7, 180.0, 28.5],
+    "aliases": ["australia and oceania", "australasia"]
+  },
+  "antarctica": {
+    "bbox": [-180.0, -90.0, 180.0, -60.0],
+    "aliases": ["antarctic"]
+  },
+  "middle east": {
+    "bbox": [26.0, 12.5, 63.3, 42.4],
+    "aliases": ["mena", "near east", "middle-east"]
+  },
+  "southeast asia": {
+    "bbox": [92.2, -11.2, 141.1, 28.5],
+    "aliases": ["se asia", "southeastern asia", "south-east asia"]
+  },
+  "south asia": {
+    "bbox": [60.9, 4.0, 97.4, 37.1],
+    "aliases": ["indian subcontinent", "southern asia", "south-asia"]
+  },
+  "east asia": {
+    "bbox": [73.5, 18.2, 145.5, 53.6],
+    "aliases": ["eastern asia", "east-asia", "far east"]
+  },
+  "central asia": {
+    "bbox": [46.5, 35.1, 87.3, 55.4],
+    "aliases": ["central-asia"]
+  },
+  "scandinavia": {
+    "bbox": [4.5, 54.6, 31.1, 71.2],
+    "aliases": ["scandinavian countries", "scandinavian peninsula"]
+  },
+  "nordic countries": {
+    "bbox": [-24.5, 54.6, 31.1, 71.5],
+    "aliases": ["nordic", "nordic nations"]
+  },
+  "sub-saharan africa": {
+    "bbox": [-17.7, -34.9, 51.3, 15.0],
+    "aliases": ["subsaharan africa", "sub saharan africa", "africa south of sahara"]
+  },
+  "central america": {
+    "bbox": [-92.3, 7.2, -77.1, 18.5],
+    "aliases": ["mesoamerica", "central-america"]
+  },
+  "caribbean": {
+    "bbox": [-84.9, 10.0, -59.5, 26.9],
+    "aliases": ["caribbean islands", "west indies"]
+  }
+}
