@@ -23,7 +23,6 @@ routed service's ``output_formats`` or the route fails at planning time.
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
@@ -31,7 +30,6 @@ from earthdata_mcp.config import get_settings
 from earthdata_mcp.db import create_engine, create_session_factory
 from earthdata_mcp.jobs import crud
 from earthdata_mcp.jobs.state import TERMINAL_STATES, JobState
-from earthdata_mcp.providers._capabilities import CollectionCapabilities
 from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, TransformSpec
 from earthdata_mcp.providers.cmr import CMRProvider
@@ -43,7 +41,8 @@ from earthdata_mcp.providers.opendap import (
     _discover_grid_geometry,
     _resolve_from_cmr,
 )
-from earthdata_mcp.providers.router import Router, RoutingDecision
+from earthdata_mcp.providers.request_spec import RequestSpec
+from earthdata_mcp.providers.router import Router
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.models import HandleType, handle_type_of
 from earthdata_mcp.workspace.provenance import ProvenanceStore
@@ -417,8 +416,6 @@ async def _submit_retrieval(
         appeears=AppEEARSProvider(caps),
         opendap=opendap_provider,
     ).route(plan)
-    service_name = decision.service.service_name if decision.service else None
-
     # Mint the two handles, then persist the durable spec that ties them together.
     obs_handle = await store.put_handle(
         workspace_id, HandleType.OBS, payload={"status": "pending"}
@@ -428,29 +425,22 @@ async def _submit_retrieval(
         HandleType.JOB,
         payload={"obs_handle": obs_handle, "dataset_handle": dataset_handle},
     )
-    spec = _build_spec(
-        concept_id=concept_id,
-        caps=caps,
+    spec = RequestSpec.from_plan(
+        plan,
         decision=decision,
-        service_name=service_name,
-        output_format=fmt,
-        bbox=bbox,
-        time_range=time_range,
-        variables=variables,
-        needs_bbox=needs_bbox,
-        needs_variable=needs_variable,
-        needs_temporal=needs_temporal,
-        needs_point_sample=needs_point_sample,
+        caps=caps,
         workspace_id=workspace_id,
         job_handle=job_handle,
         obs_handle=obs_handle,
+        time_range=time_range,
+        variables=variables,
         opendap_urls=opendap_urls,
         coord_lat=coord_lat if opendap_urls else None,
         coord_lon=coord_lon if opendap_urls else None,
         lat_axis=lat_axis,
         lon_axis=lon_axis,
         var_dims=var_dims,
-    )
+    ).to_jsonb()
 
     job_id = uuid4().hex
     async with session_factory() as session:
@@ -479,126 +469,6 @@ async def _submit_retrieval(
         "status": JobState.PENDING.value,
         "provider": decision.path,
     }
-
-
-def _build_spec(
-    *,
-    concept_id: str,
-    caps: CollectionCapabilities,
-    decision: RoutingDecision,
-    service_name: str | None,
-    output_format: str,
-    bbox: tuple[float, float, float, float] | None,
-    time_range: str,
-    variables: tuple[str, ...],
-    needs_bbox: bool,
-    needs_variable: bool,
-    needs_temporal: bool,
-    needs_point_sample: bool,
-    workspace_id: str,
-    job_handle: str,
-    obs_handle: str,
-    opendap_urls: list[str] | None = None,
-    coord_lat: str | None = None,
-    coord_lon: str | None = None,
-    lat_axis: AxisGeometry | None = None,
-    lon_axis: AxisGeometry | None = None,
-    var_dims: dict[str, VarDimPlan] | None = None,
-) -> dict:
-    """Assemble the durable, re-materializable request spec stored in JSONB.
-
-    Everything the worker needs to rebuild the plan and everything provenance
-    needs to rebuild the result — and nothing ephemeral. No staged-output URL ever
-    enters this dict (the provenance store rejects one if it slips in).
-    ``opendap_urls`` are durable granule endpoints (re-materializable on re-run),
-    not staged output URLs, so they are safe to persist here (PLAN.md §4.5).
-    ``opendap_url`` (the first) is kept for specs/readers that expect the singular key.
-    ``lat_axis``/``lon_axis``/``var_dims`` are the discovered grid geometry,
-    recorded so a re-planned submit reproduces the identical DAP4 hyperslab.
-    """
-    return {
-        "concept_id": concept_id,
-        "short_name": caps.short_name,
-        "output_format": output_format,
-        "output_shape": caps.output_shape,
-        "needs_bbox": needs_bbox,
-        "needs_variable": needs_variable,
-        "needs_temporal": needs_temporal,
-        "needs_point_sample": needs_point_sample,
-        "aoi_bbox": list(bbox) if bbox is not None else None,
-        "time_range": time_range or None,
-        "variables": list(variables),
-        "provider": decision.path,
-        "service_name": service_name,
-        "opendap_urls": list(opendap_urls) if opendap_urls else None,
-        "opendap_url": opendap_urls[0] if opendap_urls else None,
-        "coord_lat": coord_lat,
-        "coord_lon": coord_lon,
-        "lat_axis": _serialize_axis(lat_axis),
-        "lon_axis": _serialize_axis(lon_axis),
-        "var_dims": _serialize_var_dims(var_dims),
-        "workspace_id": workspace_id,
-        "job_handle": job_handle,
-        "obs_handle": obs_handle,
-        "cache_key": _cache_key(
-            short_name=caps.short_name,
-            output_format=output_format,
-            bbox=bbox,
-            time_range=time_range,
-            variables=variables,
-            service_name=service_name,
-            service_version=caps.capabilities_version,
-        ),
-    }
-
-
-def _serialize_axis(axis: AxisGeometry | None) -> dict | None:
-    """``AxisGeometry`` -> a JSONB-safe dict, or ``None``. See ``_axis_from_spec``."""
-    if axis is None:
-        return None
-    return {"name": axis.name, "origin": axis.origin, "step": axis.step, "length": axis.length}
-
-
-def _serialize_var_dims(var_dims: dict[str, VarDimPlan] | None) -> dict:
-    """Per-variable ``VarDimPlan`` map -> a JSONB-safe dict (tuples -> lists).
-
-    The worker mirror is ``jobs.worker._var_dims_from_spec``.
-    """
-    if not var_dims:
-        return {}
-    return {var: [list(pair) for pair in dims] for var, dims in var_dims.items()}
-
-
-def _cache_key(
-    *,
-    short_name: str,
-    output_format: str,
-    bbox: tuple[float, float, float, float] | None,
-    time_range: str,
-    variables: tuple[str, ...],
-    service_name: str | None,
-    service_version: str,
-) -> str:
-    """Materialization cache key (§4.4).
-
-    Keyed on ``(short_name, format, aoi, time_range, variables, service,
-    service_version)`` — ``service_version`` is in the key because a service's
-    output changes across versions, so a cached result from an old version must
-    not be reused.
-    """
-    aoi_str = ",".join(str(c) for c in bbox) if bbox is not None else ""
-    raw = ":".join(
-        [
-            short_name or "",
-            output_format,
-            aoi_str,
-            time_range or "",
-            ",".join(sorted(variables)),
-            service_name or "",
-            service_version or "",
-        ]
-    )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
 #: Cap on granules pulled into a single OPeNDAP bundle (one DAP4 bbox subset each).

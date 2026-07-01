@@ -5,7 +5,7 @@ materialize) → READY → obs handle resolved → provenance recorded → get_p
 Everything below the provider is real: the Postgres ``jobs`` table, the state
 machine, handle resolution, the local storage backend, and the provenance DAG.
 Only the provider's *network* is faked — via a fake ``RetrievalProvider`` injected
-at the worker's ``_provider_for`` seam — so no EDL credentials or Harmony/AppEEARS
+at the worker's ``_load_provider`` seam — so no EDL credentials or Harmony/AppEEARS
 servers are needed. The credentialed real-Harmony version is
 ``tests/live/test_full_retrieval.py``.
 
@@ -188,17 +188,18 @@ async def _drive_to_ready(session_factory, job_id: str) -> None:
 def patch_worker_seam(monkeypatch, workspace_store):
     """Patch the two process-default seams the worker reaches for.
 
-    ``_provider_for`` is replaced per-test with a fake provider; the worker's
-    materialize step resolves the obs handle through ``discovery._default_store``,
-    which we point at the test's real Postgres-backed store.
+    ``_load_provider`` (the ``providers.build`` seam's caller) is replaced
+    per-test with a fake provider; the worker's materialize step resolves the
+    obs handle through ``discovery._default_store``, which we point at the
+    test's real Postgres-backed store.
     """
     monkeypatch.setattr(discovery_mod, "_default_store", lambda: workspace_store)
 
     def _install(provider: _FakeProvider) -> None:
-        async def _fake_provider_for(spec: dict):
+        async def _fake_load_provider(spec) -> _FakeProvider:
             return provider
 
-        monkeypatch.setattr(worker_mod, "_provider_for", _fake_provider_for)
+        monkeypatch.setattr(worker_mod, "_load_provider", _fake_load_provider)
 
     return _install
 
