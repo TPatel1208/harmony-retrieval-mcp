@@ -18,11 +18,15 @@ the durable submit → poll → materialize seam:
 * ``materialize`` downloads the task's CSV results bundle, builds a ``pyarrow``
   table, and persists it **as Parquet** through :class:`StorageBackend`.
 
-The AppEEARS API is Bearer-authenticated with the same EDL token Harmony uses.
+AppEEARS does NOT accept EDL JWTs. Auth flow: ``POST /login`` with
+``Authorization: Basic <base64(edl_username:edl_password)>`` returns a short-lived
+session token; all subsequent requests carry ``Authorization: Bearer <session_token>``.
+On ``401``/``403``, the provider re-logs in once and retries automatically.
 """
 
 from __future__ import annotations
 
+import base64
 import io
 import logging
 
@@ -84,6 +88,7 @@ class AppEEARSProvider:
         self._base = self._settings.appeears_url.rstrip("/")
         self._timeout = timeout
         self._on_progress = on_progress
+        self._appeears_token: str | None = None
 
     # -- capability gate --------------------------------------------------
 
@@ -105,19 +110,21 @@ class AppEEARSProvider:
                 "AppEEARSProvider only handles point/area sample plans "
                 "(needs_point_sample); the router must not dispatch this here"
             )
-        if not self._settings.earthdata_token:
+        if not (self._settings.edl_username and self._settings.edl_password):
             raise ValueError(
-                "AppEEARS submission requires earthdata_token in settings; "
-                "set EARTHDATA_TOKEN environment variable"
+                "AppEEARS submission requires EDL credentials; "
+                "set EDL_USERNAME and EDL_PASSWORD environment variables"
             )
-        body = self._build_task(plan)
+        product = self._caps.short_name
+        if self._caps.version:
+            product = f"{product}.{self._caps.version}"
+        layer_map = await self._fetch_layer_map(product)
+        variables = plan.transform.variables if plan.transform else ()
+        resolved = self._resolve_layers(product, layer_map, variables)
+        body = self._build_task(plan, product, resolved)
         await get_limiter(PROVIDER).acquire()
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.post(
-                f"{self._base}/task", json=body, headers=self._auth_headers()
-            )
-            response.raise_for_status()
-            payload = response.json()
+        response = await self._request("POST", f"{self._base}/task", json=body)
+        payload = response.json()
         task_id = str(payload.get("task_id", ""))
         if not task_id:
             raise RuntimeError(f"AppEEARS task submit returned no task_id: {payload!r}")
@@ -131,13 +138,10 @@ class AppEEARSProvider:
     async def poll(self, job: JobRef) -> JobStatus:
         """One status check against ``<appeears>/task/<id>`` (worker drives the loop)."""
         await get_limiter(PROVIDER).acquire()
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.get(
-                f"{self._base}/task/{job.provider_job_id}",
-                headers=self._auth_headers(),
-            )
-            response.raise_for_status()
-            raw = response.json()
+        response = await self._request(
+            "GET", f"{self._base}/task/{job.provider_job_id}"
+        )
+        raw = response.json()
         status = self._to_job_status(raw)
         if callable(self._on_progress):
             self._on_progress(status)
@@ -151,19 +155,14 @@ class AppEEARSProvider:
         resolves to carries ``application/x-parquet`` (PLAN.md §4.4 hard rule).
         """
         await get_limiter(PROVIDER).acquire()
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            headers = self._auth_headers()
-            bundle = await client.get(
-                f"{self._base}/bundle/{job.provider_job_id}", headers=headers
-            )
-            bundle.raise_for_status()
-            file_id, file_name = _results_file(bundle.json())
-            results = await client.get(
-                f"{self._base}/bundle/{job.provider_job_id}/{file_id}",
-                headers=headers,
-            )
-            results.raise_for_status()
-            csv_bytes = results.content
+        bundle = await self._request(
+            "GET", f"{self._base}/bundle/{job.provider_job_id}"
+        )
+        file_id, file_name = _results_file(bundle.json())
+        results = await self._request(
+            "GET", f"{self._base}/bundle/{job.provider_job_id}/{file_id}"
+        )
+        csv_bytes = results.content
 
         parquet = _csv_to_parquet(csv_bytes)
         storage = self._storage_backend()
@@ -180,14 +179,13 @@ class AppEEARSProvider:
 
     # -- request mapping (the only logic we own) --------------------------
 
-    def _build_task(self, plan: RetrievalPlan) -> dict:
-        """Map a plan onto an AppEEARS point-task body (coordinates + layers + dates)."""
+    def _build_task(self, plan: RetrievalPlan, product: str, layers: list[dict]) -> dict:
+        """Map a plan onto an AppEEARS point-task body (coordinates + layers + dates).
+
+        ``layers`` is a pre-resolved list of ``{"product": ..., "layer": ...}`` dicts
+        built by ``submit``; ``_build_task`` is pure and owns no I/O.
+        """
         lat, lon = _point_from_aoi(plan.aoi)
-        product = plan.short_name or plan.concept_id or ""
-        layers = [
-            {"product": product, "layer": v}
-            for v in (plan.transform.variables if plan.transform else ())
-        ]
         params: dict[str, object] = {
             "coordinates": [
                 {"latitude": lat, "longitude": lon, "id": "0", "category": "site"}
@@ -207,6 +205,51 @@ class AppEEARSProvider:
             "params": params,
         }
 
+    async def _fetch_layer_map(self, product: str) -> dict:
+        """GET /product/{product} → dict of AppEEARS layer identifiers.
+
+        The AppEEARS product endpoint (``/product/{productId}``) returns the layer
+        map directly as a JSON object keyed by layer identifier — there is no
+        separate ``/layer`` sub-resource. Raises ``RuntimeError`` when AppEEARS
+        returns a 404 (product not in catalog) so ``submit`` fails immediately with
+        a clear message rather than sending an unknown product to ``POST /task``
+        and getting a cryptic 400 back. Other HTTP errors are re-raised as-is.
+        """
+        try:
+            response = await self._request("GET", f"{self._base}/product/{product}")
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise RuntimeError(
+                    f"Dataset {product!r} is not in the AppEEARS product catalog — "
+                    "AppEEARS only serves a curated subset of NASA products. "
+                    "Use retrieve_subset (Harmony/OPeNDAP path) or direct download instead."
+                ) from exc
+            raise
+
+    def _resolve_layers(
+        self, product: str, layer_map: dict, variables: tuple[str, ...]
+    ) -> list[dict]:
+        """Translate UMM-V variable names to AppEEARS layer identifiers.
+
+        Normalized comparison: strip a leading underscore, lowercase, spaces → underscores.
+        Unmatched names pass through raw with a warning so multi-variable tasks don't abort.
+        """
+        norm_to_key = {_normalize_layer(k): k for k in layer_map}
+        resolved = []
+        for var in variables:
+            matched = norm_to_key.get(_normalize_layer(var))
+            if matched is None:
+                logger.warning(
+                    "AppEEARS layer not found for variable %r in product %s; "
+                    "sending raw name",
+                    var,
+                    product,
+                )
+                matched = var
+            resolved.append({"product": product, "layer": matched})
+        return resolved
+
     # -- status mapping ---------------------------------------------------
 
     def _to_job_status(self, raw: dict) -> JobStatus:
@@ -223,11 +266,54 @@ class AppEEARSProvider:
             error=error,
         )
 
-    # -- HTTP / storage construction --------------------------------------
+    # -- AppEEARS auth ----------------------------------------------------
 
-    def _auth_headers(self) -> dict[str, str]:
-        token = self._settings.earthdata_token or None
-        return {"Authorization": f"Bearer {token}"} if token else {}
+    async def _login(self) -> str:
+        """POST /login with HTTP Basic (EDL user:pass); cache and return the session token."""
+        credentials = base64.b64encode(
+            f"{self._settings.edl_username}:{self._settings.edl_password}".encode()
+        ).decode()
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            response = await client.post(
+                f"{self._base}/login",
+                headers={"Authorization": f"Basic {credentials}"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            token = str(payload.get("token", ""))
+        if not token:
+            raise RuntimeError(f"AppEEARS /login returned no token: {payload!r}")
+        self._appeears_token = token
+        return token
+
+    async def _ensure_token(self) -> str:
+        if self._appeears_token:
+            return self._appeears_token
+        return await self._login()
+
+    async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Send an authenticated request; retry once on 401/403 after re-login.
+
+        ``follow_redirects=True`` is required: AppEEARS bundle file endpoints
+        return 302 redirects to pre-signed S3/CloudFront URLs for the actual
+        CSV download, so the client must follow them automatically.
+        """
+        token = await self._ensure_token()
+        headers = kwargs.pop("headers", {})
+        headers["Authorization"] = f"Bearer {token}"
+        async with httpx.AsyncClient(
+            timeout=self._timeout, follow_redirects=True
+        ) as client:
+            response = await client.request(method, url, headers=headers, **kwargs)
+            if response.status_code in (401, 403):
+                self._appeears_token = None
+                token = await self._login()
+                headers["Authorization"] = f"Bearer {token}"
+                response = await client.request(method, url, headers=headers, **kwargs)
+            response.raise_for_status()
+        return response
+
+    # -- storage construction ---------------------------------------------
 
     def _storage_backend(self) -> StorageBackend:
         if self._storage is None:
@@ -236,6 +322,16 @@ class AppEEARSProvider:
 
 
 # -- helpers ---------------------------------------------------------------
+
+
+def _normalize_layer(name: str) -> str:
+    """Canonical form for fuzzy-matching UMM-V names against AppEEARS layer keys.
+
+    Rules: strip a leading underscore (MOD13Q1 style), lowercase, replace spaces
+    with underscores. Applying the same rule to both sides handles products that
+    use a leading underscore (MOD13Q1) and those that don't (MOD11A1) uniformly.
+    """
+    return name.lstrip("_").lower().replace(" ", "_")
 
 
 def _point_from_aoi(aoi: AOI | None) -> tuple[float, float]:
@@ -263,14 +359,25 @@ def _appeears_date(dt) -> str:
 
 
 def _results_file(bundle: dict) -> tuple[str, str]:
-    """Pick the point-results CSV from a bundle listing → ``(file_id, file_name)``."""
+    """Pick the point-results CSV from a bundle listing → ``(file_id, file_name)``.
+
+    AppEEARS consistently names the data file ``*results*.csv``; the granule-list
+    and statistics files use ``*granule-list*`` / ``*statistics*`` names. We require
+    "results" in the filename rather than falling back to any CSV, so a bundle that
+    contains only a granule-list CSV does not silently produce wrong data.
+    """
     files = bundle.get("files", [])
     csvs = [f for f in files if str(f.get("file_type", "")).lower() == "csv"]
-    # Prefer the per-sample results CSV over the granule-list / stats CSVs.
-    preferred = [f for f in csvs if "results" in str(f.get("file_name", "")).lower()]
-    chosen = preferred or csvs
+    chosen = [f for f in csvs if "results" in str(f.get("file_name", "")).lower()]
     if not chosen:
-        raise RuntimeError(f"AppEEARS bundle has no CSV results file: {bundle!r}")
+        file_names = [str(f.get("file_name", "?")) for f in files]
+        summary = ", ".join(file_names[:6]) + ("…" if len(file_names) > 6 else "")
+        raise RuntimeError(
+            f"AppEEARS returned no tabular results — the bundle has {len(files)} "
+            f"file(s) ({summary}) but no CSV results file. "
+            f"The point/time range may have no valid data (cloud-masked, outside "
+            f"the collection's spatial coverage, or no granules in the time window)."
+        )
     f = chosen[0]
     return str(f.get("file_id", "")), str(f.get("file_name", ""))
 

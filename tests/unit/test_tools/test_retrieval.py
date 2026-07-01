@@ -247,6 +247,57 @@ def _make_cmr_with_ambiguous_vars(caps: CollectionCapabilities) -> CMRProvider:
     return cmr
 
 
+_GRID_EXTENT = (-180.0, -60.0, 180.0, 90.0)  # UMM-C reports grid edges, not cell centers
+
+
+def _grid_no_service_caps_with_extent() -> CollectionCapabilities:
+    """``_grid_no_service_caps`` plus a UMM-C spatial extent (bbox hyperslabbing
+    needs an extent to derive axis geometry)."""
+    caps = _grid_no_service_caps()
+    caps.spatial_extent = _GRID_EXTENT
+    return caps
+
+
+_GRID_GEOMETRY_VARS = [
+    {
+        "name": "/product/latitude",
+        "standard_name": "latitude",
+        "dimensions": [{"name": "latitude", "size": 600}],
+    },
+    {
+        "name": "/product/longitude",
+        "standard_name": "longitude",
+        "dimensions": [{"name": "longitude", "size": 1440}],
+    },
+    {
+        "name": "/product/vertical_column_total",
+        "standard_name": None,
+        "dimensions": [
+            {"name": "latitude", "size": 600},
+            {"name": "longitude", "size": 1440},
+        ],
+    },
+]
+
+
+def _make_cmr_with_grid_geometry(caps: CollectionCapabilities) -> CMRProvider:
+    """CMR mock whose UMM-V variables carry clean (lat, lon) dimensions, so
+    ``_discover_grid_geometry`` can derive real axis geometry (not just coord names)."""
+    cmr = CMRProvider.__new__(CMRProvider)
+    cmr.collection_capabilities = AsyncMock(return_value=caps)
+    cmr.search_granules = AsyncMock(
+        return_value=[
+            {
+                "related_urls": [
+                    {"URL": _OPENDAP_URL, "Type": "USE SERVICE API", "Subtype": "OPENDAP DATA"}
+                ]
+            }
+        ]
+    )
+    cmr.get_variables = AsyncMock(return_value=_GRID_GEOMETRY_VARS)
+    return cmr
+
+
 def _make_cmr_with_var_lookup_error(caps: CollectionCapabilities) -> CMRProvider:
     """CMR mock whose get_variables raises (simulates a network failure)."""
     cmr = CMRProvider.__new__(CMRProvider)
@@ -825,6 +876,61 @@ async def test_retrieve_subset_raises_fast_on_ambiguous_variable(
         )
     msg = str(exc_info.value)
     assert "/a/ndvi" in msg and "/b/ndvi" in msg
+
+
+async def test_retrieve_subset_discovers_grid_geometry_and_threads_into_spec(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """A gridded collection with a UMM-C extent + clean UMM-V dims gets its
+    lat/lon axis geometry discovered and carried on the durable spec — the same
+    seam coord_lat/coord_lon already flow through, so a resumed job rebuilds the
+    identical hyperslab constraint."""
+    caps = _grid_no_service_caps_with_extent()
+    cmr = _make_cmr_with_grid_geometry(caps)
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_subset(
+        ds, aoi, _TIME, ["vertical_column_total"], workspace_id=workspace_id,
+        cmr=cmr, store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=mock_enqueue,
+    )
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    spec = job.request_spec
+    assert spec["lat_axis"] == {
+        "name": "/product/latitude", "origin": -59.875, "step": 0.25, "length": 600,
+    }
+    assert spec["lon_axis"] == {
+        "name": "/product/longitude", "origin": -179.875, "step": 0.25, "length": 1440,
+    }
+    assert spec["var_dims"] == {
+        "/product/vertical_column_total": [["latitude", None], ["longitude", None]],
+    }
+
+
+async def test_retrieve_subset_no_extent_omits_geometry_from_spec(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """No UMM-C spatial extent -> geometry discovery fails soft; the spec carries
+    no axis geometry and the existing coord-name resolution is unaffected."""
+    cmr = _make_cmr_with_grouped_vars(_grid_no_service_caps())
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_subset(
+        ds, aoi, _TIME, ["vertical_column_total"], workspace_id=workspace_id,
+        cmr=cmr, store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=mock_enqueue,
+    )
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    spec = job.request_spec
+    assert spec["lat_axis"] is None
+    assert spec["lon_axis"] is None
+    assert spec["var_dims"] == {}
 
 
 async def test_retrieve_subset_cmr_error_falls_back_gracefully(

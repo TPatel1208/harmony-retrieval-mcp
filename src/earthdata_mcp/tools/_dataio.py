@@ -260,6 +260,11 @@ def _open_netcdf_bundle(data: bytes) -> xr.Dataset:
     Coordinate ``units``/``calendar`` attrs are stripped before concat so granules
     written at different times don't trip xarray's attribute-equality check — the
     same append-safety guard TTA applies in ``zarr_normalization``.
+
+    The CF ``units`` (and ``calendar``) attrs are saved from the first member and
+    re-attached after concat.  Without them, a downstream Zarr round-trip cannot
+    decode the raw float64 ``time`` coordinate back to datetime64 (``xr.open_zarr``
+    uses decode_times=True by default, which requires the units attr).
     """
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         names = sorted(n for n in zf.namelist() if not n.endswith("/"))
@@ -268,8 +273,19 @@ def _open_netcdf_bundle(data: bytes) -> xr.Dataset:
         raise UnsupportedMediaType("netCDF bundle is empty")
     if len(members) == 1:
         return members[0]
+    # Save CF time metadata from the first member before the strip removes it.
+    time_meta: dict[str, str] = {}
+    first = members[0]
+    if _BUNDLE_CONCAT_DIM in first.coords:
+        for key in ("units", "calendar"):
+            val = first[_BUNDLE_CONCAT_DIM].attrs.get(key) or first[_BUNDLE_CONCAT_DIM].encoding.get(key)
+            if val:
+                time_meta[key] = str(val)
     normalized = [_strip_unsafe_coord_attrs(ds) for ds in members]
-    return xr.concat(normalized, dim=_BUNDLE_CONCAT_DIM).load()
+    result = xr.concat(normalized, dim=_BUNDLE_CONCAT_DIM).load()
+    if time_meta and _BUNDLE_CONCAT_DIM in result.coords:
+        result[_BUNDLE_CONCAT_DIM].attrs.update(time_meta)
+    return result
 
 
 def _strip_unsafe_coord_attrs(ds: xr.Dataset) -> xr.Dataset:

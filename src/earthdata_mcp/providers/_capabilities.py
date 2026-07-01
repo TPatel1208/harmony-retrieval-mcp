@@ -74,6 +74,8 @@ class CollectionCapabilities:
     native_formats: frozenset[str]
     direct_s3: S3DirectAccess | None
     services: list[ServiceCapability]
+    version: str = ""
+    spatial_extent: tuple[float, float, float, float] | None = None
     capabilities_version: str = ""
     advisory: list[str] = field(default_factory=list)
 
@@ -117,6 +119,8 @@ class CollectionCapabilities:
             native_formats=layer1["native_formats"],
             direct_s3=layer1["direct_s3"],
             services=parse_service_capabilities(harmony_caps),
+            version=layer1["version"],
+            spatial_extent=layer1["spatial_extent"],
             capabilities_version=str(harmony_caps.get("capabilitiesVersion", "")),
             advisory=layer1["advisory"],
         )
@@ -162,11 +166,13 @@ def umm_c_layer(umm_c: dict) -> dict:
     return {
         "concept_id": "",
         "short_name": umm_c.get("ShortName", ""),
+        "version": umm_c.get("Version", ""),
         "processing_level": processing_level,
         "output_shape": _output_shape(processing_level),
         "native_formats": _native_formats(umm_c),
         "direct_s3": _direct_s3(umm_c),
         "advisory": _advisory(umm_c),
+        "spatial_extent": _spatial_extent(umm_c),
     }
 
 
@@ -196,6 +202,42 @@ def _direct_s3(umm_c: dict) -> S3DirectAccess | None:
         bucket_prefixes=tuple(ddi.get("S3BucketAndObjectPrefixNames", [])),
         credentials_endpoint=ddi.get("S3CredentialsAPIEndpoint"),
     )
+
+
+def _spatial_extent(
+    umm_c: dict,
+) -> tuple[float, float, float, float] | None:
+    """``(west, south, east, north)`` from UMM-C ``SpatialExtent``, or ``None``.
+
+    Grid geometry discovery (OPeNDAP bbox hyperslabbing) uses this as an
+    axis's origin. Prefers ``BoundingRectangles`` (the precise, common case for
+    global/regional gridded products); falls back to the min/max of a
+    ``GPolygons`` boundary when only a polygon extent is published — an
+    approximation, but swath collections (the only shape with GPolygons in
+    practice here) never hyperslab, so precision does not matter there.
+    """
+    geometry = (
+        (umm_c.get("SpatialExtent") or {})
+        .get("HorizontalSpatialDomain", {})
+        .get("Geometry", {})
+    )
+    rectangles = geometry.get("BoundingRectangles") or []
+    if rectangles:
+        rect = rectangles[0]
+        return (
+            float(rect["WestBoundingCoordinate"]),
+            float(rect["SouthBoundingCoordinate"]),
+            float(rect["EastBoundingCoordinate"]),
+            float(rect["NorthBoundingCoordinate"]),
+        )
+    polygons = geometry.get("GPolygons") or []
+    if polygons:
+        points = (polygons[0].get("Boundary") or {}).get("Points") or []
+        if points:
+            lons = [float(p["Longitude"]) for p in points]
+            lats = [float(p["Latitude"]) for p in points]
+            return (min(lons), min(lats), max(lons), max(lats))
+    return None
 
 
 def _advisory(umm_c: dict) -> list[str]:

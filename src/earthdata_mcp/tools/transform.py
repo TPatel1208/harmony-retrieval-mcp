@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 
+import numpy as np
 import pyarrow as pa
 import xarray as xr
 
@@ -158,6 +159,7 @@ async def resample(
 
     result = obj
     if time_freq and "time" in result.dims:
+        result = _maybe_decode_float_time(result)
         result = result.resample(time=time_freq).mean()
     if spatial_factor:
         dims = {
@@ -216,6 +218,7 @@ async def convert_format(
 async def align(
     source_handles: list[str],
     method: str = "outer",
+    snap_time_freq: int | None = None,
     workspace_id: str = DEFAULT_WORKSPACE,
     *,
     store: WorkspaceStore | None = None,
@@ -227,6 +230,12 @@ async def align(
     Records **one provenance edge per source** (so every input is in the lineage),
     and returns an ``alignment_report`` describing the common grid and the shape
     change each input underwent.
+
+    ``snap_time_freq`` (nanoseconds) rounds every dataset's ``time`` coordinate to the
+    nearest multiple of the given frequency before alignment.  Use this when co-temporal
+    products write slightly different timestamps (e.g. TEMPO NO2 vs HCHO storing
+    scan-center vs scan-start times): a 60-second snap collapses sub-second offsets
+    without merging genuinely distinct scans.  ``None`` means no snapping.
     """
     if not source_handles or len(source_handles) < 2:
         raise ValueError("align needs at least two source handles")
@@ -237,6 +246,9 @@ async def align(
         obj, _payload = await _load_source(handle, workspace_id, store, storage)
         if not isinstance(obj, xr.Dataset):
             raise ValueError("align requires gridded (Zarr) sources")
+        obj = _cast_int_vars_to_float(obj)
+        if snap_time_freq is not None:
+            obj = _snap_time(obj, snap_time_freq)
         datasets.append(obj)
 
     shapes_before = [{str(k): int(v) for k, v in d.sizes.items()} for d in datasets]
@@ -441,3 +453,73 @@ def _lon_name(ds: xr.Dataset) -> str | None:
 
 def _lat_name(ds: xr.Dataset) -> str | None:
     return next((n for n in _LAT_NAMES if n in ds.coords or n in ds.dims), None)
+
+
+def _maybe_decode_float_time(ds: xr.Dataset) -> xr.Dataset:
+    """Decode a float64 time coordinate to datetime64 before temporal resample.
+
+    Data opened with ``decode_times=False`` (all netCDF paths in _dataio) keeps
+    ``time`` as raw float64 seconds.  pandas/xarray resample requires a
+    DatetimeIndex; if the coordinate carries a CF ``units`` attr, decode it here.
+    No-op when time is already datetime64 or when ``units`` is absent (resample
+    will raise its own TypeError with a clear message in that case).
+    """
+    if "time" not in ds.coords or np.issubdtype(ds["time"].dtype, np.datetime64):
+        return ds
+    units = ds["time"].attrs.get("units", "")
+    if not units:
+        return ds
+    decoded = xr.coding.times.decode_cf_datetime(
+        ds["time"].values, units=units, use_cftime=False
+    )
+    new_attrs = {k: v for k, v in ds["time"].attrs.items() if k not in ("units", "calendar")}
+    return ds.assign_coords(time=("time", decoded, new_attrs))
+
+
+def _cast_int_vars_to_float(ds: xr.Dataset) -> xr.Dataset:
+    """Upcast integer data variables and non-dimension coordinates to float before alignment.
+
+    Integer types cannot represent NaN.  When ``xr.align`` introduces new grid
+    positions (outer join), any integer variable is silently reindexed with 0 as
+    the fill value instead of NaN, producing corrupt data.  Upcasting first lets
+    xarray use a proper NaN fill.  int8/int16 → float32 preserves all values;
+    wider integers → float64.
+
+    Non-dimension coordinate variables (auxiliary coords that are not a named
+    dimension axis) are also cast: xr.align can invoke numpy arithmetic on them
+    when building a union index, and integer dtypes raise a ufunc 'divide' error
+    in that path.  Dimension coordinates (lat, lon, time, etc.) are skipped —
+    they are already the correct dtype for index operations.
+    """
+    def _target(arr: xr.Variable) -> str:
+        return "float32" if arr.dtype.itemsize <= 2 else "float64"
+
+    casts = {}
+    for v in ds.data_vars:
+        if np.issubdtype(ds[v].dtype, np.integer):
+            casts[v] = ds[v].astype(_target(ds[v]))
+
+    coord_casts = {}
+    for c in ds.coords:
+        if c in ds.dims:
+            continue  # dimension coords are index types — leave them alone
+        if np.issubdtype(ds[c].dtype, np.integer):
+            coord_casts[c] = ds[c].astype(_target(ds[c]))
+
+    result = ds.assign(casts) if casts else ds
+    return result.assign_coords(coord_casts) if coord_casts else result
+
+
+def _snap_time(ds: xr.Dataset, freq_ns: int) -> xr.Dataset:
+    """Round the ``time`` coordinate to the nearest ``freq_ns`` nanoseconds.
+
+    Needed when co-temporal products write slightly different nanosecond-precision
+    timestamps (e.g. scan-center vs scan-start).  A 60-second snap collapses
+    sub-second offsets so xr.align finds exact matches instead of doubling the
+    time axis with all-NaN interleaved values.
+    """
+    if "time" not in ds.coords:
+        return ds
+    t = ds.time.values.astype("int64")
+    snapped = (np.round(t / freq_ns) * freq_ns).astype("datetime64[ns]")
+    return ds.assign_coords(time=snapped)
