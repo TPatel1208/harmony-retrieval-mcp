@@ -36,7 +36,13 @@ from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, TransformSpec
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.providers.harmony import HarmonyProvider
-from earthdata_mcp.providers.opendap import OPeNDAPProvider, _resolve_from_cmr
+from earthdata_mcp.providers.opendap import (
+    AxisGeometry,
+    OPeNDAPProvider,
+    VarDimPlan,
+    _discover_grid_geometry,
+    _resolve_from_cmr,
+)
 from earthdata_mcp.providers.router import Router, RoutingDecision
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.models import HandleType, handle_type_of
@@ -374,12 +380,29 @@ async def _submit_retrieval(
     # Resolved names flow into both the Harmony primary submit and the OPeNDAP
     # fallback via the durable spec, so neither path re-derives them.
     coord_lat, coord_lon = "lat", "lon"
+    lat_axis: AxisGeometry | None = None
+    lon_axis: AxisGeometry | None = None
+    var_dims: dict[str, VarDimPlan] = {}
     if opendap_urls:
         coord_lat, coord_lon, variables = await _resolve_from_cmr(cmr, concept_id, variables)
+        # Grid geometry discovery mirrors coordinate-name discovery — same CMR
+        # pass, same fail-soft posture. Only a "grid" collection ever gets a
+        # hyperslab; a swath's curvilinear geolocation cannot use a 1D index
+        # range, so we do not bother discovering geometry for it.
+        if caps.output_shape == "grid":
+            lat_axis, lon_axis, var_dims = await _discover_grid_geometry(
+                cmr, concept_id, caps.spatial_extent, variables, coord_lat, coord_lon
+            )
     harmony_provider = HarmonyProvider(caps)
     opendap_provider = (
         OPeNDAPProvider(
-            caps, opendap_urls=opendap_urls, coord_lat=coord_lat, coord_lon=coord_lon
+            caps,
+            opendap_urls=opendap_urls,
+            coord_lat=coord_lat,
+            coord_lon=coord_lon,
+            lat_axis=lat_axis,
+            lon_axis=lon_axis,
+            var_dims=var_dims,
         )
         if opendap_urls
         else None
@@ -420,6 +443,9 @@ async def _submit_retrieval(
         opendap_urls=opendap_urls,
         coord_lat=coord_lat if opendap_urls else None,
         coord_lon=coord_lon if opendap_urls else None,
+        lat_axis=lat_axis,
+        lon_axis=lon_axis,
+        var_dims=var_dims,
     )
 
     job_id = uuid4().hex
@@ -471,6 +497,9 @@ def _build_spec(
     opendap_urls: list[str] | None = None,
     coord_lat: str | None = None,
     coord_lon: str | None = None,
+    lat_axis: AxisGeometry | None = None,
+    lon_axis: AxisGeometry | None = None,
+    var_dims: dict[str, VarDimPlan] | None = None,
 ) -> dict:
     """Assemble the durable, re-materializable request spec stored in JSONB.
 
@@ -480,6 +509,8 @@ def _build_spec(
     ``opendap_urls`` are durable granule endpoints (re-materializable on re-run),
     not staged output URLs, so they are safe to persist here (PLAN.md §4.5).
     ``opendap_url`` (the first) is kept for specs/readers that expect the singular key.
+    ``lat_axis``/``lon_axis``/``var_dims`` are the discovered grid geometry,
+    recorded so a re-planned submit reproduces the identical DAP4 hyperslab.
     """
     return {
         "concept_id": concept_id,
@@ -499,6 +530,9 @@ def _build_spec(
         "opendap_url": opendap_urls[0] if opendap_urls else None,
         "coord_lat": coord_lat,
         "coord_lon": coord_lon,
+        "lat_axis": _serialize_axis(lat_axis),
+        "lon_axis": _serialize_axis(lon_axis),
+        "var_dims": _serialize_var_dims(var_dims),
         "workspace_id": workspace_id,
         "job_handle": job_handle,
         "obs_handle": obs_handle,
@@ -512,6 +546,23 @@ def _build_spec(
             service_version=caps.capabilities_version,
         ),
     }
+
+
+def _serialize_axis(axis: AxisGeometry | None) -> dict | None:
+    """``AxisGeometry`` -> a JSONB-safe dict, or ``None``. See ``_axis_from_spec``."""
+    if axis is None:
+        return None
+    return {"name": axis.name, "origin": axis.origin, "step": axis.step, "length": axis.length}
+
+
+def _serialize_var_dims(var_dims: dict[str, VarDimPlan] | None) -> dict:
+    """Per-variable ``VarDimPlan`` map -> a JSONB-safe dict (tuples -> lists).
+
+    The worker mirror is ``jobs.worker._var_dims_from_spec``.
+    """
+    if not var_dims:
+        return {}
+    return {var: [list(pair) for pair in dims] for var, dims in var_dims.items()}
 
 
 def _cache_key(

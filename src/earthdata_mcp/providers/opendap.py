@@ -32,10 +32,13 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import math
 import zipfile
+from dataclasses import dataclass
 from urllib.parse import quote, urlsplit
 
 import httpx
+import tenacity
 
 from earthdata_mcp.config import Settings, get_settings
 from earthdata_mcp.jobs.state import JobState
@@ -64,6 +67,22 @@ _GRIDDED_SHAPES = frozenset({"grid", "swath"})
 _URL_SEP = "\n"
 
 
+@dataclass(frozen=True)
+class AxisGeometry:
+    """A regular 1D coordinate axis, described without fetching its values.
+
+    ``origin`` is the axis's first value (index 0); ``step`` is the signed
+    spacing between consecutive cells (negative for a descending axis, e.g.
+    north-to-south latitude); ``length`` is the axis's cell count. This is the
+    minimal data needed to map a degree value to a cell index.
+    """
+
+    name: str
+    origin: float
+    step: float
+    length: int
+
+
 class OPeNDAPProvider:
     """A ``RetrievalProvider`` that subsets one collection's granules over DAP4."""
 
@@ -74,6 +93,9 @@ class OPeNDAPProvider:
         opendap_urls: list[str] | None = None,
         coord_lat: str = "lat",
         coord_lon: str = "lon",
+        lat_axis: AxisGeometry | None = None,
+        lon_axis: AxisGeometry | None = None,
+        var_dims: dict[str, VarDimPlan] | None = None,
         storage: StorageBackend | None = None,
         settings: Settings | None = None,
         timeout: float = 300.0,
@@ -87,6 +109,16 @@ class OPeNDAPProvider:
         # time and injected here so the CE uses the correct names.
         self._coord_lat = coord_lat
         self._coord_lon = coord_lon
+        # Regular-grid axis geometry, discovered at planning time the same way as
+        # coord_lat/coord_lon. Only threaded into the CE for a "grid" collection —
+        # a 1D index hyperslab cannot express a bbox on a swath's 2D geolocation.
+        self._lat_axis = lat_axis
+        self._lon_axis = lon_axis
+        # Per-variable dimension plans discovered alongside the axes — lets a
+        # variable with a non-spatial dimension (e.g. a per-granule time axis)
+        # still be hyperslabbed correctly. A variable absent from the map falls
+        # back to whole-array (see _constraint_expression).
+        self._var_dims = var_dims
         self._storage = storage
         self._settings = settings or get_settings()
         self._timeout = timeout
@@ -179,9 +211,19 @@ class OPeNDAPProvider:
 
         The constraint expression projects the requested variables (and the
         spatial/temporal coordinate variables they need), so only the requested
-        subset crosses the wire — the whole point of an OPeNDAP fetch.
+        subset crosses the wire — the whole point of an OPeNDAP fetch. Axis
+        geometry is only passed through for a "grid" collection; a swath's
+        curvilinear 2D geolocation keeps the whole-array projection.
         """
-        ce = _constraint_expression(plan, coord_lat=self._coord_lat, coord_lon=self._coord_lon)
+        is_grid = self._caps.output_shape == "grid"
+        ce = _constraint_expression(
+            plan,
+            coord_lat=self._coord_lat,
+            coord_lon=self._coord_lon,
+            lat_axis=self._lat_axis if is_grid else None,
+            lon_axis=self._lon_axis if is_grid else None,
+            var_dims=self._var_dims if is_grid else None,
+        )
         url = f"{base_url}{_DAP4_SUFFIX}"
         if ce:
             url = f"{url}?dap4.ce={quote(ce, safe='')}"
@@ -190,14 +232,51 @@ class OPeNDAPProvider:
     # -- HTTP / storage construction --------------------------------------
 
     async def _fetch(self, url: str) -> bytes:
-        """GET the DAP4 subset bytes (Bearer-authenticated when a token is set)."""
+        """GET the DAP4 subset bytes (Bearer-authenticated when a token is set).
+
+        Retries up to 3× on transient 5xx / 429 with exponential backoff (2 s,
+        4 s, 8 s). A persistent 503 after all retries surfaces a message that
+        names the direct-download alternative so the caller is not left guessing.
+        """
         await get_limiter(PROVIDER).acquire()
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.get(
-                url, headers=self._auth_headers(), follow_redirects=True
-            )
-            response.raise_for_status()
-            return response.content
+
+        @tenacity.retry(
+            retry=tenacity.retry_if_exception(_is_transient_http_error),
+            wait=tenacity.wait_exponential(multiplier=2, min=2, max=30),
+            stop=tenacity.stop_after_attempt(4),
+            reraise=True,
+        )
+        async def _do_get() -> bytes:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.get(
+                    url, headers=self._auth_headers(), follow_redirects=True
+                )
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code in (502, 503, 504, 429):
+                        raise
+                    if exc.response.status_code == 503:
+                        raise RuntimeError(
+                            f"OPeNDAP server returned 503 for {url!r} — the DAP4 "
+                            "endpoint for this collection appears persistently "
+                            "unavailable. Consider direct HTTPS/S3 download of the "
+                            "full granule file and subsetting locally."
+                        ) from exc
+                    raise
+                return response.content
+
+        try:
+            return await _do_get()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (502, 503, 504):
+                raise RuntimeError(
+                    f"OPeNDAP server returned {exc.response.status_code} for "
+                    f"{url!r} after retries — the DAP4 endpoint for this collection "
+                    "appears persistently unavailable. Consider direct HTTPS/S3 "
+                    "download of the full granule file and subsetting locally."
+                ) from exc
+            raise
 
     def _auth_headers(self) -> dict[str, str]:
         token = self._settings.earthdata_token or None
@@ -217,11 +296,77 @@ def _fqn(name: str) -> str:
     return name if name.startswith("/") else f"/{name}"
 
 
+def _index_range(axis: AxisGeometry, lo: float, hi: float) -> tuple[int, int] | None:
+    """Map a ``[lo, hi]`` degree window onto an inclusive ``[low, high]`` cell
+    index range on ``axis``, clamped to ``[0, length - 1]``.
+
+    Uses floor/ceil rather than round so a box edge that falls between two
+    cells still includes the cell it touches (never clipped by an off-by-one).
+    ``axis.step``'s sign carries the axis's direction — a descending axis
+    (e.g. north-to-south latitude) still yields ``low <= high``. A degenerate
+    window (``lo == hi``) always resolves to at least one cell. Returns
+    ``None`` for a malformed axis (zero step or non-positive length).
+    """
+    if axis.step == 0 or axis.length <= 0:
+        return None
+    i_lo = (lo - axis.origin) / axis.step
+    i_hi = (hi - axis.origin) / axis.step
+    low_f, high_f = (i_lo, i_hi) if axis.step > 0 else (i_hi, i_lo)
+    low = max(0, min(math.floor(low_f), axis.length - 1))
+    high = max(0, min(math.ceil(high_f), axis.length - 1))
+    return (low, high) if high >= low else (low, low)
+
+
+def _bracket(index_range: tuple[int, int] | None) -> str:
+    return f"[{index_range[0]}:{index_range[1]}]" if index_range is not None else ""
+
+
+def _fqn_sliced(name: str, *ranges: tuple[int, int] | None) -> str:
+    return _fqn(name) + "".join(_bracket(r) for r in ranges)
+
+
+#: One data variable's own dimensions, in order, as ``(leaf_name, size)`` pairs.
+#: ``size`` is ``None`` for the two spatial (lat/lon) dims — their range comes
+#: from the axis, not a stored size — and the dimension's true size for
+#: anything else (e.g. a per-granule ``time`` dimension of length 1).
+VarDimPlan = tuple[tuple[str, "int | None"], ...]
+
+
+def _var_bracket_ranges(
+    dims: VarDimPlan,
+    lat_leaf: str,
+    lon_leaf: str,
+    lat_range: tuple[int, int] | None,
+    lon_range: tuple[int, int] | None,
+) -> tuple[tuple[int, int] | None, ...]:
+    """One bracket range per dimension, in the variable's own dimension order.
+
+    DAP4 hyperslabs are positional: a variable's *every* dimension needs a
+    bracket, in order, or Hyrax rejects the request outright (verified against
+    production Cloud OPeNDAP — a 2-bracket CE on a 3-D variable is a 400, not a
+    silently-misapplied slice). A non-spatial dimension (e.g. GLDAS's
+    per-granule ``time`` dimension, size 1) gets its own full ``(0, size - 1)``
+    range so the variable still opens correctly.
+    """
+    ranges: list[tuple[int, int] | None] = []
+    for leaf, size in dims:
+        if leaf == lat_leaf:
+            ranges.append(lat_range)
+        elif leaf == lon_leaf:
+            ranges.append(lon_range)
+        else:
+            ranges.append((0, size - 1) if size else None)
+    return tuple(ranges)
+
+
 def _constraint_expression(
     plan: RetrievalPlan,
     *,
     coord_lat: str = "lat",
     coord_lon: str = "lon",
+    lat_axis: AxisGeometry | None = None,
+    lon_axis: AxisGeometry | None = None,
+    var_dims: dict[str, VarDimPlan] | None = None,
 ) -> str:
     """Build a DAP4 projection CE from the plan's variables + coordinate variables.
 
@@ -233,23 +378,80 @@ def _constraint_expression(
     collection's netCDF files — they vary (``lat``/``lon`` for GLDAS;
     ``/product/latitude``/``/product/longitude`` for TEMPO L2 grouped).
 
-    ``/time`` is intentionally omitted: temporal filtering happens at the CMR
-    granule-search level (selecting which files to fetch), not within a file via
-    DAP4 CE. Many L3 monthly products have no ``time`` variable at all (time is
-    encoded in the filename), so projecting it causes a 400 from Hyrax.
+    ``lat_axis``/``lon_axis`` are optional regular-grid descriptors. When both
+    are given and the plan needs a bbox, the coordinate arrays *and* every
+    projected data variable are clipped to inclusive DAP4 index hyperslabs
+    covering the requested box — the variable hyperslab is what actually
+    shrinks the payload, since projecting a clipped coordinate alone does not.
+    A box crossing the antimeridian (west > east) falls back to whole-longitude
+    projection rather than emitting a wrong/split slab. When either axis is
+    absent (no geometry, or a swath collection the caller never threads
+    geometry for), output is identical to a plain whole-array projection.
+
+    ``var_dims`` maps a variable name to its own ordered dimension plan (see
+    :data:`VarDimPlan`), discovered alongside the axes. When given, each
+    variable is bracketed dimension-by-dimension using its *own* shape — the
+    only safe way to hyperslab a variable that carries an extra non-spatial
+    dimension (e.g. GLDAS's per-granule ``time``); a variable absent from the
+    map gets no bracket at all (whole-array — its shape could not be verified).
+    When ``var_dims`` is not given at all, every variable is bracketed as a
+    plain ``[lat][lon]`` pair (the caller is asserting it already knows the
+    variable is exactly 2-D over these two axes).
+
+    ``/time`` is intentionally omitted as its own *projection*: temporal
+    filtering happens at the CMR granule-search level (selecting which files
+    to fetch), not within a file via DAP4 CE, and many L3 monthly products
+    have no ``time`` variable at all (time is encoded in the filename) — so
+    projecting ``/time`` on its own causes a 400 from Hyrax. A data variable's
+    own ``time`` *dimension*, when present, is still handled — see
+    ``var_dims`` above.
     """
     # No variables requested → no CE; OPeNDAP returns the full file.
     if plan.transform is None or not plan.transform.variables:
         return ""
 
+    lat_range: tuple[int, int] | None = None
+    lon_range: tuple[int, int] | None = None
+    if (
+        plan.needs_bbox
+        and lat_axis is not None
+        and lon_axis is not None
+        and plan.aoi is not None
+        and plan.aoi.bbox is not None
+    ):
+        west, south, east, north = plan.aoi.bbox
+        lat_range = _index_range(lat_axis, south, north)
+        if west <= east:
+            lon_range = _index_range(lon_axis, west, east)
+        # else: antimeridian wrap (v1) — leave lon_range None, whole-longitude.
+
+    lat_leaf = _leaf(coord_lat) if lat_axis is not None else ""
+    lon_leaf = _leaf(coord_lon) if lon_axis is not None else ""
+
     projected: list[str] = []
-    if plan.needs_bbox:
-        projected.extend([coord_lat, coord_lon])
-    projected.extend(plan.transform.variables)
-    # Preserve order while dropping duplicate coordinate projections.
     seen: set[str] = set()
-    unique = [p for p in projected if not (p in seen or seen.add(p))]
-    return ";".join(_fqn(v) for v in unique)
+
+    def _add(name: str, *ranges: tuple[int, int] | None) -> None:
+        if name in seen:
+            return
+        seen.add(name)
+        projected.append(_fqn_sliced(name, *ranges))
+
+    if plan.needs_bbox:
+        _add(coord_lat, lat_range)
+        _add(coord_lon, lon_range)
+    for var in plan.transform.variables:
+        if not plan.needs_bbox:
+            _add(var)
+        elif var_dims is not None:
+            dims = var_dims.get(var)
+            if dims is None:
+                _add(var)  # shape unverified — whole-array for this variable only
+            else:
+                _add(var, *_var_bracket_ranges(dims, lat_leaf, lon_leaf, lat_range, lon_range))
+        else:
+            _add(var, lat_range, lon_range)
+    return ";".join(projected)
 
 
 async def _resolve_from_cmr(
@@ -318,9 +520,140 @@ async def _resolve_from_cmr(
     return (lat_name, lon_name, tuple(resolved))
 
 
+def _leaf(name: str) -> str:
+    return name.rsplit("/", 1)[-1].lower()
+
+
+def _find_cmr_var(cmr_vars: list[dict], name: str) -> dict | None:
+    leaf = _leaf(name)
+    for var in cmr_vars:
+        if _leaf(str(var.get("name") or "")) == leaf:
+            return var
+    return None
+
+
+def _dimension_length(cmr_vars: list[dict], coord_name: str) -> int | None:
+    """The size of ``coord_name``'s own (self-referencing) UMM-V dimension."""
+    var = _find_cmr_var(cmr_vars, coord_name)
+    if var is None:
+        return None
+    leaf = _leaf(coord_name)
+    for dim in var.get("dimensions") or []:
+        if _leaf(str(dim.get("name") or "")) == leaf:
+            size = dim.get("size")
+            return int(size) if size else None
+    return None
+
+
+def _variable_dim_plan(
+    cmr_vars: list[dict], var_name: str, lat_leaf: str, lon_leaf: str
+) -> VarDimPlan | None:
+    """``var_name``'s own UMM-V dimensions, in order, as a :data:`VarDimPlan`.
+
+    DAP4 hyperslabs are positional — a variable's *every* dimension needs a
+    bracket, in the variable's own order, or Hyrax rejects the request outright
+    (confirmed against production Cloud OPeNDAP: a 2-bracket CE on a 3-D
+    variable is a 400, not a silently-misapplied slice). ``None`` when the
+    variable's dimensions are unknown, don't include both a lat and a lon
+    dimension, or include a non-spatial dimension whose size UMM-V doesn't
+    report — any of which makes a safe per-dimension bracket list impossible,
+    so the caller falls back to a whole-array projection for just this variable.
+    """
+    var = _find_cmr_var(cmr_vars, var_name)
+    if var is None:
+        return None
+    dims = var.get("dimensions") or []
+    if not dims:
+        return None
+    leaves = [_leaf(str(d.get("name") or "")) for d in dims]
+    if lat_leaf not in leaves or lon_leaf not in leaves:
+        return None
+    plan: list[tuple[str, int | None]] = []
+    for d, leaf in zip(dims, leaves):
+        if leaf in (lat_leaf, lon_leaf):
+            plan.append((leaf, None))
+            continue
+        size = d.get("size")
+        if not size:
+            return None
+        plan.append((leaf, int(size)))
+    return tuple(plan)
+
+
+async def _discover_grid_geometry(
+    cmr: object,
+    concept_id: str,
+    spatial_extent: tuple[float, float, float, float] | None,
+    variables: tuple[str, ...],
+    coord_lat: str,
+    coord_lon: str,
+) -> tuple[AxisGeometry | None, AxisGeometry | None, dict[str, VarDimPlan]]:
+    """Derive regular lat/lon axis geometry from UMM-C extent + UMM-V dimensions.
+
+    Mirrors :func:`_resolve_from_cmr`'s fail-soft posture and reuses the same
+    ``get_variables()`` call — one extra CMR round trip, made in the same
+    planning pass that already resolves coordinate names. Any error, missing
+    extent, or unresolvable axis length yields ``(None, None, {})`` — the
+    caller's whole-array fallback. Never raises into the retrieval path.
+
+    Each requested variable is independently resolved to a :data:`VarDimPlan`
+    (see :func:`_variable_dim_plan`); a variable that fails resolution is
+    simply absent from the returned map (whole-array for that one variable),
+    it does not disable geometry for the rest of the request.
+
+    UMM-C's bounding coordinates describe the grid's outer *edges*, not the
+    first cell's coordinate value — confirmed against production Cloud OPeNDAP
+    (GLDAS's published west/south edge is exactly a half-cell short of its
+    real ``lon[0]``/``lat[0]``). So each axis's ``step`` is the extent span
+    divided by ``length`` (not ``length - 1``), and ``origin`` (a *value*, not
+    an edge) is the edge offset by half a step.
+    """
+    if spatial_extent is None:
+        return (None, None, {})
+    try:
+        cmr_vars = await cmr.get_variables(concept_id)  # type: ignore[attr-defined]
+    except Exception:
+        return (None, None, {})
+
+    lat_len = _dimension_length(cmr_vars, coord_lat)
+    lon_len = _dimension_length(cmr_vars, coord_lon)
+    if not lat_len or not lon_len:
+        return (None, None, {})
+
+    west, south, east, north = spatial_extent
+    lat_step = (north - south) / lat_len
+    lon_step = (east - west) / lon_len
+    if lat_step == 0 or lon_step == 0:
+        return (None, None, {})
+
+    lat_axis = AxisGeometry(
+        name=coord_lat, origin=south + lat_step / 2, step=lat_step, length=lat_len
+    )
+    lon_axis = AxisGeometry(
+        name=coord_lon, origin=west + lon_step / 2, step=lon_step, length=lon_len
+    )
+
+    lat_leaf, lon_leaf = _leaf(coord_lat), _leaf(coord_lon)
+    var_dims: dict[str, VarDimPlan] = {}
+    for v in variables:
+        plan = _variable_dim_plan(cmr_vars, v, lat_leaf, lon_leaf)
+        if plan is not None:
+            var_dims[v] = plan
+
+    return (lat_axis, lon_axis, var_dims)
+
+
 def _is_netcdf(output_format: str) -> bool:
     """True for any netCDF media type (the only shape OPeNDAP materialises here)."""
     return "netcdf" in output_format.lower()
+
+
+def _is_transient_http_error(exc: BaseException) -> bool:
+    """True for HTTP errors that are worth retrying (5xx gateway errors, 429)."""
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code in (429, 502, 503, 504)
+    )
 
 
 def _filename_from_url(url: str) -> str:

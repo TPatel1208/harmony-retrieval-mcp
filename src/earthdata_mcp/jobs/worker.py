@@ -277,6 +277,26 @@ def _apply_poll(job: Job, status: object) -> str | None:
     return "poll_job"
 
 
+def _axis_from_spec(data: dict | None):
+    """Rebuild an ``AxisGeometry`` from its ``_serialize_axis`` dict form, or
+    ``None`` — the mirror of ``tools.retrieval._serialize_axis``."""
+    if not data:
+        return None
+    from earthdata_mcp.providers.opendap import AxisGeometry
+
+    return AxisGeometry(
+        name=data["name"], origin=data["origin"], step=data["step"], length=data["length"]
+    )
+
+
+def _var_dims_from_spec(data: dict | None) -> dict:
+    """Rebuild the per-variable ``VarDimPlan`` map from its JSONB list-of-lists
+    form — the mirror of ``tools.retrieval._serialize_var_dims``."""
+    if not data:
+        return {}
+    return {var: tuple(tuple(pair) for pair in dims) for var, dims in data.items()}
+
+
 async def _provider_for(spec: dict):
     """Rebuild the retrieval provider from a durable spec, keyed on ``provider``.
 
@@ -315,6 +335,9 @@ async def _provider_for(spec: dict):
             opendap_urls=urls or [],
             coord_lat=spec.get("coord_lat") or "lat",
             coord_lon=spec.get("coord_lon") or "lon",
+            lat_axis=_axis_from_spec(spec.get("lat_axis")),
+            lon_axis=_axis_from_spec(spec.get("lon_axis")),
+            var_dims=_var_dims_from_spec(spec.get("var_dims")),
         )
     raise ValueError(f"no retrieval provider for spec provider {provider!r}")
 

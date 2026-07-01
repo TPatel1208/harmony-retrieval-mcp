@@ -19,7 +19,7 @@ import pytest
 from earthdata_mcp.providers._capabilities import CollectionCapabilities
 from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.harmony import HarmonyProvider
-from earthdata_mcp.providers.opendap import OPeNDAPProvider
+from earthdata_mcp.providers.opendap import AxisGeometry, OPeNDAPProvider
 from earthdata_mcp.jobs.worker import _job_id_from_url, _plan_from_spec, _provider_for
 
 
@@ -77,6 +77,49 @@ async def test_provider_for_opendap_falls_back_to_singular_url() -> None:
     provider = await _provider_for_with_mock_caps(spec)
     assert isinstance(provider, OPeNDAPProvider)
     assert provider._opendap_urls == ["https://hyrax.example/granule"]
+
+
+async def test_provider_for_opendap_rebuilds_axis_geometry() -> None:
+    """A spec carrying discovered grid geometry rebuilds identical AxisGeometry
+    objects — a resumed job must reproduce the same hyperslab constraint."""
+    spec = _spec(
+        "opendap",
+        opendap_urls=["https://hyrax.example/g1"],
+        lat_axis={"name": "lat", "origin": -59.875, "step": 0.25, "length": 600},
+        lon_axis={"name": "lon", "origin": -179.875, "step": 0.25, "length": 1440},
+    )
+    provider = await _provider_for_with_mock_caps(spec)
+    assert isinstance(provider, OPeNDAPProvider)
+    assert provider._lat_axis == AxisGeometry(
+        name="lat", origin=-59.875, step=0.25, length=600
+    )
+    assert provider._lon_axis == AxisGeometry(
+        name="lon", origin=-179.875, step=0.25, length=1440
+    )
+
+
+async def test_provider_for_opendap_rebuilds_var_dims() -> None:
+    """A spec carrying per-variable dim plans rebuilds them as tuples-of-tuples —
+    a resumed job must bracket each variable exactly as it was originally."""
+    spec = _spec(
+        "opendap",
+        opendap_urls=["https://hyrax.example/g1"],
+        var_dims={"Rainf_tavg": [["time", 1], ["lat", None], ["lon", None]]},
+    )
+    provider = await _provider_for_with_mock_caps(spec)
+    assert provider._var_dims == {
+        "Rainf_tavg": (("time", 1), ("lat", None), ("lon", None))
+    }
+
+
+async def test_provider_for_opendap_without_geometry_in_spec() -> None:
+    """A spec with no lat_axis/lon_axis key (or an explicit None) rebuilds a
+    provider with no geometry — the pre-existing whole-array behavior."""
+    spec = _spec("opendap", opendap_urls=["https://hyrax.example/g1"])
+    provider = await _provider_for_with_mock_caps(spec)
+    assert provider._lat_axis is None
+    assert provider._lon_axis is None
+    assert provider._var_dims == {}
 
 
 async def test_provider_for_defaults_to_harmony_when_absent() -> None:

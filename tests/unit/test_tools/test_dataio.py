@@ -101,3 +101,52 @@ def test_open_netcdf_bundle_single_member_is_the_member() -> None:
 
     assert ds.sizes["time"] == 1
     assert ds["x"].values.tolist() == [5.0]
+
+
+def _cf_time_netcdf_bytes(time_value: int, x_value: float) -> bytes:
+    """A flat single-time granule with a CF-encoded float64 ``time`` coordinate.
+
+    Uses ``units: seconds since 2000-01-01T00:00:00Z`` to mimic the encoding
+    TEMPO/OMI L3 products write — the same encoding that ``_strip_unsafe_coord_attrs``
+    removes during multi-granule concat, and that ``_open_netcdf_bundle`` must
+    re-attach so the downstream Zarr round-trip can decode ``time`` to datetime64.
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = os.path.join(tmp, "granule.nc")
+        time_arr = np.array([float(time_value)], dtype="float64")
+        ds = xr.Dataset(
+            {"x": ("time", np.array([x_value], dtype="float64"))},
+            coords={
+                "time": (
+                    "time",
+                    time_arr,
+                    {"units": "seconds since 2000-01-01T00:00:00Z", "calendar": "standard"},
+                )
+            },
+        )
+        ds.to_netcdf(path, engine="h5netcdf", mode="w")
+        with open(path, "rb") as f:
+            return f.read()
+
+
+def test_open_netcdf_bundle_preserves_time_units_after_concat() -> None:
+    """Multi-granule bundle concat must re-attach the CF ``units`` attr on ``time``.
+
+    ``_strip_unsafe_coord_attrs`` removes ``units`` so ``xr.concat`` doesn't choke
+    on attribute-equality checks across granules.  Without the re-attach step the
+    resulting dataset has a raw float64 ``time`` coordinate with no CF metadata —
+    ``xr.open_zarr`` (decode_times=True) then cannot decode it, and any downstream
+    ``resample(time=...)`` call raises a TypeError.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("g0.nc", _cf_time_netcdf_bytes(0, 10.0))
+        zf.writestr("g1.nc", _cf_time_netcdf_bytes(86400, 20.0))  # +1 day in seconds
+
+    ds = open_result(buf.getvalue(), NETCDF_BUNDLE_MEDIA_TYPE)
+
+    assert ds.sizes["time"] == 2
+    # The ``units`` attr must survive so Zarr round-trips can decode back to datetime64.
+    assert "units" in ds["time"].attrs, (
+        "time units attr must be re-attached after bundle concat"
+    )

@@ -490,6 +490,10 @@ def normalize_variable_item(item: dict) -> dict:
         "fill_values": umm.get("FillValues", []),
         "valid_ranges": umm.get("ValidRanges", []),
         "standard_name": umm.get("StandardName"),
+        "dimensions": [
+            {"name": d.get("Name"), "size": d.get("Size")}
+            for d in umm.get("Dimensions", []) or []
+        ],
     }
 
 

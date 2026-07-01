@@ -96,6 +96,31 @@ async def test_two_phase_variable_lookup(httpx_mock, provider: CMRProvider) -> N
     assert "V99-X" in str(phase2.url)
 
 
+async def test_get_variables_carries_dimensions_name_and_size(
+    httpx_mock, provider: CMRProvider
+) -> None:
+    """UMM-V ``Dimensions`` is normalized to a lowercase name/size list — the
+    data geometry discovery needs to derive an axis's cell count from it."""
+    httpx_mock.add_response(
+        json={"items": [{"meta": {"associations": {"variables": ["V1-X"]}}}]}
+    )
+    httpx_mock.add_response(
+        json={
+            "items": [
+                {
+                    "meta": {"concept-id": "V1-X"},
+                    "umm": {
+                        "Name": "lat",
+                        "Dimensions": [{"Name": "lat", "Size": 600}],
+                    },
+                }
+            ]
+        }
+    )
+    variables = await provider.get_variables("C1-X")
+    assert variables[0]["dimensions"] == [{"name": "lat", "size": 600}]
+
+
 async def test_get_variables_returns_empty_without_associations(
     httpx_mock, provider: CMRProvider
 ) -> None:

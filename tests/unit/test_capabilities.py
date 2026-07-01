@@ -64,3 +64,44 @@ def test_l3_is_gridded_with_direct_s3_and_provisional_advisory(
 def test_two_services_parsed_from_l2_fixture(l2_caps: CollectionCapabilities) -> None:
     names = {s.service_name for s in l2_caps.services}
     assert names == {"l2-subsetter-batchee-stitchee-concise", "asdc/imagenator_l2"}
+
+
+def test_collection_capabilities_carries_version() -> None:
+    caps = CollectionCapabilities.from_harmony_capabilities(
+        {}, {"Version": "061", "ShortName": "MOD13Q1"}
+    )
+    assert caps.version == "061"
+
+
+def test_spatial_extent_parses_bounding_rectangle() -> None:
+    umm_c = {
+        "SpatialExtent": {
+            "HorizontalSpatialDomain": {
+                "Geometry": {
+                    "BoundingRectangles": [
+                        {
+                            "WestBoundingCoordinate": -179.875,
+                            "SouthBoundingCoordinate": -59.875,
+                            "EastBoundingCoordinate": 179.875,
+                            "NorthBoundingCoordinate": 89.875,
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    caps = CollectionCapabilities.from_harmony_capabilities({}, umm_c)
+    assert caps.spatial_extent == (-179.875, -59.875, 179.875, 89.875)
+
+
+def test_spatial_extent_falls_back_to_gpolygon_bbox(
+    l3_caps: CollectionCapabilities,
+) -> None:
+    # tempo_no2_l3_umm_c.json has GPolygons, no BoundingRectangles (see module
+    # docstring fixture list).
+    assert l3_caps.spatial_extent == (-170.0, 10.0, -10.0, 80.0)
+
+
+def test_spatial_extent_none_without_geometry() -> None:
+    caps = CollectionCapabilities.from_harmony_capabilities({}, {"ShortName": "X"})
+    assert caps.spatial_extent is None
