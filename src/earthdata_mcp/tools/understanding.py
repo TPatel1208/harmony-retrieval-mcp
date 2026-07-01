@@ -12,7 +12,7 @@ from __future__ import annotations
 from earthdata_mcp.catalog.enrichment import enrich_variable
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
-from earthdata_mcp.workspace.models import HandleType, handle_type_of
+from earthdata_mcp.workspace.handles import resolve_dataset
 from earthdata_mcp.workspace.store import WorkspaceStore
 
 
@@ -30,25 +30,18 @@ async def describe_dataset(
     and a non-``dataset_`` handle raises ``ValueError`` — this tool resolves
     dataset handles only.
     """
-    if handle_type_of(dataset_handle) is not HandleType.DATASET:
-        raise ValueError(
-            f"describe_dataset expects a dataset_ handle, got {dataset_handle!r}"
-        )
-
     cmr = cmr or CMRProvider()
     store = store or _default_store()
 
+    concept_id = await resolve_dataset(store, workspace_id, dataset_handle)
     record = await store.get_handle(workspace_id, dataset_handle)
     collection = record.payload.get("collection", {})
-    concept_id = record.payload.get("concept_id") or collection.get("concept_id")
     short_name = collection.get("short_name")
 
-    variables: list[dict] = []
-    if concept_id:
-        for var in await cmr.get_variables(concept_id):
-            variables.append(
-                enrich_variable(_to_umm_var(var), short_name=short_name)
-            )
+    variables: list[dict] = [
+        enrich_variable(_to_umm_var(var), short_name=short_name)
+        for var in await cmr.get_variables(concept_id)
+    ]
 
     return {
         "handle": dataset_handle,

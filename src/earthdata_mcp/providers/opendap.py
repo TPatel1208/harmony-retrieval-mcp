@@ -643,6 +643,123 @@ async def _discover_grid_geometry(
     return (lat_axis, lon_axis, var_dims)
 
 
+#: Cap on granules pulled into a single OPeNDAP bundle (one DAP4 bbox subset each).
+#: Matches CMR's per-request granule limit; a wider window is truncated to this.
+_OPENDAP_GRANULE_LIMIT = 50
+
+
+@dataclass(frozen=True)
+class OpendapPlan:
+    """The OPeNDAP planning outputs :func:`plan_subset` resolves for one request.
+
+    Carries exactly what ``RequestSpec.from_plan`` needs (PLAN.md §4.3):
+    the window's granule OPeNDAP URLs, the resolved coordinate names, the
+    optional regular-grid axis geometry, the per-variable dimension plans, and
+    the resolved variable names (bare leaf names substituted with their full
+    UMM-V group path where CMR resolves them unambiguously). ``opendap_urls``
+    empty means no OPeNDAP endpoint was found for this window — every other
+    field is then the untouched default (fail-soft, never raises).
+    """
+
+    opendap_urls: list[str]
+    coord_lat: str
+    coord_lon: str
+    lat_axis: AxisGeometry | None
+    lon_axis: AxisGeometry | None
+    var_dims: dict[str, VarDimPlan]
+    variables: tuple[str, ...]
+
+
+async def plan_subset(
+    cmr: object,
+    caps: CollectionCapabilities,
+    concept_id: str,
+    bbox: tuple[float, float, float, float] | None,
+    time_range: str,
+    variables: tuple[str, ...],
+) -> OpendapPlan:
+    """The public OPeNDAP planning entry point (PLAN.md §4.2 step 3).
+
+    Composes granule-URL discovery, coordinate/variable-name resolution
+    (:func:`_resolve_from_cmr`), and grid-geometry discovery
+    (:func:`_discover_grid_geometry`) — everything a caller previously had to
+    reach into this module's private helpers to assemble. When no granule in
+    the window advertises an OPeNDAP URL, resolution is skipped entirely and
+    the plan carries the untouched inputs (fail-soft, mirrors the no-op this
+    replaces). Grid-geometry discovery only runs for a ``"grid"`` collection —
+    a swath's curvilinear geolocation cannot use a 1D index hyperslab.
+    """
+    urls = await _discover_opendap_urls(cmr, concept_id, bbox, time_range)
+    if not urls:
+        return OpendapPlan(
+            opendap_urls=[],
+            coord_lat="lat",
+            coord_lon="lon",
+            lat_axis=None,
+            lon_axis=None,
+            var_dims={},
+            variables=tuple(variables),
+        )
+
+    coord_lat, coord_lon, resolved_variables = await _resolve_from_cmr(
+        cmr, concept_id, variables
+    )
+    lat_axis: AxisGeometry | None = None
+    lon_axis: AxisGeometry | None = None
+    var_dims: dict[str, VarDimPlan] = {}
+    if caps.output_shape == "grid":
+        lat_axis, lon_axis, var_dims = await _discover_grid_geometry(
+            cmr, concept_id, caps.spatial_extent, resolved_variables, coord_lat, coord_lon
+        )
+    return OpendapPlan(
+        opendap_urls=urls,
+        coord_lat=coord_lat,
+        coord_lon=coord_lon,
+        lat_axis=lat_axis,
+        lon_axis=lon_axis,
+        var_dims=var_dims,
+        variables=resolved_variables,
+    )
+
+
+async def _discover_opendap_urls(
+    cmr: object,
+    concept_id: str,
+    bbox: tuple[float, float, float, float] | None,
+    time_range: str,
+) -> list[str]:
+    """Search the window's granules and collect each one's OPeNDAP access URL.
+
+    Over every granule in the AOI+time window (up to
+    :data:`_OPENDAP_GRANULE_LIMIT`) so a multi-day request covers the whole
+    span. Returns ``[]`` if no granules are found or none advertise an
+    OPeNDAP URL.
+    """
+    bbox_str = ",".join(str(c) for c in bbox) if bbox is not None else None
+    granules = await cmr.search_granules(  # type: ignore[attr-defined]
+        concept_id,
+        bounding_box=bbox_str,
+        temporal=time_range or None,
+        limit=_OPENDAP_GRANULE_LIMIT,
+    )
+    urls: list[str] = []
+    for granule in granules:
+        url = _opendap_url_of(granule)
+        if url:
+            urls.append(url)
+    return urls
+
+
+def _opendap_url_of(granule: dict) -> str | None:
+    """Extract a granule's OPeNDAP access URL (sans trailing ``.html``) or ``None``."""
+    for entry in granule.get("related_urls", []):
+        url = str(entry.get("URL", ""))
+        subtype = str(entry.get("Subtype", "")).upper()
+        if "OPENDAP" in subtype or "opendap" in url.lower():
+            return url[: -len(".html")] if url.endswith(".html") else url
+    return None
+
+
 def _is_netcdf(output_format: str) -> bool:
     """True for any netCDF media type (the only shape OPeNDAP materialises here)."""
     return "netcdf" in output_format.lower()

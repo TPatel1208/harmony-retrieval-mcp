@@ -689,3 +689,197 @@ async def test_discover_grid_geometry_unresolvable_variable_omitted_from_var_dim
     )
     assert lat_axis is not None and lon_axis is not None
     assert var_dims == {}
+
+
+# -- plan_subset: the OPeNDAP planning seam ---------------------------------
+#
+# plan_subset composes granule-URL discovery + _resolve_from_cmr +
+# _discover_grid_geometry behind one public entry point. These tests assert
+# the *composition* (what plan_subset returns for a given fake CMR + inputs),
+# not the internals each helper already has its own exhaustive coverage for.
+
+from earthdata_mcp.providers.opendap import plan_subset  # noqa: E402
+
+_PLAN_BBOX = (-105.0, 37.0, -104.0, 38.0)
+
+_GROUPED_VARS = [
+    {"name": "/product/vertical_column_total", "standard_name": None},
+    {"name": "/product/latitude", "standard_name": "latitude"},
+    {"name": "/product/longitude", "standard_name": "longitude"},
+]
+
+_AMBIGUOUS_VARS = [
+    {"name": "/a/ndvi", "standard_name": None},
+    {"name": "/b/ndvi", "standard_name": None},
+]
+
+# UMM-C reports the grid's outer *edges*, not the first cell's value (see
+# _discover_grid_geometry's docstring).
+_GRID_EXTENT = (-180.0, -60.0, 180.0, 90.0)
+
+_GRID_GEOMETRY_VARS = [
+    {
+        "name": "/product/latitude",
+        "standard_name": "latitude",
+        "dimensions": [{"name": "latitude", "size": 600}],
+    },
+    {
+        "name": "/product/longitude",
+        "standard_name": "longitude",
+        "dimensions": [{"name": "longitude", "size": 1440}],
+    },
+    {
+        "name": "/product/vertical_column_total",
+        "standard_name": None,
+        "dimensions": [
+            {"name": "latitude", "size": 600},
+            {"name": "longitude", "size": 1440},
+        ],
+    },
+]
+
+
+def _granule_with_opendap_url(url: str) -> dict:
+    return {
+        "related_urls": [
+            {"URL": url, "Type": "USE SERVICE API", "Subtype": "OPENDAP DATA"}
+        ]
+    }
+
+
+class _PlanCmrStub:
+    """A CMR stub whose ``search_granules`` and ``get_variables`` are both
+    independently configurable — ``plan_subset`` calls both."""
+
+    def __init__(
+        self,
+        *,
+        granules: list[dict] | None = None,
+        variables: list[dict] | BaseException | None = None,
+    ) -> None:
+        self._granules = granules if granules is not None else []
+        self._variables = variables
+        self.get_variables_called = False
+
+    async def search_granules(
+        self, concept_id: str, *, bounding_box=None, temporal=None, limit=None
+    ) -> list[dict]:
+        return self._granules
+
+    async def get_variables(self, concept_id: str, **_: object) -> list[dict]:
+        self.get_variables_called = True
+        if isinstance(self._variables, BaseException):
+            raise self._variables
+        return list(self._variables or [])
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_discovers_granule_urls() -> None:
+    cmr = _PlanCmrStub(granules=[_granule_with_opendap_url(OPENDAP_URL)])
+    plan = await plan_subset(cmr, _grid_caps(), "C1-GES_DISC", _PLAN_BBOX, "", ("precipitation",))
+    assert plan.opendap_urls == [OPENDAP_URL]
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_resolves_bare_leaf_to_grouped_path() -> None:
+    """When granule URLs are found, a bare leaf variable name is resolved to its
+    full UMM-V group path (the TEMPO case), and the resolved coordinate names
+    are carried on the plan too."""
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)], variables=_GROUPED_VARS
+    )
+    plan = await plan_subset(
+        cmr, _grid_caps(), "C1-GES_DISC", _PLAN_BBOX, "", ("vertical_column_total",)
+    )
+    assert plan.variables == ("/product/vertical_column_total",)
+    assert plan.coord_lat == "/product/latitude"
+    assert plan.coord_lon == "/product/longitude"
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_already_qualified_variable_passes_through() -> None:
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)], variables=_GROUPED_VARS
+    )
+    plan = await plan_subset(
+        cmr, _grid_caps(), "C1-GES_DISC", _PLAN_BBOX, "",
+        ("/product/vertical_column_total",),
+    )
+    assert plan.variables == ("/product/vertical_column_total",)
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_ambiguous_variable_raises() -> None:
+    """An ambiguous bare leaf name raises outside the fail-soft path — it is
+    never swallowed by plan_subset's CMR-error handling."""
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)], variables=_AMBIGUOUS_VARS
+    )
+    with pytest.raises(ValueError) as exc_info:
+        await plan_subset(cmr, _grid_caps(), "C1-GES_DISC", _PLAN_BBOX, "", ("ndvi",))
+    msg = str(exc_info.value)
+    assert "/a/ndvi" in msg and "/b/ndvi" in msg
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_no_granules_skips_resolution() -> None:
+    """No OPeNDAP granule found -> defaults, and get_variables is never called
+    (fail-soft, but also no unnecessary CMR round-trip)."""
+    cmr = _PlanCmrStub(granules=[])
+    plan = await plan_subset(cmr, _grid_caps(), "C1-GES_DISC", _PLAN_BBOX, "", ("precipitation",))
+    assert plan.opendap_urls == []
+    assert plan.coord_lat == "lat"
+    assert plan.coord_lon == "lon"
+    assert plan.lat_axis is None and plan.lon_axis is None
+    assert plan.var_dims == {}
+    assert plan.variables == ("precipitation",)
+    assert cmr.get_variables_called is False
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_cmr_error_falls_back_gracefully() -> None:
+    """A CMR/network error resolving variables still yields the discovered
+    granule URLs, with coordinate names and variables at their fail-soft
+    defaults — never raises."""
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)],
+        variables=RuntimeError("network error"),
+    )
+    plan = await plan_subset(cmr, _grid_caps(), "C1-GES_DISC", _PLAN_BBOX, "", ("precipitation",))
+    assert plan.opendap_urls == [OPENDAP_URL]
+    assert plan.coord_lat == "lat"
+    assert plan.coord_lon == "lon"
+    assert plan.variables == ("precipitation",)
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_discovers_grid_geometry_for_grid_shape() -> None:
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)], variables=_GRID_GEOMETRY_VARS
+    )
+    caps = _grid_caps()
+    caps.spatial_extent = _GRID_EXTENT
+    plan = await plan_subset(
+        cmr, caps, "C1-GES_DISC", _PLAN_BBOX, "", ("vertical_column_total",)
+    )
+    assert plan.lat_axis is not None
+    assert plan.lon_axis is not None
+    assert plan.var_dims
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_swath_shape_never_discovers_grid_geometry() -> None:
+    """A swath collection never gets axis geometry, even with granule URLs and
+    resolvable variables — a 1D index hyperslab cannot express a bbox on a
+    swath's curvilinear geolocation."""
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)], variables=_GRID_GEOMETRY_VARS
+    )
+    caps = _swath_caps()
+    caps.spatial_extent = _GRID_EXTENT
+    plan = await plan_subset(
+        cmr, caps, "C1-GES_DISC", _PLAN_BBOX, "", ("vertical_column_total",)
+    )
+    assert plan.lat_axis is None
+    assert plan.lon_axis is None
+    assert plan.var_dims == {}

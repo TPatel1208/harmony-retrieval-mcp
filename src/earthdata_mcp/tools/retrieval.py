@@ -34,16 +34,11 @@ from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, TransformSpec
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.providers.harmony import HarmonyProvider
-from earthdata_mcp.providers.opendap import (
-    AxisGeometry,
-    OPeNDAPProvider,
-    VarDimPlan,
-    _discover_grid_geometry,
-    _resolve_from_cmr,
-)
+from earthdata_mcp.providers.opendap import AxisGeometry, OPeNDAPProvider, VarDimPlan, plan_subset
 from earthdata_mcp.providers.request_spec import RequestSpec
 from earthdata_mcp.providers.router import Router
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
+from earthdata_mcp.workspace.handles import resolve_aoi, resolve_dataset
 from earthdata_mcp.workspace.models import HandleType, handle_type_of
 from earthdata_mcp.workspace.provenance import ProvenanceStore
 from earthdata_mcp.workspace.store import WorkspaceStore
@@ -341,13 +336,14 @@ async def _submit_retrieval(
     # costs one extra CMR granule-search but never displaces a working Harmony service.
     # All granules in the window are collected so a multi-day request covers the whole
     # span, not just the first scan cycle (Part 3).
-    opendap_urls: list[str] = []
+    opendap_plan = None
     if (
         not needs_point_sample
         and caps.output_shape in ("grid", "swath")
         and bbox is not None
     ):
-        opendap_urls = await _discover_opendap_urls(cmr, concept_id, bbox, time_range)
+        opendap_plan = await plan_subset(cmr, caps, concept_id, bbox, time_range, variables)
+    opendap_urls = opendap_plan.opendap_urls if opendap_plan else []
 
     # Format by shape (grid/swath → netCDF-4). An explicit caller format still wins.
     if needs_point_sample:
@@ -377,25 +373,22 @@ async def _submit_retrieval(
     # AppEEARS handles point-sample plans (step 0); OPeNDAP handles gridded/swath
     # bbox+variable+temporal subsets when Harmony has no capable service (step 3).
     #
-    # When OPeNDAP URLs are present we resolve variable names to their full UMM-V
-    # paths in one get_variables call: bare leaf names become /<group>/<leaf> for
-    # grouped collections (TEMPO), coordinate names are discovered in the same pass.
-    # Resolved names flow into both the Harmony primary submit and the OPeNDAP
-    # fallback via the durable spec, so neither path re-derives them.
+    # plan_subset resolves variable names to their full UMM-V paths in one
+    # get_variables call whenever a granule URL was found: bare leaf names become
+    # /<group>/<leaf> for grouped collections (TEMPO), coordinate names are
+    # discovered in the same pass. Resolved names flow into both the Harmony
+    # primary submit and the OPeNDAP fallback via the durable spec, so neither
+    # path re-derives them.
     coord_lat, coord_lon = "lat", "lon"
     lat_axis: AxisGeometry | None = None
     lon_axis: AxisGeometry | None = None
     var_dims: dict[str, VarDimPlan] = {}
-    if opendap_urls:
-        coord_lat, coord_lon, variables = await _resolve_from_cmr(cmr, concept_id, variables)
-        # Grid geometry discovery mirrors coordinate-name discovery — same CMR
-        # pass, same fail-soft posture. Only a "grid" collection ever gets a
-        # hyperslab; a swath's curvilinear geolocation cannot use a 1D index
-        # range, so we do not bother discovering geometry for it.
-        if caps.output_shape == "grid":
-            lat_axis, lon_axis, var_dims = await _discover_grid_geometry(
-                cmr, concept_id, caps.spatial_extent, variables, coord_lat, coord_lon
-            )
+    if opendap_plan is not None:
+        coord_lat, coord_lon = opendap_plan.coord_lat, opendap_plan.coord_lon
+        lat_axis, lon_axis, var_dims = (
+            opendap_plan.lat_axis, opendap_plan.lon_axis, opendap_plan.var_dims
+        )
+        variables = opendap_plan.variables
     harmony_provider = HarmonyProvider(caps)
     opendap_provider = (
         OPeNDAPProvider(
@@ -471,49 +464,6 @@ async def _submit_retrieval(
     }
 
 
-#: Cap on granules pulled into a single OPeNDAP bundle (one DAP4 bbox subset each).
-#: Matches CMR's per-request granule limit; a wider window is truncated to this.
-_OPENDAP_GRANULE_LIMIT = 50
-
-
-async def _discover_opendap_urls(
-    cmr: CMRProvider,
-    concept_id: str,
-    bbox: tuple[float, float, float, float] | None,
-    time_range: str,
-) -> list[str]:
-    """Search the window's granules and collect each one's OPeNDAP access URL.
-
-    Mirrors the discovery pattern in ``tests/live/test_opendap_subset.py``, but over
-    every granule in the AOI+time window (up to :data:`_OPENDAP_GRANULE_LIMIT`) so a
-    multi-day request covers the whole span. Returns ``[]`` if no granules are found
-    or none advertise an OPeNDAP URL.
-    """
-    bbox_str = ",".join(str(c) for c in bbox) if bbox is not None else None
-    granules = await cmr.search_granules(
-        concept_id,
-        bounding_box=bbox_str,
-        temporal=time_range or None,
-        limit=_OPENDAP_GRANULE_LIMIT,
-    )
-    urls: list[str] = []
-    for granule in granules:
-        url = _opendap_url_of(granule)
-        if url:
-            urls.append(url)
-    return urls
-
-
-def _opendap_url_of(granule: dict) -> str | None:
-    """Extract a granule's OPeNDAP access URL (sans trailing ``.html``) or ``None``."""
-    for entry in granule.get("related_urls", []):
-        url = str(entry.get("URL", ""))
-        subtype = str(entry.get("Subtype", "")).upper()
-        if "OPENDAP" in subtype or "opendap" in url.lower():
-            return url[: -len(".html")] if url.endswith(".html") else url
-    return None
-
-
 async def _resolve_handles(
     dataset_handle: str,
     aoi_handle: str | None,
@@ -522,29 +472,12 @@ async def _resolve_handles(
 ) -> tuple[str, tuple[float, float, float, float] | None]:
     """Resolve a ``dataset_`` (and optional ``aoi_``) handle → ``(concept_id, bbox)``.
 
-    Type-checks each prefix before any DB hit, then resolves within
-    ``workspace_id`` (cross-workspace access raises). ``aoi_handle`` may be
-    ``None`` (a global time-series), in which case ``bbox`` is ``None``.
+    A thin composition of the two typed resolvers. ``aoi_handle`` may be
+    ``None`` (a global time-series), in which case ``bbox`` is ``None`` — a
+    caller decision made here, before ``resolve_aoi`` is ever called.
     """
-    if handle_type_of(dataset_handle) is not HandleType.DATASET:
-        raise ValueError(f"expected a dataset_ handle, got {dataset_handle!r}")
-
-    dataset_record = await store.get_handle(workspace_id, dataset_handle)
-    concept_id = dataset_record.payload.get("concept_id")
-    if not concept_id:
-        raise ValueError(
-            f"dataset handle {dataset_handle!r} payload missing 'concept_id'"
-        )
-
+    concept_id = await resolve_dataset(store, workspace_id, dataset_handle)
     if aoi_handle is None:
         return concept_id, None
-
-    if handle_type_of(aoi_handle) is not HandleType.AOI:
-        raise ValueError(f"expected an aoi_ handle, got {aoi_handle!r}")
-    aoi_record = await store.get_handle(workspace_id, aoi_handle)
-    bbox = aoi_record.payload.get("bbox")
-    if not bbox or len(bbox) != 4:
-        raise ValueError(
-            f"aoi handle {aoi_handle!r} payload missing or malformed 'bbox'"
-        )
-    return concept_id, tuple(float(c) for c in bbox)
+    bbox = await resolve_aoi(store, workspace_id, aoi_handle)
+    return concept_id, bbox

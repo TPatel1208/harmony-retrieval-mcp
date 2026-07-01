@@ -22,7 +22,7 @@ from __future__ import annotations
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.tools.retrieval import _default_provenance
-from earthdata_mcp.workspace.models import HandleType, handle_type_of
+from earthdata_mcp.workspace.handles import resolve_dataset
 from earthdata_mcp.workspace.provenance import ProvenanceStore
 from earthdata_mcp.workspace.store import WorkspaceStore
 
@@ -80,16 +80,7 @@ async def cite_dataset(
     store = store or _default_store()
     cmr = cmr or CMRProvider()
 
-    if handle_type_of(dataset_handle) is not HandleType.DATASET:
-        raise ValueError(f"expected a dataset_ handle, got {dataset_handle!r}")
-
-    record = await store.get_handle(workspace_id, dataset_handle)  # isolation gate
-    concept_id = record.payload.get("concept_id")
-    if not concept_id:
-        raise ValueError(
-            f"dataset handle {dataset_handle!r} payload missing 'concept_id'"
-        )
-
+    concept_id = await resolve_dataset(store, workspace_id, dataset_handle)
     citations = await cmr.get_citations(concept_id)
     return {
         "handle": dataset_handle,
