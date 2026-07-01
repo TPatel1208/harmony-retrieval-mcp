@@ -124,15 +124,28 @@ async def test_check_coverage_returns_sample_granules(
     )
 
     assert out["covered"] is True
-    assert out["granule_count"] == 2
+    # granule_count is the TRUE total (CMR-Hits, via check_availability) — not
+    # capped at the eyeball sample size, which check_availability also reports.
+    assert out["granule_count"] == 12
+    assert out["sampled_granules"] == 2
     assert len(out["sample_granules"]) == 2
     assert out["sample_granules"][0]["concept_id"] == "G1-X"
+    fake_cmr.check_availability.assert_awaited_once_with(
+        _CONCEPT_ID, bounding_box=_BBOX_STR, temporal=_TIME
+    )
 
 
 async def test_check_coverage_empty_is_not_covered(
     workspace_store, workspace_id
 ) -> None:
-    cmr = _make_cmr(granules=[])
+    cmr = _make_cmr(
+        granules=[],
+        availability={
+            "collection_concept_id": _CONCEPT_ID,
+            "granule_count": 0,
+            "available": False,
+        },
+    )
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
 
@@ -141,6 +154,7 @@ async def test_check_coverage_empty_is_not_covered(
     )
     assert out["covered"] is False
     assert out["granule_count"] == 0
+    assert out["sampled_granules"] == 0
 
 
 # -- inspect_granules -----------------------------------------------------
@@ -172,9 +186,13 @@ async def test_inspect_granules_forwards_limit(
 # -- estimate_retrieval_size ----------------------------------------------
 
 
-async def test_estimate_retrieval_size_sums_sizes(
+async def test_estimate_retrieval_size_extrapolates_from_sample(
     fake_cmr, workspace_store, workspace_id
 ) -> None:
+    """total_size_mb must be the avg sampled size extrapolated across the TRUE
+    granule count (12, from check_availability) — not just the sum of the
+    2-granule sample, which previously reported the same figure regardless of
+    how many granules actually matched the AOI+time window."""
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
 
@@ -182,11 +200,15 @@ async def test_estimate_retrieval_size_sums_sizes(
         ds, aoi, _TIME, workspace_id=workspace_id, cmr=fake_cmr, store=workspace_store
     )
 
+    assert out["total_granules"] == 12
     assert out["sampled_granules"] == 2
-    assert out["total_size_mb"] == pytest.approx(238.7)
     assert out["avg_size_mb"] == pytest.approx(119.35)
+    assert out["total_size_mb"] == pytest.approx(119.35 * 12)
     assert out["warning"] is None
-    # Samples up to the CMR cap of 50.
+    fake_cmr.check_availability.assert_awaited_once_with(
+        _CONCEPT_ID, bounding_box=_BBOX_STR, temporal=_TIME
+    )
+    # Still samples up to the CMR cap of 50 to compute the average.
     fake_cmr.search_granules.assert_awaited_once_with(
         _CONCEPT_ID, bounding_box=_BBOX_STR, temporal=_TIME, limit=50
     )
@@ -213,7 +235,14 @@ async def test_estimate_retrieval_size_zero_sizes_warns(
 async def test_estimate_retrieval_size_no_granules_warns(
     workspace_store, workspace_id
 ) -> None:
-    cmr = _make_cmr(granules=[])
+    cmr = _make_cmr(
+        granules=[],
+        availability={
+            "collection_concept_id": _CONCEPT_ID,
+            "granule_count": 0,
+            "available": False,
+        },
+    )
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
 
@@ -221,6 +250,7 @@ async def test_estimate_retrieval_size_no_granules_warns(
         ds, aoi, _TIME, workspace_id=workspace_id, cmr=cmr, store=workspace_store
     )
 
+    assert out["total_granules"] == 0
     assert out["sampled_granules"] == 0
     assert out["total_size_mb"] == 0.0
     assert out["warning"] == "No granules found for this AOI and time range."

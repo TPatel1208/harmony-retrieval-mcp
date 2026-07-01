@@ -233,20 +233,22 @@ class AppEEARSProvider:
         """Translate UMM-V variable names to AppEEARS layer identifiers.
 
         Normalized comparison: strip a leading underscore, lowercase, spaces → underscores.
-        Unmatched names pass through raw with a warning so multi-variable tasks don't abort.
+        An unmatched name is never sent raw: AppEEARS validates every layer in the
+        task body and rejects the *whole* task with an opaque 400 if any one of
+        them is invalid, so silently forwarding a broken name only trades a clear
+        error here for a cryptic one from the API. Raise immediately instead,
+        naming the layers that were actually available.
         """
         norm_to_key = {_normalize_layer(k): k for k in layer_map}
         resolved = []
         for var in variables:
             matched = norm_to_key.get(_normalize_layer(var))
             if matched is None:
-                logger.warning(
-                    "AppEEARS layer not found for variable %r in product %s; "
-                    "sending raw name",
-                    var,
-                    product,
+                available = ", ".join(sorted(layer_map)) or "(none)"
+                raise RuntimeError(
+                    f"No AppEEARS layer matches variable {var!r} in product "
+                    f"{product!r}; available layers: {available}"
                 )
-                matched = var
             resolved.append({"product": product, "layer": matched})
         return resolved
 
@@ -310,7 +312,17 @@ class AppEEARSProvider:
                 token = await self._login()
                 headers["Authorization"] = f"Bearer {token}"
                 response = await client.request(method, url, headers=headers, **kwargs)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                # response.text carries AppEEARS's actual validation message (e.g.
+                # a bad date range or layer); a bare raise_for_status() drops it,
+                # leaving only "400 Bad Request" for the caller to go on.
+                raise httpx.HTTPStatusError(
+                    f"{exc}\nResponse body: {response.text}",
+                    request=exc.request,
+                    response=exc.response,
+                ) from exc
         return response
 
     # -- storage construction ---------------------------------------------

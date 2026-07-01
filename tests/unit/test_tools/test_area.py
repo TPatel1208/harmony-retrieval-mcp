@@ -17,6 +17,7 @@ from earthdata_mcp.tools.area import (
     _lookup_region,
     _normalize_huc_prefix,
     _parse_bbox_string,
+    _try_parse_point,
     define_area_of_interest,
 )
 from earthdata_mcp.workspace.models import HandleType, handle_type_of
@@ -177,6 +178,31 @@ def test_parse_bbox_string_latitude_out_of_range() -> None:
 def test_parse_bbox_string_anti_meridian_allowed() -> None:
     # W > E is valid (crosses the anti-meridian); must not raise.
     assert _parse_bbox_string("170,-10,-170,10") == (170.0, -10.0, -170.0, 10.0)
+
+
+# -- bare point coordinate parsing (no DB, no HTTP) -----------------------
+
+
+def test_try_parse_point_valid() -> None:
+    assert _try_parse_point("-93.6,41.6") == (-93.6, 41.6)
+
+
+def test_try_parse_point_strips_whitespace() -> None:
+    assert _try_parse_point(" -93.6, 41.6 ") == (-93.6, 41.6)
+
+
+def test_try_parse_point_lat_out_of_range_returns_none() -> None:
+    # 37, -104: second value isn't a valid latitude -> not a point, fall through.
+    assert _try_parse_point("37,-104") is None
+
+
+def test_try_parse_point_non_numeric_returns_none() -> None:
+    # A one-comma place name must not be mistaken for a coordinate pair.
+    assert _try_parse_point("Denver, CO") is None
+
+
+def test_try_parse_point_wrong_comma_count_returns_none() -> None:
+    assert _try_parse_point("-105,37,-104,38") is None
 
 
 # -- GeoJSON bbox extraction (no DB, no HTTP) -----------------------------
@@ -409,6 +435,34 @@ async def test_define_area_nominatim_no_results_raises(
         await define_area_of_interest(
             "ZZZ-nowhere", workspace_id=workspace_id, store=workspace_store
         )
+
+
+async def test_define_area_bare_point_mints_point_aoi(
+    workspace_store, workspace_id
+) -> None:
+    # "-93.6,41.6" (lon,lat) is the point/station use case retrieve_timeseries's
+    # point_sample flag documents — it must resolve without a Nominatim/WBD lookup.
+    out = await define_area_of_interest(
+        "-93.6,41.6", workspace_id=workspace_id, store=workspace_store
+    )
+    assert out["source"] == "point"
+    assert out["bbox"] == [-93.6, 41.6, -93.6, 41.6]
+    assert out["geojson"] == {"type": "Point", "coordinates": [-93.6, 41.6]}
+
+    record = await workspace_store.get_handle(workspace_id, out["handle"])
+    assert record.payload["source"] == "point"
+    assert record.payload["bbox"] == [-93.6, 41.6, -93.6, 41.6]
+
+
+async def test_define_area_place_name_with_comma_still_geocodes(
+    httpx_mock, workspace_store, workspace_id
+) -> None:
+    # A one-comma place name ("City, State") must not be swallowed by point parsing.
+    httpx_mock.add_response(json=_NOMINATIM_RESPONSE)
+    out = await define_area_of_interest(
+        "Denver, CO", workspace_id=workspace_id, store=workspace_store
+    )
+    assert out["source"] == "nominatim"
 
 
 async def test_define_area_handle_is_workspace_scoped(
