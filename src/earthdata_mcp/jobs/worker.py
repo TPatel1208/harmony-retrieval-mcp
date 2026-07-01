@@ -24,18 +24,15 @@ from urllib.parse import urlsplit
 
 from arq.connections import RedisSettings
 
+from earthdata_mcp import providers
 from earthdata_mcp.config import get_settings
 from earthdata_mcp.db import create_engine, create_session_factory
 from earthdata_mcp.jobs import crud
 from earthdata_mcp.jobs.models import Job
 from earthdata_mcp.jobs.state import TERMINAL_STATES, JobState
-from earthdata_mcp.providers.base import (
-    AOI,
-    JobRef,
-    RetrievalPlan,
-    TimeRange,
-    TransformSpec,
-)
+from earthdata_mcp.providers.base import JobRef, RetrievalProvider
+from earthdata_mcp.providers.cmr import CMRProvider
+from earthdata_mcp.providers.request_spec import RequestSpec
 
 logger = logging.getLogger(__name__)
 
@@ -83,15 +80,14 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
         job = await crud.get_job(session, job_id)
         if job is None or JobState(job.state) is not JobState.PENDING:
             return
-        spec = dict(job.request_spec)
+        spec = RequestSpec.from_jsonb(job.request_spec)
 
-    provider = await _provider_for(spec)
-    plan = _plan_from_spec(spec)
+    provider = await _load_provider(spec)
+    plan = spec.to_plan()
     try:
         ref = await provider.submit(plan)
     except Exception as exc:
-        opendap_urls = spec.get("opendap_urls") or []
-        if spec.get("provider") == "harmony" and opendap_urls:
+        if spec.provider == "harmony" and spec.opendap_urls:
             logger.warning(
                 "Harmony submit failed for job %s (%s); falling back to OPeNDAP",
                 job_id,
@@ -133,12 +129,12 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
             JobState.RUNNING,
         ):
             return
-        spec = dict(job.request_spec)
+        spec = RequestSpec.from_jsonb(job.request_spec)
         url = job.provider_job_url
 
-    provider = await _provider_for(spec)
+    provider = await _load_provider(spec)
     ref = JobRef(
-        provider=spec.get("provider", "harmony"),
+        provider=spec.provider,
         provider_job_id=_job_id_from_url(url),
         provider_job_url=url,
     )
@@ -171,15 +167,15 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
         job = await crud.get_job(session, job_id)
         if job is None or JobState(job.state) is not JobState.MATERIALIZING:
             return
-        spec = dict(job.request_spec)
+        spec = RequestSpec.from_jsonb(job.request_spec)
         url = job.provider_job_url
 
-    provider = await _provider_for(spec)
+    provider = await _load_provider(spec)
     ref = JobRef(
-        provider=spec.get("provider", "harmony"),
+        provider=spec.provider,
         provider_job_id=_job_id_from_url(url),
         provider_job_url=url,
-        job_handle=spec.get("job_handle"),
+        job_handle=spec.job_handle,
     )
     try:
         result = await provider.materialize(ref)
@@ -193,14 +189,13 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
         raise
 
     # Resolve the pending obs_ handle to the durable storage key (not a URL).
-    obs_handle = spec.get("obs_handle")
-    if obs_handle:
+    if spec.obs_handle:
         from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 
         store = _default_store()
         await store.update_handle(
-            spec.get("workspace_id", DEFAULT_WORKSPACE),
-            obs_handle,
+            spec.workspace_id or DEFAULT_WORKSPACE,
+            spec.obs_handle,
             {
                 "status": "ready",
                 "storage_key": result.storage_key,
@@ -277,93 +272,19 @@ def _apply_poll(job: Job, status: object) -> str | None:
     return "poll_job"
 
 
-def _axis_from_spec(data: dict | None):
-    """Rebuild an ``AxisGeometry`` from its ``_serialize_axis`` dict form, or
-    ``None`` — the mirror of ``tools.retrieval._serialize_axis``."""
-    if not data:
-        return None
-    from earthdata_mcp.providers.opendap import AxisGeometry
+async def _load_provider(spec: RequestSpec) -> RetrievalProvider:
+    """Fetch fresh capabilities and build this spec's retrieval provider.
 
-    return AxisGeometry(
-        name=data["name"], origin=data["origin"], step=data["step"], length=data["length"]
-    )
-
-
-def _var_dims_from_spec(data: dict | None) -> dict:
-    """Rebuild the per-variable ``VarDimPlan`` map from its JSONB list-of-lists
-    form — the mirror of ``tools.retrieval._serialize_var_dims``."""
-    if not data:
-        return {}
-    return {var: tuple(tuple(pair) for pair in dims) for var, dims in data.items()}
-
-
-async def _provider_for(spec: dict):
-    """Rebuild the retrieval provider from a durable spec, keyed on ``provider``.
-
-    The worker owns no provider state — it reconstructs the right provider on every
-    task from ``request_spec["provider"]`` (the path the router chose at planning
-    time), bound to the collection's **freshly-fetched** capabilities so
+    The worker owns no provider state — it reconstructs the right provider on
+    every task, bound to the collection's **freshly-fetched** capabilities so
     ``find_service`` re-checks the matched service rather than trusting the spec
-    blindly. This is the single switch that decides which provider drives
-    submit→poll→materialize for a given job (Harmony, AppEEARS point→Parquet, or
-    OPeNDAP DAP4 subset). An unknown provider fails loud — we never silently fall
-    back to Harmony for a job another provider planned.
+    blindly. ``providers.build`` owns the spec -> provider mapping itself
+    (Harmony, AppEEARS point→Parquet, or OPeNDAP DAP4 subset); an unknown
+    provider fails loud there — we never silently fall back to Harmony for a
+    job another provider planned.
     """
-    from earthdata_mcp.providers.appeears import AppEEARSProvider
-    from earthdata_mcp.providers.cmr import CMRProvider
-    from earthdata_mcp.providers.harmony import HarmonyProvider
-    from earthdata_mcp.providers.opendap import OPeNDAPProvider
-
-    provider = spec.get("provider", "harmony")
-    caps = await CMRProvider().collection_capabilities(spec["concept_id"])
-    if provider == "harmony":
-        return HarmonyProvider(caps, service_name_hint=spec.get("service_name"))
-    if provider == "appeears":
-        # AppEEARS builds its point-task body from the plan alone (no granule URL).
-        return AppEEARSProvider(caps)
-    if provider == "opendap":
-        # The granules' OPeNDAP URLs and coordinate variable names are discovered at
-        # planning time and carried on the spec so the CEs are rebuilt correctly on
-        # resume (coordinate names vary by collection: GLDAS uses lat/lon, TEMPO uses
-        # latitude/longitude — PLAN.md §4.2 step 3). Fall back to the singular
-        # ``opendap_url`` key for specs written before multi-granule support.
-        urls = spec.get("opendap_urls")
-        if not urls and spec.get("opendap_url"):
-            urls = [spec["opendap_url"]]
-        return OPeNDAPProvider(
-            caps,
-            opendap_urls=urls or [],
-            coord_lat=spec.get("coord_lat") or "lat",
-            coord_lon=spec.get("coord_lon") or "lon",
-            lat_axis=_axis_from_spec(spec.get("lat_axis")),
-            lon_axis=_axis_from_spec(spec.get("lon_axis")),
-            var_dims=_var_dims_from_spec(spec.get("var_dims")),
-        )
-    raise ValueError(f"no retrieval provider for spec provider {provider!r}")
-
-
-def _plan_from_spec(spec: dict) -> RetrievalPlan:
-    """Reconstruct the :class:`RetrievalPlan` from a durable request spec."""
-    bbox = spec.get("aoi_bbox")
-    variables = tuple(spec.get("variables") or ())
-    fmt = spec.get("output_format") or "application/netcdf4"
-    return RetrievalPlan(
-        output_format=fmt,
-        needs_bbox=bool(spec.get("needs_bbox")),
-        needs_variable=bool(spec.get("needs_variable")),
-        needs_temporal=bool(spec.get("needs_temporal")),
-        # Carried so a resumed AppEEARS job rebuilds a plan its provider can_handle.
-        needs_point_sample=bool(spec.get("needs_point_sample")),
-        concept_id=spec.get("concept_id"),
-        short_name=spec.get("short_name"),
-        aoi=AOI(bbox=tuple(bbox)) if bbox else None,
-        time_range=TimeRange.from_cmr(spec["time_range"])
-        if spec.get("time_range")
-        else None,
-        transform=TransformSpec(output_format=fmt, variables=variables)
-        if variables
-        else None,
-    )
+    caps = await CMRProvider().collection_capabilities(spec.concept_id)
+    return providers.build(spec, caps)
 
 
 def _job_id_from_url(url: str | None) -> str | None:

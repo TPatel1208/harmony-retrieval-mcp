@@ -20,7 +20,7 @@ serviceId, while UAT honours it, so UAT is where the "submit exactly the matched
 service" contract is actually exercisable end-to-end. The backing service is
 discovered at runtime from UAT Harmony's ``/capabilities`` (parsed by our own
 ``from_harmony_capabilities``) and the plan is built to match it. The worker's
-``_provider_for`` seam is pointed at UAT, and its obs-handle resolution at this
+``_load_provider`` seam is pointed at UAT, and its obs-handle resolution at this
 test's real Postgres store; everything else — job table, state machine, storage,
 provenance — is the real production code path.
 
@@ -132,12 +132,12 @@ async def _run(caps: CollectionCapabilities, fmt: str) -> None:
     # The two seams a real worker reaches for: rebuild the provider against UAT
     # Harmony (where serviceId pinning is honoured), and resolve the obs handle
     # through this test's real store.
-    async def _provider_for(spec: dict):
+    async def _load_provider(spec) -> "HarmonyProvider":
         return HarmonyProvider(caps, settings=settings, env=harmony.Environment.UAT)
 
-    orig_provider_for = worker_mod._provider_for
+    orig_load_provider = worker_mod._load_provider
     orig_default_store = discovery_mod._default_store
-    worker_mod._provider_for = _provider_for
+    worker_mod._load_provider = _load_provider
     discovery_mod._default_store = lambda: store
     try:
         ds = await store.put_handle(
@@ -191,6 +191,6 @@ async def _run(caps: CollectionCapabilities, fmt: str) -> None:
         )
         assert ds in {a["handle"] for a in prov["ancestors"]}
     finally:
-        worker_mod._provider_for = orig_provider_for
+        worker_mod._load_provider = orig_load_provider
         discovery_mod._default_store = orig_default_store
         await engine.dispose()
