@@ -12,17 +12,24 @@ route the tools use, so a materialized cube can be read back and inspected.
 
 from __future__ import annotations
 
+import io
 import os
 import tempfile
+import zipfile
 from uuid import uuid4
 
 import numpy as np
+import pyarrow as pa
 import pytest
 import xarray as xr
 
 from earthdata_mcp.tools._dataio import (
+    CSV_MEDIA_TYPE,
+    NETCDF_BUNDLE_MEDIA_TYPE,
+    NETCDF_WRITE_MEDIA_TYPE,
     PARQUET_MEDIA_TYPE,
     ZARR_MEDIA_TYPE,
+    UnsupportedMediaType,
     open_result,
     serialize_result,
 )
@@ -49,6 +56,17 @@ def _grid(var: str = "ndvi", lon=(-105.0, -104.5, -104.0)) -> xr.Dataset:
     )
 
 
+def _grid_capitalized(var: str = "no2", lon=(-105.0, -104.5, -104.0)) -> xr.Dataset:
+    """Same as ``_grid`` but with capitalized axis names (OMI/TEMPO-style L3 products)."""
+    lat = [37.0, 38.0, 39.0]
+    data = np.arange(len(lat) * len(lon), dtype="float32").reshape(len(lat), len(lon))
+    return xr.Dataset(
+        {var: (("Latitude", "Longitude"), data)},
+        coords={"Latitude": lat, "Longitude": list(lon)},
+        attrs={"crs": "EPSG:4326"},
+    )
+
+
 async def _seed_aoi(store, workspace_id: str) -> str:
     return await store.put_handle(
         workspace_id, HandleType.AOI, {"source": "bbox", "bbox": _BBOX}
@@ -65,6 +83,38 @@ async def _seed_cube(
         workspace_id,
         handle_type,
         {"status": "ready", "storage_key": key, "media_type": ZARR_MEDIA_TYPE},
+    )
+
+
+def _table(n: int = 3) -> pa.Table:
+    return pa.table({"lat": [37.0, 38.0, 39.0][:n], "lon": [-105.0, -104.5, -104.0][:n],
+                     "ndvi": [0.1, 0.2, 0.3][:n]})
+
+
+async def _seed_table_cube(store, storage, workspace_id: str, table: pa.Table) -> str:
+    name, data = serialize_result(table, PARQUET_MEDIA_TYPE)
+    key = f"results/{uuid4().hex}/{name}"
+    await storage.put(key, data)
+    return await store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "ready", "storage_key": key, "media_type": PARQUET_MEDIA_TYPE},
+    )
+
+
+async def _seed_bundle_obs(store, storage, workspace_id: str, data: bytes) -> str:
+    """Seed an ``obs_`` handle backed by raw netCDF-bundle-zip bytes.
+
+    Mirrors how a real Harmony/OPeNDAP multi-granule retrieval is actually stored
+    (``application/netcdf-bundle+zip``), unlike ``_seed_cube``'s Zarr round-trip —
+    needed for tests that exercise ``_dataio``'s bundle-concat time handling.
+    """
+    key = f"results/{uuid4().hex}/bundle.nc.zip"
+    await storage.put(key, data)
+    return await store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "ready", "storage_key": key, "media_type": NETCDF_BUNDLE_MEDIA_TYPE},
     )
 
 
@@ -103,6 +153,39 @@ async def test_subset_returns_cube_and_records_edge(
     # The bbox actually narrowed the lat axis (37.5..38.5 → lat 38 only).
     cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
     assert cube.sizes["lat"] == 1
+
+
+async def test_subset_bbox_applies_to_capitalized_axis_names(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """Regression: OMI/TEMPO-style Latitude/Longitude axes must not be silently
+    skipped by the AOI bbox filter (case-insensitive lon/lat lookup)."""
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, _grid_capitalized())
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await subset(
+        src, aoi_handle=aoi, workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    assert cube.sizes["Latitude"] == 1
+
+
+async def test_subset_bbox_raises_when_no_spatial_axis_found(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """An AOI was explicitly requested; if no lon/lat axis can be found at all,
+    that must be a loud error, never a silent no-op."""
+    ds = xr.Dataset({"val": (("a", "b"), np.zeros((2, 2), dtype="float32"))})
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, ds)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    with pytest.raises(ValueError, match="lon|lat|spatial"):
+        await subset(
+            src, aoi_handle=aoi, workspace_id=workspace_id,
+            **_deps(workspace_store, provenance_store, local_backend),
+        )
 
 
 # -- reproject -------------------------------------------------------------
@@ -147,6 +230,23 @@ async def test_resample_returns_cube_and_records_edge(
     assert cube.sizes["lon"] == 1
 
 
+async def test_resample_spatial_factor_applies_to_capitalized_axis_names(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """Regression: coarsening must not be silently skipped for Latitude/Longitude axes."""
+    src = await _seed_cube(
+        workspace_store, local_backend, workspace_id, _grid_capitalized()
+    )
+
+    out = await resample(
+        src, spatial_factor=2, workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    assert cube.sizes["Longitude"] == 1
+
+
 async def test_resample_requires_a_parameter(
     workspace_store, provenance_store, local_backend, workspace_id
 ):
@@ -176,6 +276,73 @@ async def test_convert_format_grid_to_parquet(
     assert src in await _ancestor_handles(provenance_store, workspace_id, out["handle"])
     record = await workspace_store.get_handle(workspace_id, out["handle"])
     assert record.payload["media_type"] == PARQUET_MEDIA_TYPE
+
+
+async def test_convert_format_table_to_csv(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    src = await _seed_table_cube(workspace_store, local_backend, workspace_id, _table())
+
+    out = await convert_format(
+        src, output_format="csv", workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    assert out["output_format"] == CSV_MEDIA_TYPE
+    cube, payload = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    assert payload["media_type"] == CSV_MEDIA_TYPE
+    assert isinstance(cube, pa.Table)
+    assert cube.column("ndvi").to_pylist() == [0.1, 0.2, 0.3]
+
+
+async def test_convert_format_grid_to_netcdf(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, _grid())
+
+    out = await convert_format(
+        src, output_format="netCDF", workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    assert out["output_format"] == NETCDF_WRITE_MEDIA_TYPE
+    cube, payload = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    assert payload["media_type"] == NETCDF_WRITE_MEDIA_TYPE
+    assert isinstance(cube, xr.Dataset)
+    assert "ndvi" in cube.data_vars
+
+
+async def test_convert_format_grid_to_csv_rejected(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, _grid())
+    with pytest.raises(UnsupportedMediaType, match="tabular"):
+        await convert_format(
+            src, output_format="csv", workspace_id=workspace_id,
+            **_deps(workspace_store, provenance_store, local_backend),
+        )
+
+
+async def test_convert_format_table_to_netcdf_rejected(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    src = await _seed_table_cube(workspace_store, local_backend, workspace_id, _table())
+    with pytest.raises(UnsupportedMediaType, match="gridded"):
+        await convert_format(
+            src, output_format="netcdf", workspace_id=workspace_id,
+            **_deps(workspace_store, provenance_store, local_backend),
+        )
+
+
+async def test_convert_format_unknown_format_raises(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, _grid())
+    with pytest.raises(UnsupportedMediaType):
+        await convert_format(
+            src, output_format="geojson", workspace_id=workspace_id,
+            **_deps(workspace_store, provenance_store, local_backend),
+        )
 
 
 # -- align -----------------------------------------------------------------
@@ -267,6 +434,85 @@ async def test_align_sub_second_time_offset_does_not_produce_all_nan(
     # Both variables must be finite at every timestep (no NaN from misalignment).
     assert not bool(np.isnan(cube["no2"].values).any()), "no2 has unexpected NaN"
     assert not bool(np.isnan(cube["hcho"].values).any()), "hcho has unexpected NaN"
+
+
+def _no2_like_granule_bytes(range_beginning_date: str, value: float) -> bytes:
+    """One OMI_MINDS_NO2d-style daily granule: singleton ``Time`` dim, no ``time``
+    coordinate variable at all — its date lives only in the ``RangeBeginningDate``
+    global attr."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = os.path.join(tmp, "g.nc")
+        xr.Dataset(
+            {"no2": (("Time", "lat", "lon"), np.array([[[value]]]))},
+            coords={"lat": [40.0], "lon": [-90.0]},
+            attrs={
+                "RangeBeginningDate": range_beginning_date,
+                "RangeBeginningTime": "00:00:00.000000Z",
+            },
+        ).to_netcdf(path, engine="h5netcdf", mode="w")
+        with open(path, "rb") as f:
+            return f.read()
+
+
+def _wind_like_granule_bytes(date: str, value: float) -> bytes:
+    """One MERRA-2-style daily granule: real ``time`` coord, but CF units relative
+    to *that day* — "minutes since <date> 00:00:00", the same on every granule."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = os.path.join(tmp, "g.nc")
+        xr.Dataset(
+            {"u": (("time", "lat", "lon"), np.array([[[value]]]))},
+            coords={
+                "time": ("time", np.array([0.0]), {"units": f"minutes since {date} 00:00:00"}),
+                "lat": [40.0],
+                "lon": [-90.0],
+            },
+        ).to_netcdf(path, engine="h5netcdf", mode="w")
+        with open(path, "rb") as f:
+            return f.read()
+
+
+def _bundle_zip(*members: bytes) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, member in enumerate(members):
+            zf.writestr(f"g{i}.nc", member)
+    return buf.getvalue()
+
+
+async def test_align_reconciles_no_time_index_against_real_time_index(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """Regression: aligning an OMI-style daily bundle (no native ``time`` coordinate,
+    date only in global attrs) against a MERRA-2-style bundle (real ``time`` coord,
+    per-granule relative CF epoch) must produce a real outer join, not
+    ``xarray.structure.alignment.AlignmentError: ... note: an index is found along
+    that dimension`` — which is what happened before ``_dataio`` gave every bundle
+    member a real, correctly-decoded ``time`` coordinate before concat.
+    """
+    # Different granule counts on each side (2 vs 3), like the real NO2 (50) vs
+    # wind (489) mismatch — a same-size coincidence would hide the bug, since
+    # xr.align's unindexed-dim check only complains when sizes actually differ.
+    no2_bundle = _bundle_zip(
+        _no2_like_granule_bytes("2020-09-15", 1.0),
+        _no2_like_granule_bytes("2020-09-16", 2.0),
+    )
+    wind_bundle = _bundle_zip(
+        _wind_like_granule_bytes("2020-09-15", 10.0),
+        _wind_like_granule_bytes("2020-09-16", 20.0),
+        _wind_like_granule_bytes("2020-09-17", 30.0),
+    )
+    no2 = await _seed_bundle_obs(workspace_store, local_backend, workspace_id, no2_bundle)
+    wind = await _seed_bundle_obs(workspace_store, local_backend, workspace_id, wind_bundle)
+
+    out = await align(
+        [no2, wind], method="outer", workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    # Outer join over {15,16} ∪ {15,16,17} = 3 distinct days.
+    assert cube.sizes["time"] == 3, f"expected 3 aligned days, got {cube.sizes['time']}"
+    assert not bool(np.isnan(cube["u"].values).any()), "wind must be finite on every real day"
 
 
 # -- shared contract -------------------------------------------------------

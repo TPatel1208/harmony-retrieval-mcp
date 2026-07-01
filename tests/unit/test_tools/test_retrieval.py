@@ -745,10 +745,19 @@ async def test_cancel_pending_job(
     assert job.state == JobState.CANCELLED.value
 
 
-async def test_cancel_terminal_job_raises(
+@pytest.mark.parametrize(
+    "terminal_state",
+    [JobState.READY, JobState.FAILED, JobState.EXPIRED, JobState.CANCELLED],
+)
+async def test_cancel_terminal_job_is_noop(
+    terminal_state,
     grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
     workspace_id,
 ) -> None:
+    """Cancelling an already-terminal job is a soft no-op, not a raised error:
+    job state can change between when a caller decides to cancel and when the
+    call lands (e.g. it just finished or failed), so the caller's intent
+    ("stop this job") is already satisfied — there is nothing illegal here."""
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
     out = await retrieve_data(
@@ -756,17 +765,22 @@ async def test_cancel_terminal_job_raises(
         **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
     )
 
-    # Force the row to a terminal state, then cancelling must be illegal.
     async with session_factory() as session:
         job = await get_job_by_handle(session, out["job_handle"])
-        job.state = JobState.READY.value
+        job.state = terminal_state.value
         await session.commit()
 
-    with pytest.raises(ValueError):
-        await cancel_retrieval(
-            out["job_handle"], workspace_id=workspace_id,
-            store=workspace_store, session_factory=session_factory,
-        )
+    res = await cancel_retrieval(
+        out["job_handle"], workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+    assert res == {"job_handle": out["job_handle"], "status": terminal_state.value}
+
+    # The job's actual state is untouched — cancelling "ready" must not flip it
+    # to "cancelled".
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    assert job.state == terminal_state.value
 
 
 async def test_cancel_cross_workspace_denied(

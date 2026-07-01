@@ -287,7 +287,12 @@ async def convert_format(
     output_format: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
 ) -> dict:
-    """Re-serialize a materialized result to a different media type → a ``cube_`` handle."""
+    """Re-serialize a materialized result to a different media type → a ``cube_`` handle.
+
+    ``output_format`` accepts ``"csv"``, ``"netcdf"``, ``"parquet"``, ``"zarr"`` (or
+    their media-type spellings), case-insensitive. CSV requires a tabular (point)
+    source; netCDF requires a gridded source — each raises a clear error otherwise.
+    """
     return await transform.convert_format(source_handle, output_format, workspace_id)
 
 
@@ -298,7 +303,7 @@ async def align(
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
 ) -> dict:
     """Align ≥2 gridded results to a common grid → a ``cube_`` handle + alignment report."""
-    return await transform.align(source_handles, method, workspace_id)
+    return await transform.align(source_handles, method, workspace_id=workspace_id)
 
 
 @mcp.tool

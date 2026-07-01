@@ -4,6 +4,9 @@ Accepts the forms an agent naturally has on hand and resolves each to a bbox
 (plus the original geometry, when given GeoJSON):
 
 * a bbox string ``"-105,37,-104,38"`` (W,S,E,N decimal degrees),
+* a bare point string ``"-93.6,41.6"`` (lon,lat decimal degrees) — resolves to a
+  degenerate point AOI (Point geojson + zero-area bbox), the point/station case
+  ``retrieve_timeseries(point_sample=True)`` expects,
 * a GeoJSON geometry/Feature (string or dict),
 * a HUC watershed code (all-digit string, even length 2–12) — resolved via
   the **USGS Watershed Boundary Dataset (WBD) REST API** (auth-free).
@@ -139,12 +142,17 @@ async def _resolve_location(
     Resolution order:
     1. dict / GeoJSON string → geojson branch.
     2. Four-comma string → bbox branch (raises on bad values; never geocodes).
-    3. All-digit even-length string (2–12 chars) → USGS WBD by HUC code; raises
+    3. One-comma numeric string ``"lon,lat"`` → a degenerate point AOI (a Point
+       geojson plus a zero-area bbox where W==E, S==N) — the point/station case
+       ``retrieve_timeseries(point_sample=True)`` expects. A one-comma string
+       that doesn't parse as two in-range floats (e.g. ``"Denver, CO"``) falls
+       through to geocoding instead.
+    4. All-digit even-length string (2–12 chars) → USGS WBD by HUC code; raises
        immediately if WBD returns nothing (no Nominatim fallback for HUC inputs).
-    4. Curated region table (``tools/data/regions.json``) — continents and
+    5. Curated region table (``tools/data/regions.json``) — continents and
        informal regions that Nominatim mishandles; matched case-insensitively
        including aliases.  Returns immediately; Nominatim is never called.
-    5. Plain-English name → Nominatim first:
+    6. Plain-English name → Nominatim first:
        - Polygon/MultiPolygon result → return immediately, source ``"nominatim"``.
        - Point/LineString result (``geo is None``) → try USGS WBD name search first:
          - WBD hit → return it, source ``"usgs_wbd"`` (fixes basin/watershed names).
@@ -163,6 +171,18 @@ async def _resolve_location(
     # and surface a bad value rather than silently geocoding "Colorado,37,-104,38".
     if location.count(",") == 3:
         return _parse_bbox_string(location), None, "bbox", None
+
+    # A string with exactly one comma may be a bare "lon,lat" point (the
+    # point/station case retrieve_timeseries(point_sample=True) expects) — but
+    # it may also be a "City, State" place name, so only claim it as a point
+    # when both parts actually parse as in-range floats; otherwise fall through
+    # to geocoding below.
+    if location.count(",") == 1:
+        point = _try_parse_point(location)
+        if point is not None:
+            lon, lat = point
+            geometry = {"type": "Point", "coordinates": [lon, lat]}
+            return (lon, lat, lon, lat), geometry, "point", None
 
     huc_digits = _normalize_huc_prefix(location)
     if huc_digits is not None and _is_huc_code(huc_digits):
@@ -229,6 +249,24 @@ def _parse_bbox_string(s: str) -> tuple[float, float, float, float]:
         raise ValueError(f"non-numeric value in bbox string {s!r}") from exc
     _validate_bbox(w, south, e, n)
     return (w, south, e, n)
+
+
+def _try_parse_point(s: str) -> tuple[float, float] | None:
+    """Parse ``"lon,lat"`` → ``(lon, lat)``, or ``None`` if it isn't one.
+
+    Returns ``None`` rather than raising so a one-comma place name like
+    ``"Denver, CO"`` falls through to geocoding instead of being rejected.
+    """
+    parts = s.split(",")
+    if len(parts) != 2:
+        return None
+    try:
+        lon, lat = (float(p.strip()) for p in parts)
+    except ValueError:
+        return None
+    if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
+        return None
+    return lon, lat
 
 
 def _validate_bbox(w: float, s: float, e: float, n: float) -> None:

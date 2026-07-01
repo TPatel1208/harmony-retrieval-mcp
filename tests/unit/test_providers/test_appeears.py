@@ -11,8 +11,8 @@ from __future__ import annotations
 import datetime as dt
 import io
 import json
-import logging
 
+import httpx
 import pyarrow.parquet as pq
 import pytest
 
@@ -204,25 +204,41 @@ async def test_submit_raises_when_product_not_in_appeears_catalog(httpx_mock) ->
 
 
 @pytest.mark.asyncio
-async def test_submit_falls_back_to_raw_name_on_no_match(httpx_mock, caplog) -> None:
-    """When a UMM-V name has no normalized match in the AppEEARS layer list, the raw
-    name is sent and a warning is logged so multi-variable tasks still proceed."""
+async def test_submit_raises_on_unmatched_variable(httpx_mock) -> None:
+    """When a UMM-V name has no normalized match in the AppEEARS layer list, submit
+    must raise immediately naming the available layers — not send a broken layer
+    name to POST /task, which AppEEARS rejects with an opaque 400."""
     _mock_login(httpx_mock)
     _mock_layer_list(httpx_mock)  # only contains APPEEARS_LAYER, not "Unknown Variable"
-    httpx_mock.add_response(url=f"{BASE}/task", method="POST", json={"task_id": "ghi789"})
     plan = _point_plan(
         transform=TransformSpec(
             output_format=PARQUET_MEDIA_TYPE, variables=("Unknown Variable",)
         )
     )
 
-    with caplog.at_level(logging.WARNING, logger="earthdata_mcp.providers.appeears"):
+    with pytest.raises(RuntimeError, match="Unknown Variable"):
         await _provider().submit(plan)
 
-    task_req = httpx_mock.get_requests()[2]
-    body = json.loads(task_req.content)
-    assert body["params"]["layers"] == [{"product": PRODUCT, "layer": "Unknown Variable"}]
-    assert any("Unknown Variable" in msg for msg in caplog.messages)
+    # No /task request was ever sent — the bad request never left the client.
+    assert len(httpx_mock.get_requests()) == 2
+
+
+@pytest.mark.asyncio
+async def test_submit_task_rejection_surfaces_response_body(httpx_mock) -> None:
+    """A 400 from POST /task must surface AppEEARS's error body in the raised
+    exception — a bare ``response.raise_for_status()`` drops it, leaving the
+    caller with only "400 BAD REQUEST" and no clue what was wrong."""
+    _mock_login(httpx_mock)
+    _mock_layer_list(httpx_mock)
+    httpx_mock.add_response(
+        url=f"{BASE}/task",
+        method="POST",
+        status_code=400,
+        json={"message": "startDate must precede endDate"},
+    )
+
+    with pytest.raises(httpx.HTTPStatusError, match="startDate must precede endDate"):
+        await _provider().submit(_point_plan())
 
 
 @pytest.mark.asyncio

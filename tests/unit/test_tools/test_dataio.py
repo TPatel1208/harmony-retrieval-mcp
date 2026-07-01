@@ -23,9 +23,18 @@ import zipfile
 import numpy as np
 import xarray as xr
 
+import pyarrow as pa
+import pytest
+
 from earthdata_mcp.tools._dataio import (
+    CSV_MEDIA_TYPE,
     NETCDF_BUNDLE_MEDIA_TYPE,
+    NETCDF_WRITE_MEDIA_TYPE,
+    PARQUET_MEDIA_TYPE,
+    UnsupportedMediaType,
+    normalize_output_format,
     open_result,
+    serialize_result,
 )
 
 
@@ -103,13 +112,14 @@ def test_open_netcdf_bundle_single_member_is_the_member() -> None:
     assert ds["x"].values.tolist() == [5.0]
 
 
-def _cf_time_netcdf_bytes(time_value: int, x_value: float) -> bytes:
+def _cf_time_netcdf_bytes(
+    time_value: int, x_value: float, units: str = "seconds since 2000-01-01T00:00:00Z"
+) -> bytes:
     """A flat single-time granule with a CF-encoded float64 ``time`` coordinate.
 
-    Uses ``units: seconds since 2000-01-01T00:00:00Z`` to mimic the encoding
-    TEMPO/OMI L3 products write — the same encoding that ``_strip_unsafe_coord_attrs``
-    removes during multi-granule concat, and that ``_open_netcdf_bundle`` must
-    re-attach so the downstream Zarr round-trip can decode ``time`` to datetime64.
+    Defaults to ``seconds since 2000-01-01T00:00:00Z`` to mimic the encoding
+    TEMPO/OMI L3 products write. ``units`` is overridable so a test can give
+    different members different reference epochs (as MERRA-2 daily granules do).
     """
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         path = os.path.join(tmp, "granule.nc")
@@ -120,7 +130,7 @@ def _cf_time_netcdf_bytes(time_value: int, x_value: float) -> bytes:
                 "time": (
                     "time",
                     time_arr,
-                    {"units": "seconds since 2000-01-01T00:00:00Z", "calendar": "standard"},
+                    {"units": units, "calendar": "standard"},
                 )
             },
         )
@@ -129,14 +139,14 @@ def _cf_time_netcdf_bytes(time_value: int, x_value: float) -> bytes:
             return f.read()
 
 
-def test_open_netcdf_bundle_preserves_time_units_after_concat() -> None:
-    """Multi-granule bundle concat must re-attach the CF ``units`` attr on ``time``.
+def test_open_netcdf_bundle_decodes_time_to_datetime64_after_concat() -> None:
+    """Multi-granule bundle concat must decode ``time`` to real datetime64 values.
 
-    ``_strip_unsafe_coord_attrs`` removes ``units`` so ``xr.concat`` doesn't choke
-    on attribute-equality checks across granules.  Without the re-attach step the
-    resulting dataset has a raw float64 ``time`` coordinate with no CF metadata —
-    ``xr.open_zarr`` (decode_times=True) then cannot decode it, and any downstream
-    ``resample(time=...)`` call raises a TypeError.
+    ``_strip_unsafe_coord_attrs`` removes the CF ``units``/``calendar`` attrs so
+    ``xr.concat`` doesn't choke on attribute-equality checks across granules.
+    ``_open_netcdf_bundle`` decodes each member against its own ``units`` *before*
+    that strip runs (see ``_decode_member_time``), so the concatenated result
+    already carries proper datetime64 values with no CF metadata left to lose.
     """
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -146,7 +156,148 @@ def test_open_netcdf_bundle_preserves_time_units_after_concat() -> None:
     ds = open_result(buf.getvalue(), NETCDF_BUNDLE_MEDIA_TYPE)
 
     assert ds.sizes["time"] == 2
-    # The ``units`` attr must survive so Zarr round-trips can decode back to datetime64.
-    assert "units" in ds["time"].attrs, (
-        "time units attr must be re-attached after bundle concat"
-    )
+    assert np.issubdtype(ds["time"].dtype, np.datetime64)
+    assert list(ds["time"].values) == [
+        np.datetime64("2000-01-01T00:00:00"),
+        np.datetime64("2000-01-02T00:00:00"),
+    ]
+
+
+def test_open_netcdf_bundle_decodes_each_member_against_its_own_epoch() -> None:
+    """Members with different CF reference epochs must decode to distinct dates.
+
+    MERRA-2 daily granules each encode ``time`` as "minutes since <that day's
+    date> 00:00:00" — the raw values ``[180]``/``[180]`` are identical across
+    days.  A prior version of ``_open_netcdf_bundle`` stripped every member's
+    ``units`` before concat and re-attached only the *first* member's units to
+    the whole stack afterward, silently reinterpreting every later member's
+    day-relative offset under the first member's epoch and collapsing distinct
+    days onto one. Decoding each member against its own units before concat
+    (``_decode_member_time``) must keep them distinct.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "g0.nc",
+            _cf_time_netcdf_bytes(180, 10.0, units="minutes since 2020-09-15 00:00:00"),
+        )
+        zf.writestr(
+            "g1.nc",
+            _cf_time_netcdf_bytes(180, 20.0, units="minutes since 2020-09-16 00:00:00"),
+        )
+
+    ds = open_result(buf.getvalue(), NETCDF_BUNDLE_MEDIA_TYPE)
+
+    assert ds.sizes["time"] == 2
+    times = list(ds["time"].values)
+    assert len(set(times)) == 2, f"expected two distinct days, got {times}"
+    assert times == [
+        np.datetime64("2020-09-15T03:00:00"),
+        np.datetime64("2020-09-16T03:00:00"),
+    ]
+
+
+def _no_time_coord_netcdf_bytes(range_beginning_date: str, x_value: float) -> bytes:
+    """A granule with a singleton ``Time`` (capitalized) dim and no ``time`` coord.
+
+    Mirrors OMI_MINDS_NO2d: the only per-granule date lives in the
+    ``RangeBeginningDate``/``RangeBeginningTime`` global attrs (standard CMR/UMM-G
+    granule temporal metadata), not in any coordinate variable.
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = os.path.join(tmp, "granule.nc")
+        ds = xr.Dataset(
+            {"x": ("Time", np.array([x_value], dtype="float64"))},
+            attrs={
+                "RangeBeginningDate": range_beginning_date,
+                "RangeBeginningTime": "00:00:00.000000Z",
+            },
+        )
+        ds.to_netcdf(path, engine="h5netcdf", mode="w")
+        with open(path, "rb") as f:
+            return f.read()
+
+
+def test_open_netcdf_bundle_synthesizes_time_from_range_beginning_date() -> None:
+    """A granule with no ``time`` coordinate at all must still get a real,
+    indexed ``time`` after bundle concat.
+
+    Without this, ``xr.concat(dim="time")`` can't find ``time`` in the member
+    (it only has a differently-cased ``Time`` dim) and fabricates a brand-new,
+    *unindexed* stacking dimension instead. That later fails ``xr.align``
+    against any peer dataset that does carry a real time index:
+    ``AlignmentError: ... note: an index is found along that dimension``.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("g0.nc", _no_time_coord_netcdf_bytes("2020-09-15", 10.0))
+        zf.writestr("g1.nc", _no_time_coord_netcdf_bytes("2020-09-16", 20.0))
+
+    ds = open_result(buf.getvalue(), NETCDF_BUNDLE_MEDIA_TYPE)
+
+    assert "time" in ds.coords, "time must be an indexed coordinate, not a bare dim"
+    assert "time" in ds.indexes
+    assert np.issubdtype(ds["time"].dtype, np.datetime64)
+    assert list(ds["time"].values) == [
+        np.datetime64("2020-09-15T00:00:00"),
+        np.datetime64("2020-09-16T00:00:00"),
+    ]
+    assert ds["x"].values.tolist() == [10.0, 20.0]
+
+
+# -- convert_format serializers ----------------------------------------------
+
+
+def test_serialize_and_reopen_csv_round_trips_a_table() -> None:
+    table = pa.table({"lat": [37.0, 38.0], "ndvi": [0.1, 0.2]})
+
+    name, data = serialize_result(table, CSV_MEDIA_TYPE)
+    reopened = open_result(data, CSV_MEDIA_TYPE)
+
+    assert name == "cube.csv"
+    assert reopened.column("ndvi").to_pylist() == [0.1, 0.2]
+
+
+def test_serialize_csv_rejects_a_dataset() -> None:
+    ds = xr.Dataset({"ndvi": ("lat", np.array([0.1, 0.2]))}, coords={"lat": [37.0, 38.0]})
+    with pytest.raises(UnsupportedMediaType, match="tabular"):
+        serialize_result(ds, CSV_MEDIA_TYPE)
+
+
+def test_serialize_and_reopen_netcdf_round_trips_a_dataset() -> None:
+    ds = xr.Dataset({"ndvi": ("lat", np.array([0.1, 0.2]))}, coords={"lat": [37.0, 38.0]})
+
+    name, data = serialize_result(ds, NETCDF_WRITE_MEDIA_TYPE)
+    reopened = open_result(data, NETCDF_WRITE_MEDIA_TYPE)
+
+    assert name == "cube.nc"
+    assert reopened["ndvi"].values.tolist() == [0.1, 0.2]
+
+
+def test_serialize_netcdf_rejects_a_table() -> None:
+    table = pa.table({"lat": [37.0, 38.0], "ndvi": [0.1, 0.2]})
+    with pytest.raises(UnsupportedMediaType, match="gridded"):
+        serialize_result(table, NETCDF_WRITE_MEDIA_TYPE)
+
+
+@pytest.mark.parametrize(
+    "alias,canonical",
+    [
+        ("csv", CSV_MEDIA_TYPE),
+        ("CSV", CSV_MEDIA_TYPE),
+        ("text/csv", CSV_MEDIA_TYPE),
+        ("netcdf", NETCDF_WRITE_MEDIA_TYPE),
+        ("NetCDF", NETCDF_WRITE_MEDIA_TYPE),
+        ("application/x-netcdf4", NETCDF_WRITE_MEDIA_TYPE),
+        ("parquet", PARQUET_MEDIA_TYPE),
+        ("application/parquet", PARQUET_MEDIA_TYPE),
+        (PARQUET_MEDIA_TYPE, PARQUET_MEDIA_TYPE),
+    ],
+)
+def test_normalize_output_format_accepts_aliases(alias: str, canonical: str) -> None:
+    assert normalize_output_format(alias) == canonical
+
+
+def test_normalize_output_format_rejects_unknown() -> None:
+    with pytest.raises(UnsupportedMediaType):
+        normalize_output_format("geojson")

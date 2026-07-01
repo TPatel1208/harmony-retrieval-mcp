@@ -5,10 +5,12 @@ a ``dataset_`` + ``aoi_`` + time window. All delegate to ``CMRProvider``'s granu
 search/count — no Harmony, no downloads (PLAN.md §6 constraint):
 
 * ``check_availability`` — count-only (CMR-Hits header); the fast yes/no.
-* ``check_coverage`` — count plus a small sample of granules to eyeball.
+* ``check_coverage`` — the same true count plus a small sample of granules to
+  eyeball; ``granule_count`` always agrees with ``check_availability``.
 * ``inspect_granules`` — the granule records themselves (URs, URLs, sizes).
-* ``estimate_retrieval_size`` — sum CMR-reported granule sizes; the gate a later
-  phase uses to refuse a huge request before any byte moves.
+* ``estimate_retrieval_size`` — extrapolate the true total from a sampled
+  average granule size; the gate a later phase uses to refuse a huge request
+  before any byte moves.
 
 Each resolves both handles within the caller's workspace (cross-workspace access
 is denied, not silently served) and rebuilds the CMR query from the durable
@@ -39,12 +41,22 @@ async def check_coverage(
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
 ) -> dict:
-    """Is there data for this dataset/AOI/time? Returns a count + sample granules."""
+    """Is there data for this dataset/AOI/time? Returns the true count + a sample.
+
+    ``granule_count`` is the true total (CMR-Hits, via the same query
+    ``check_availability`` uses) — never capped at the eyeball sample size, so
+    it agrees with ``check_availability`` for the same dataset/AOI/time.
+    ``sample_granules`` is a separate, small eyeball list capped at
+    :data:`_COVERAGE_SAMPLE_LIMIT`; its size is reported as ``sampled_granules``.
+    """
     cmr = cmr or CMRProvider()
     store = store or _default_store()
 
     concept_id, bbox_str = await _resolve_handles(
         dataset_handle, aoi_handle, workspace_id, store
+    )
+    availability = await cmr.check_availability(
+        concept_id, bounding_box=bbox_str, temporal=time_range
     )
     granules = await cmr.search_granules(
         concept_id,
@@ -56,8 +68,9 @@ async def check_coverage(
         "dataset_handle": dataset_handle,
         "aoi_handle": aoi_handle,
         "time_range": time_range,
-        "granule_count": len(granules),
-        "covered": len(granules) > 0,
+        "granule_count": availability["granule_count"],
+        "covered": availability["available"],
+        "sampled_granules": len(granules),
         "sample_granules": granules,
     }
 
@@ -131,12 +144,16 @@ async def estimate_retrieval_size(
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
 ) -> dict:
-    """Estimate total retrieval size by summing CMR-reported granule sizes.
+    """Estimate total retrieval size by extrapolating from a sample of granules.
 
-    Sums ``size_mb`` over a sample of up to 50 granules. Granules that report no
-    size (UMM-G may omit it) are excluded from the average; ``warning`` is set
-    when no granules match or none report a size, so a caller never mistakes a
-    metadata gap for "0 MB to download".
+    Averages ``size_mb`` over a sample of up to 50 granules, then multiplies by
+    the true granule count (CMR-Hits, the same count ``check_availability``
+    reports) to produce ``total_size_mb`` for the *whole* AOI+time window — not
+    just the sum of the sampled subset, which stays constant regardless of AOI
+    size since granule files are global and subsetting happens downstream.
+    Granules that report no size (UMM-G may omit it) are excluded from the
+    average; ``warning`` is set when no granules match or none report a size,
+    so a caller never mistakes a metadata gap for "0 MB to download".
     """
     cmr = cmr or CMRProvider()
     store = store or _default_store()
@@ -144,6 +161,10 @@ async def estimate_retrieval_size(
     concept_id, bbox_str = await _resolve_handles(
         dataset_handle, aoi_handle, workspace_id, store
     )
+    availability = await cmr.check_availability(
+        concept_id, bounding_box=bbox_str, temporal=time_range
+    )
+    total_granules = availability["granule_count"]
     granules = await cmr.search_granules(
         concept_id,
         bounding_box=bbox_str,
@@ -152,8 +173,8 @@ async def estimate_retrieval_size(
     )
 
     sized = [g for g in granules if g.get("size_mb", 0.0) > 0.0]
-    total_size_mb = sum(g["size_mb"] for g in sized)
-    avg_size_mb = total_size_mb / len(sized) if sized else 0.0
+    avg_size_mb = sum(g["size_mb"] for g in sized) / len(sized) if sized else 0.0
+    total_size_mb = avg_size_mb * total_granules
 
     warning: str | None = None
     if not granules:
@@ -168,9 +189,10 @@ async def estimate_retrieval_size(
         "dataset_handle": dataset_handle,
         "aoi_handle": aoi_handle,
         "time_range": time_range,
+        "total_granules": total_granules,
         "sampled_granules": len(granules),
-        "total_size_mb": round(total_size_mb, 3),
         "avg_size_mb": round(avg_size_mb, 3),
+        "total_size_mb": round(total_size_mb, 3),
         "warning": warning,
     }
 

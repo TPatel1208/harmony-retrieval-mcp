@@ -34,6 +34,7 @@ from earthdata_mcp.storage import StorageBackend, get_storage_backend
 from earthdata_mcp.tools._dataio import (
     PARQUET_MEDIA_TYPE,
     ZARR_MEDIA_TYPE,
+    normalize_output_format,
     open_result,
     serialize_result,
 )
@@ -162,13 +163,16 @@ async def resample(
         result = _maybe_decode_float_time(result)
         result = result.resample(time=time_freq).mean()
     if spatial_factor:
-        dims = {
-            name: spatial_factor
-            for name in (_lon_name(result), _lat_name(result))
-            if name is not None
-        }
-        if dims:
-            result = result.coarsen(boundary="trim", **dims).mean()
+        lon, lat = _lon_name(result), _lat_name(result)
+        if lon is None and lat is None:
+            raise ValueError(
+                "resample: no lon/lat spatial dimension found on the source dataset "
+                f"(looked for {_LON_NAMES + _LAT_NAMES}, case-insensitive, among "
+                f"{sorted(set(result.dims) | set(result.coords))}); "
+                "cannot apply the requested spatial_factor"
+            )
+        dims = {name: spatial_factor for name in (lon, lat) if name is not None}
+        result = result.coarsen(boundary="trim", **dims).mean()
 
     spec = {
         "operation": "resample",
@@ -193,15 +197,18 @@ async def convert_format(
     """Re-serialize a materialized result to a different media type → a ``cube_``.
 
     Unlike the other transforms, the output format is the caller's explicit choice
-    (not format-by-shape); it still travels the one storage route.
+    (not format-by-shape); it still travels the one storage route. ``output_format``
+    accepts bare names (``"csv"``, ``"netcdf"``, ``"parquet"``, ``"zarr"``) or their
+    media-type spellings, case-insensitive — see ``_dataio.normalize_output_format``.
     """
     store, provenance, storage = _resolve_deps(store, provenance, storage)
     obj, _payload = await _load_source(source_handle, workspace_id, store, storage)
+    canonical_format = normalize_output_format(output_format)
 
     spec = {
         "operation": "convert_format",
         "source_handle": source_handle,
-        "output_format": output_format,
+        "output_format": canonical_format,
     }
     return await _emit_cube(
         obj,
@@ -211,7 +218,7 @@ async def convert_format(
         store,
         provenance,
         storage,
-        output_format=output_format,
+        output_format=canonical_format,
     )
 
 
@@ -247,6 +254,7 @@ async def align(
         if not isinstance(obj, xr.Dataset):
             raise ValueError("align requires gridded (Zarr) sources")
         obj = _cast_int_vars_to_float(obj)
+        obj = _maybe_decode_float_time(obj)
         if snap_time_freq is not None:
             obj = _snap_time(obj, snap_time_freq)
         datasets.append(obj)
@@ -433,9 +441,20 @@ def _apply_subset(
 
 
 def _bbox_sel(ds: xr.Dataset, bbox: tuple[float, float, float, float]) -> xr.Dataset:
-    """Select a W,S,E,N box, honoring a descending latitude axis."""
+    """Select a W,S,E,N box, honoring a descending latitude axis.
+
+    Raises if neither a lon nor lat axis can be found: a caller who explicitly
+    requested an AOI never gets a silent no-op — see CLAUDE.md's "no analysis
+    tools" spirit applied to transforms, every one must record a real effect.
+    """
     west, south, east, north = bbox
     lon, lat = _lon_name(ds), _lat_name(ds)
+    if lon is None and lat is None:
+        raise ValueError(
+            "subset: no lon/lat spatial dimension found on the source dataset "
+            f"(looked for {_LON_NAMES + _LAT_NAMES}, case-insensitive, among "
+            f"{sorted(set(ds.dims) | set(ds.coords))}); cannot apply the requested AOI"
+        )
     if lon is not None:
         ds = ds.sel({lon: slice(west, east)})
     if lat is not None:
@@ -448,21 +467,26 @@ def _bbox_sel(ds: xr.Dataset, bbox: tuple[float, float, float, float]) -> xr.Dat
 
 
 def _lon_name(ds: xr.Dataset) -> str | None:
-    return next((n for n in _LON_NAMES if n in ds.coords or n in ds.dims), None)
+    names = {n.lower(): n for n in ds.coords} | {n.lower(): n for n in ds.dims}
+    return next((names[n] for n in _LON_NAMES if n in names), None)
 
 
 def _lat_name(ds: xr.Dataset) -> str | None:
-    return next((n for n in _LAT_NAMES if n in ds.coords or n in ds.dims), None)
+    names = {n.lower(): n for n in ds.coords} | {n.lower(): n for n in ds.dims}
+    return next((names[n] for n in _LAT_NAMES if n in names), None)
 
 
 def _maybe_decode_float_time(ds: xr.Dataset) -> xr.Dataset:
-    """Decode a float64 time coordinate to datetime64 before temporal resample.
+    """Decode a float/int CF-encoded time coordinate to datetime64.
 
     Data opened with ``decode_times=False`` (all netCDF paths in _dataio) keeps
-    ``time`` as raw float64 seconds.  pandas/xarray resample requires a
-    DatetimeIndex; if the coordinate carries a CF ``units`` attr, decode it here.
-    No-op when time is already datetime64 or when ``units`` is absent (resample
-    will raise its own TypeError with a clear message in that case).
+    ``time`` as raw numeric CF units (e.g. "minutes since 2020-09-15"). Both
+    ``resample`` (pandas needs a DatetimeIndex) and ``align`` (two datasets on
+    different CF epochs/units are otherwise not comparable, even when their raw
+    encodings happen to share a dtype) need real datetime64 values to work with.
+    Decode here if the coordinate carries a CF ``units`` attr. No-op when time
+    is already datetime64, absent, or ``units`` is missing (the caller raises
+    its own clear error in that case).
     """
     if "time" not in ds.coords or np.issubdtype(ds["time"].dtype, np.datetime64):
         return ds

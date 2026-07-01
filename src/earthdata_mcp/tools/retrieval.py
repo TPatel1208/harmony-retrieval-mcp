@@ -30,7 +30,7 @@ from uuid import uuid4
 from earthdata_mcp.config import get_settings
 from earthdata_mcp.db import create_engine, create_session_factory
 from earthdata_mcp.jobs import crud
-from earthdata_mcp.jobs.state import JobState
+from earthdata_mcp.jobs.state import TERMINAL_STATES, JobState
 from earthdata_mcp.providers._capabilities import CollectionCapabilities
 from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, TransformSpec
@@ -268,11 +268,13 @@ async def cancel_retrieval(
     store: WorkspaceStore | None = None,
     session_factory=None,
 ) -> dict:
-    """Cancel a non-terminal job. Legal only from pending/submitted/running.
+    """Cancel a non-terminal job; a no-op on one that is already terminal.
 
-    Cancelling an already-terminal job (ready/failed/expired/cancelled) raises
-    :class:`~earthdata_mcp.jobs.state.IllegalTransition` — the state machine is
-    the authority, not this tool.
+    A job's state can change between when a caller decides to cancel and when
+    the call lands (e.g. it finishes or fails first), so cancelling an
+    already-terminal job (ready/failed/expired/cancelled) returns that state
+    as-is rather than raising — the caller's intent ("stop this job") is
+    already satisfied, and this is not an illegal request.
     """
     store = store or _default_store()
     session_factory = session_factory or _default_session_factory()
@@ -285,6 +287,8 @@ async def cancel_retrieval(
         job = await crud.get_job_by_handle(session, job_handle)
         if job is None:
             raise crud.JobNotFoundError(job_handle)
+        if JobState(job.state) in TERMINAL_STATES:
+            return {"job_handle": job_handle, "status": job.state}
         crud.set_state(job, JobState.CANCELLED)
         await session.commit()
 
