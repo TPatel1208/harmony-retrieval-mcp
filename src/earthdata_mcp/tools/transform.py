@@ -40,7 +40,8 @@ from earthdata_mcp.tools._dataio import (
 )
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.tools.retrieval import _default_provenance
-from earthdata_mcp.workspace.models import HandleType, handle_type_of
+from earthdata_mcp.workspace.handles import resolve_aoi, resolve_materialized
+from earthdata_mcp.workspace.models import HandleType
 from earthdata_mcp.workspace.provenance import ProvenanceStore
 from earthdata_mcp.workspace.store import WorkspaceStore
 
@@ -305,20 +306,8 @@ async def _load_source(
     store: WorkspaceStore,
     storage: StorageBackend,
 ) -> tuple[xr.Dataset | pa.Table, dict]:
-    """Resolve a materialized ``obs_``/``cube_`` handle and open its data blob.
-
-    Type-checks the prefix, resolves within the workspace (cross-workspace access
-    raises), and requires the handle to be a ``ready`` result with a ``storage_key``.
-    """
-    htype = handle_type_of(handle)
-    if htype not in (HandleType.OBS, HandleType.CUBE):
-        raise ValueError(f"expected an obs_ or cube_ handle, got {handle!r}")
-    record = await store.get_handle(workspace_id, handle)  # isolation gate
-    payload = record.payload
-    storage_key = payload.get("storage_key")
-    media_type = payload.get("media_type")
-    if payload.get("status") != "ready" or not storage_key or not media_type:
-        raise ValueError(f"source handle {handle!r} is not a materialized result")
+    """Resolve a materialized ``obs_``/``cube_`` handle and open its data blob."""
+    storage_key, media_type, payload = await resolve_materialized(store, workspace_id, handle)
     data = await storage.get(storage_key)
     return open_result(data, media_type), payload
 
@@ -408,13 +397,7 @@ async def _aoi_bbox(
     """Resolve an optional ``aoi_`` handle to a bbox (W,S,E,N)."""
     if aoi_handle is None:
         return None
-    if handle_type_of(aoi_handle) is not HandleType.AOI:
-        raise ValueError(f"expected an aoi_ handle, got {aoi_handle!r}")
-    record = await store.get_handle(workspace_id, aoi_handle)
-    bbox = record.payload.get("bbox")
-    if not bbox or len(bbox) != 4:
-        raise ValueError(f"aoi handle {aoi_handle!r} payload missing 'bbox'")
-    return tuple(float(c) for c in bbox)
+    return await resolve_aoi(store, workspace_id, aoi_handle)
 
 
 def _apply_subset(

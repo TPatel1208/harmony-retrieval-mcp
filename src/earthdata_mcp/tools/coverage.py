@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
-from earthdata_mcp.workspace.models import HandleType, handle_type_of
+from earthdata_mcp.workspace.handles import resolve_aoi, resolve_dataset
 from earthdata_mcp.workspace.store import WorkspaceStore
 
 #: Granules sampled to estimate total retrieval size. CMR caps the per-request
@@ -208,33 +208,11 @@ async def _resolve_handles(
 ) -> tuple[str, str]:
     """Resolve a ``dataset_`` + ``aoi_`` pair → ``(concept_id, bbox_str)``.
 
-    Type-checks both handle prefixes up front (a wrong-typed handle is a
-    ``ValueError`` before any DB hit), then resolves each within ``workspace_id``
-    — ``store.get_handle`` raises ``CrossWorkspaceError``/``HandleNotFoundError``,
-    which propagate. The bbox string is rebuilt from the AOI payload in the
-    ``"W,S,E,N"`` order CMR's ``bounding_box`` param expects.
+    A thin composition of the two typed resolvers; the CMR ``"W,S,E,N"``
+    bounding-box string is rebuilt here from the bbox tuple ``resolve_aoi``
+    returns, since that formatting is specific to this caller.
     """
-    if handle_type_of(dataset_handle) is not HandleType.DATASET:
-        raise ValueError(
-            f"expected a dataset_ handle, got {dataset_handle!r}"
-        )
-    if handle_type_of(aoi_handle) is not HandleType.AOI:
-        raise ValueError(f"expected an aoi_ handle, got {aoi_handle!r}")
-
-    dataset_record = await store.get_handle(workspace_id, dataset_handle)
-    aoi_record = await store.get_handle(workspace_id, aoi_handle)
-
-    concept_id = dataset_record.payload.get("concept_id")
-    if not concept_id:
-        raise ValueError(
-            f"dataset handle {dataset_handle!r} payload missing 'concept_id'"
-        )
-
-    bbox = aoi_record.payload.get("bbox")
-    if not bbox or len(bbox) != 4:
-        raise ValueError(
-            f"aoi handle {aoi_handle!r} payload missing or malformed 'bbox'"
-        )
+    concept_id = await resolve_dataset(store, workspace_id, dataset_handle)
+    bbox = await resolve_aoi(store, workspace_id, aoi_handle)
     bbox_str = ",".join(str(c) for c in bbox)
-
     return concept_id, bbox_str

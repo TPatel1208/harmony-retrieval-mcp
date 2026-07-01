@@ -34,6 +34,7 @@ from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.storage import StorageBackend, get_storage_backend
 from earthdata_mcp.tools._dataio import open_result, open_result_lazy
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
+from earthdata_mcp.workspace.handles import resolve_aoi, resolve_materialized
 from earthdata_mcp.workspace.models import HandleType, handle_type_of
 from earthdata_mcp.workspace.store import WorkspaceStore
 
@@ -207,13 +208,7 @@ async def _aoi_bbox(
     """Resolve an optional ``aoi_`` handle to a bbox (W,S,E,N)."""
     if aoi_handle is None:
         return None
-    if handle_type_of(aoi_handle) is not HandleType.AOI:
-        raise ValueError(f"expected an aoi_ handle, got {aoi_handle!r}")
-    record = await store.get_handle(workspace_id, aoi_handle)
-    bbox = record.payload.get("bbox")
-    if not bbox or len(bbox) != 4:
-        raise ValueError(f"aoi handle {aoi_handle!r} payload missing 'bbox'")
-    return tuple(float(c) for c in bbox)
+    return await resolve_aoi(store, workspace_id, aoi_handle)
 
 
 def _preview_bbox(
@@ -282,9 +277,9 @@ async def summarize_dataset(
     """
     store = store or _default_store()
     htype = handle_type_of(handle)
-    record = await store.get_handle(workspace_id, handle)  # isolation gate
 
     if htype is HandleType.DATASET:
+        record = await store.get_handle(workspace_id, handle)  # isolation gate
         collection = record.payload.get("collection", {})
         return {
             "handle": handle,
@@ -302,21 +297,26 @@ async def summarize_dataset(
         }
 
     if htype in (HandleType.OBS, HandleType.CUBE):
-        payload = record.payload
-        if payload.get("status") != "ready" or not payload.get("storage_key"):
+        try:
+            storage_key, media_type, _payload = await resolve_materialized(
+                store, workspace_id, handle
+            )
+        except ValueError:
+            # Not yet materialized — isolation must still be enforced here too.
+            record = await store.get_handle(workspace_id, handle)  # isolation gate
             return {
                 "handle": handle,
                 "kind": htype.value,
-                "status": payload.get("status"),
+                "status": record.payload.get("status"),
                 "summary": None,
             }
         storage = storage or _default_storage()
-        data = await storage.get(payload["storage_key"])
-        obj = open_result(data, payload["media_type"])
+        data = await storage.get(storage_key)
+        obj = open_result(data, media_type)
         return {
             "handle": handle,
             "kind": htype.value,
-            "media_type": payload["media_type"],
+            "media_type": media_type,
             "summary": _summarize_obj(obj),
         }
 
@@ -360,21 +360,10 @@ async def inspect_statistics(
     is inspection, not analysis: no correlation, trend, anomaly, or hotspot — those
     are out of scope by PLAN.md rule.
     """
-    htype = handle_type_of(handle)
-    if htype not in (HandleType.OBS, HandleType.CUBE):
-        raise ValueError(
-            f"inspect_statistics expects an obs_ or cube_ handle, got {handle!r}"
-        )
     store = store or _default_store()
     storage = storage or _default_storage()
 
-    record = await store.get_handle(workspace_id, handle)  # isolation gate
-    payload = record.payload
-    if payload.get("status") != "ready" or not payload.get("storage_key"):
-        raise ValueError(f"handle {handle!r} is not a materialized result")
-
-    storage_key = payload["storage_key"]
-    media_type = payload["media_type"]
+    storage_key, media_type, _payload = await resolve_materialized(store, workspace_id, handle)
 
     local_path = storage.path(storage_key)
     if local_path is not None:

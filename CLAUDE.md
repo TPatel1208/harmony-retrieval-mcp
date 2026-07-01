@@ -1,10 +1,5 @@
 # Earthdata MCP Server — project rules
 
-## Spec
-This file is the source of truth for project rules. Routing canon lives in the
-hard rules below and in `src/earthdata_mcp/providers/router.py`. (PLAN.md, the old
-phased spec, has been removed; ignore any lingering `PLAN.md §…` citations in
-docstrings — they are stale references, not authority.)
 
 ## Hard rules (never violate)
 - Use the official harmony-py client; do NOT hand-roll a Harmony client.
