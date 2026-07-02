@@ -114,6 +114,80 @@ class _MaterializingProvider:
         )
 
 
+class _FailingPollProvider:
+    """Fails every poll — a mid-flight Harmony poll error."""
+
+    async def poll(self, job: JobRef):
+        raise RuntimeError("harmony poll: job not found")
+
+
+class _FailingMaterializeProvider:
+    """Fails every materialize — a download/materialization error."""
+
+    async def materialize(self, job: JobRef) -> MaterializedResult:
+        raise RuntimeError("materialize: storage backend unreachable")
+
+
+async def _seed_submitted_job(
+    session_factory, workspace_id: str, *, provider: str = "harmony"
+) -> tuple[str, str]:
+    """Insert a SUBMITTED job with a durable spec, ready for ``poll_job``."""
+    job_id = uuid4().hex
+    obs_handle = f"obs_{uuid4().hex[:16]}"
+    request_spec = {
+        "concept_id": "C1-X",
+        "provider": provider,
+        "workspace_id": workspace_id,
+        "obs_handle": obs_handle,
+        "job_handle": f"job_{uuid4().hex[:16]}",
+    }
+    async with session_factory() as session:
+        session.add(
+            Job(
+                job_id=job_id,
+                job_handle=request_spec["job_handle"],
+                obs_handle=obs_handle,
+                provider=provider,
+                request_spec=request_spec,
+                state=JobState.SUBMITTED.value,
+                progress=0,
+                provider_job_url="https://example/jobs/j1",
+            )
+        )
+        await session.commit()
+    return job_id, obs_handle
+
+
+async def _seed_materializing_job(
+    session_factory, workspace_id: str, *, provider: str = "harmony"
+) -> tuple[str, str]:
+    """Insert a MATERIALIZING job with a durable spec, ready for ``materialize_job``."""
+    job_id = uuid4().hex
+    obs_handle = f"obs_{uuid4().hex[:16]}"
+    request_spec = {
+        "concept_id": "C1-X",
+        "provider": provider,
+        "workspace_id": workspace_id,
+        "obs_handle": obs_handle,
+        "job_handle": f"job_{uuid4().hex[:16]}",
+    }
+    async with session_factory() as session:
+        session.add(
+            Job(
+                job_id=job_id,
+                job_handle=request_spec["job_handle"],
+                obs_handle=obs_handle,
+                provider=provider,
+                request_spec=request_spec,
+                state=JobState.MATERIALIZING.value,
+                progress=50,
+                provider_job_url="https://example/jobs/j1",
+            )
+        )
+        await session.commit()
+    return job_id, obs_handle
+
+
 # -- SUBMITTED on direct-Harmony success ------------------------------------
 
 
@@ -198,6 +272,17 @@ async def test_submit_job_records_opendap_not_applicable_when_no_urls(
     assert "unsupported" in detail["harmony_error"]["message"]
     assert detail["reason"] == "no_opendap_endpoint_discovered"
 
+    # OPENDAP_NOT_APPLICABLE explains the fallback decision; JOB_FAILED records
+    # the terminal outcome — both are recorded on this branch (WS3).
+    failed = [e for e in events if e.event_type == "job-failed"]
+    assert len(failed) == 1
+    assert failed[0].detail == {
+        "stage": "submit",
+        "provider": "harmony",
+        "error_type": "RuntimeError",
+        "message": "variable subsetting on C1-X is unsupported",
+    }
+
     async with session_factory() as session:
         job = await crud.get_job(session, job_id)
     assert job.state == JobState.FAILED.value
@@ -205,7 +290,7 @@ async def test_submit_job_records_opendap_not_applicable_when_no_urls(
     assert "unsupported" in job.error
 
 
-async def test_submit_job_non_harmony_failure_records_no_new_events(
+async def test_submit_job_non_harmony_failure_records_job_failed_event(
     session_factory, provenance_store, workspace_id, monkeypatch
 ) -> None:
     job_id, obs_handle = await _seed_pending_job(
@@ -224,11 +309,19 @@ async def test_submit_job_non_harmony_failure_records_no_new_events(
     events = await provenance_store.events(workspace_id, obs_handle)
     assert [e for e in events if e.event_type == "opendap-not-applicable"] == []
     assert [e for e in events if e.event_type == "provider-fallback"] == []
+    failed = [e for e in events if e.event_type == "job-failed"]
+    assert len(failed) == 1
+    assert failed[0].detail == {
+        "stage": "submit",
+        "provider": "opendap",
+        "error_type": "RuntimeError",
+        "message": "variable subsetting on C1-X is unsupported",
+    }
 
     async with session_factory() as session:
         job = await crud.get_job(session, job_id)
     assert job.state == JobState.FAILED.value
-    assert job.error == "variable subsetting on C1-X is unsupported"
+    assert job.error == "submit/opendap failed: variable subsetting on C1-X is unsupported"
 
 
 async def test_submit_job_error_message_is_not_a_raw_args_tuple(
@@ -306,3 +399,70 @@ async def test_materialize_job_records_materialized_with_detail_fields(
     assert detail["storage_key"] == "harmony/result/g1.nc"
     assert detail["media_type"] == "application/netcdf4"
     assert detail["size_bytes"] == 1234
+
+
+# -- JOB_FAILED on poll/materialize stage failures (WS3 failure envelope) ---
+
+
+async def test_poll_job_failure_records_job_failed_with_stage_and_provider(
+    session_factory, provenance_store, workspace_id, monkeypatch
+) -> None:
+    job_id, obs_handle = await _seed_submitted_job(
+        session_factory, workspace_id, provider="harmony"
+    )
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_FailingPollProvider())
+    )
+    ctx = _ctx(session_factory)
+
+    try:
+        await worker_mod.poll_job(ctx, job_id)
+    except RuntimeError:
+        pass
+
+    events = await provenance_store.events(workspace_id, obs_handle)
+    failed = [e for e in events if e.event_type == "job-failed"]
+    assert len(failed) == 1
+    assert failed[0].detail == {
+        "stage": "poll",
+        "provider": "harmony",
+        "error_type": "RuntimeError",
+        "message": "harmony poll: job not found",
+    }
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.FAILED.value
+    assert job.error == "poll/harmony failed: harmony poll: job not found"
+
+
+async def test_materialize_job_failure_records_job_failed_with_stage_and_provider(
+    session_factory, provenance_store, workspace_id, monkeypatch
+) -> None:
+    job_id, obs_handle = await _seed_materializing_job(
+        session_factory, workspace_id, provider="opendap"
+    )
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_FailingMaterializeProvider())
+    )
+    ctx = _ctx(session_factory)
+
+    try:
+        await worker_mod.materialize_job(ctx, job_id)
+    except RuntimeError:
+        pass
+
+    events = await provenance_store.events(workspace_id, obs_handle)
+    failed = [e for e in events if e.event_type == "job-failed"]
+    assert len(failed) == 1
+    assert failed[0].detail == {
+        "stage": "materialize",
+        "provider": "opendap",
+        "error_type": "RuntimeError",
+        "message": "materialize: storage backend unreachable",
+    }
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.FAILED.value
+    assert job.error == "materialize/opendap failed: materialize: storage backend unreachable"

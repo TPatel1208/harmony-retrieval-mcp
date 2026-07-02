@@ -30,3 +30,18 @@ the single spec → `RetrievalProvider` mapping (Harmony / OPeNDAP / AppEEARS),
 consumed by the worker's `submit_job` / `poll_job` / `materialize_job` and by
 `startup` resume. An unknown `spec.provider` raises rather than silently
 falling back to Harmony.
+
+## Failure legibility convention
+
+Explanation facts are persisted at plan time; failure time only formats them.
+A terminal failure must never re-derive anything with a fresh CMR/Harmony call
+— everything it needs to explain itself (stage, provider, the caught
+exception) is already on the durable `RequestSpec` or in hand at the point of
+failure. `jobs/worker.py`'s `_fail_job` is the one choke point all three
+lifecycle tasks (`submit_job`/`poll_job`/`materialize_job`) route through on
+their way to `FAILED`: it builds the stage- and provider-prefixed stored error
+string and records a `JOB_FAILED` provenance event with structured detail
+(`stage`, `provider`, `error_type`, `message`). Branch-specific explanations —
+like `OPENDAP_NOT_APPLICABLE`'s no-fallback-available event and its verbatim
+error prefix — are recorded *in addition to* `JOB_FAILED`, not instead of it:
+they explain a decision, `JOB_FAILED` records the terminal outcome.

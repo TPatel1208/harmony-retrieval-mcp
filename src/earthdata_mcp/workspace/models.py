@@ -60,6 +60,7 @@ class ProvenanceEventType(StrEnum):
     SUBMITTED = "submitted"
     PROVIDER_FALLBACK = "provider-fallback"
     OPENDAP_NOT_APPLICABLE = "opendap-not-applicable"
+    JOB_FAILED = "job-failed"
     MATERIALIZED = "materialized"
     EXPIRED = "expired"
     RE_MATERIALIZED = "re-materialized"
@@ -115,8 +116,8 @@ class ProvenanceEdge(Base):
 
 class ProvenanceEvent(Base):
     """A first-class lineage event (``created``/``submitted``/``provider-fallback``/
-    ``opendap-not-applicable``/``materialized``/``expired``/``re-materialized``)
-    attached to a handle."""
+    ``opendap-not-applicable``/``job-failed``/``materialized``/``expired``/
+    ``re-materialized``) attached to a handle."""
 
     __tablename__ = "provenance_events"
 
