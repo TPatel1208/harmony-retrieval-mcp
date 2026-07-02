@@ -39,7 +39,7 @@ from earthdata_mcp.providers.request_spec import RequestSpec
 from earthdata_mcp.providers.router import Router
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.handles import resolve_aoi, resolve_dataset
-from earthdata_mcp.workspace.models import HandleType, handle_type_of
+from earthdata_mcp.workspace.models import HandleType, ProvenanceEventType, handle_type_of
 from earthdata_mcp.workspace.provenance import ProvenanceStore
 from earthdata_mcp.workspace.store import WorkspaceStore
 
@@ -415,6 +415,13 @@ async def _submit_retrieval(
     # Mint the two handles, then persist the durable spec that ties them together.
     obs_handle = await store.put_handle(
         workspace_id, HandleType.OBS, payload={"status": "pending"}
+    )
+    # Durable, re-materializable record of *why* this path was chosen — computed
+    # by `route` from data already in hand, never re-derived here (CLAUDE.md: the
+    # union-trap booleans are never trusted; provenance never stores an ephemeral
+    # staged-output URL, and this trace carries none).
+    await provenance.record_event(
+        workspace_id, obs_handle, ProvenanceEventType.ROUTED, detail=decision.trace
     )
     job_handle = await store.put_handle(
         workspace_id,

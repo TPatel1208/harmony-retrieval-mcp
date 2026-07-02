@@ -61,6 +61,22 @@ def test_bbox_plus_png_with_harmony_wired_routes_to_harmony_unpinned(l2_caps) ->
     harmony.submit.assert_not_called()  # route decides, does not submit
 
 
+def test_bbox_plus_png_unpinned_trace_names_first_unmet_need_per_service(l2_caps) -> None:
+    # The trace is the legible "why": neither service is disqualified by a missing
+    # registration, each fails the plan at a different, named point — the subsetter
+    # does bbox but not png; the imagenator does png but not bbox. This is the
+    # union-trap shape, so the reason category says so, never the rolled-up booleans.
+    router = Router(l2_caps, harmony=MagicMock())
+    plan = RetrievalPlan(output_format="image/png", needs_bbox=True)
+    decision = router.route(plan)
+    assert decision.trace["path"] == "harmony"
+    assert decision.trace["pinned_service"] is None
+    assert decision.trace["reason"] == "no_single_service_satisfies"
+    by_name = {s["service_name"]: s["first_unmet_need"] for s in decision.trace["services"]}
+    assert by_name[SUBSETTER] == "output_format"
+    assert by_name[IMAGENATOR] == "bbox"
+
+
 def test_bbox_plus_png_without_harmony_is_not_retrievable(l2_caps) -> None:
     # Without Harmony wired, no path can satisfy bbox+png — fails at planning time.
     # ``available`` reports BOTH services' real, disjoint capabilities so the agent
@@ -89,6 +105,17 @@ def test_bbox_plus_netcdf_routes_to_subsetter(l2_caps) -> None:
     assert decision.service.service_name == SUBSETTER
     assert decision.provider is harmony
     harmony.submit.assert_not_called()  # route decides, it does not submit
+
+
+def test_bbox_plus_netcdf_pinned_trace_names_service_and_satisfied_needs(l2_caps) -> None:
+    router = Router(l2_caps, harmony=MagicMock())
+    plan = RetrievalPlan(output_format="application/netcdf", needs_bbox=True)
+
+    decision = router.route(plan)
+    assert decision.trace["path"] == "harmony"
+    assert decision.trace["pinned_service"] == SUBSETTER
+    assert decision.trace["pinned_concept_id"] == decision.service.concept_id
+    assert decision.trace["satisfied_needs"] == ["bbox", "output_format"]
 
 
 def test_variable_plus_png_routes_to_imagenator(l2_caps) -> None:
@@ -130,6 +157,10 @@ def test_l3_data_as_is_routes_to_direct_when_s3_connected(l3_caps, monkeypatch) 
     assert decision.path == "direct"
     assert decision.service is None
     harmony.submit.assert_not_called()
+    # The trace records the gate facts that fired the shortcut (in-region + enabled).
+    assert decision.trace["path"] == "direct"
+    assert decision.trace["region"] == region
+    assert decision.trace["s3_direct_enabled"] is True
 
 
 def test_l3_with_a_transform_need_routes_to_harmony_when_wired(l3_caps) -> None:
@@ -142,6 +173,17 @@ def test_l3_with_a_transform_need_routes_to_harmony_when_wired(l3_caps) -> None:
     assert decision.path == "harmony"
     assert decision.service is None  # no pinned service — server picks
     assert decision.provider is harmony
+
+
+def test_l3_no_registered_services_unpinned_trace_reason(l3_caps) -> None:
+    # L3 has zero CMR-registered services — distinct reason category from the
+    # union-trap case (a real, disjoint-but-nonempty service list).
+    router = Router(l3_caps, harmony=MagicMock())
+    plan = RetrievalPlan(output_format="application/netcdf", needs_bbox=True)
+    decision = router.route(plan)
+    assert decision.trace["pinned_service"] is None
+    assert decision.trace["reason"] == "no_registered_services"
+    assert decision.trace["services"] == []
 
 
 def test_l3_with_a_transform_need_is_not_retrievable_without_harmony(l3_caps) -> None:
@@ -200,6 +242,9 @@ def test_point_sample_routes_to_appeears_before_harmony(l2_caps) -> None:
     assert decision.path == "appeears"
     assert decision.provider is appeears
     harmony.submit.assert_not_called()
+    assert decision.trace["path"] == "appeears"
+    assert decision.trace["reason"] == "point_sample_intent"
+    assert decision.trace["needs_point_sample"] is True
 
 
 def test_non_point_plan_does_not_hijack_to_appeears(l2_caps) -> None:

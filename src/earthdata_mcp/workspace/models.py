@@ -57,6 +57,7 @@ class ProvenanceEventType(StrEnum):
     """First-class provenance events (PLAN.md §4.5)."""
 
     CREATED = "created"
+    ROUTED = "routed"
     SUBMITTED = "submitted"
     PROVIDER_FALLBACK = "provider-fallback"
     OPENDAP_NOT_APPLICABLE = "opendap-not-applicable"
