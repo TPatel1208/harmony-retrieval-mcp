@@ -80,6 +80,44 @@ def _provenance(ctx: dict[str, Any]) -> ProvenanceStore:
     return store
 
 
+async def _fail_job(
+    ctx: dict[str, Any],
+    job_id: str,
+    spec: RequestSpec,
+    stage: str,
+    exc: BaseException,
+    *,
+    error_prefix: str | None = None,
+) -> None:
+    """The one choke point every lifecycle task's exception handler routes
+    through on its way to ``FAILED``: records a ``JOB_FAILED`` provenance event
+    and persists the stage- and provider-prefixed error string.
+
+    Built only from ``spec``, ``stage``, and the caught ``exc`` — never a fresh
+    CMR/Harmony call — per the failure-legibility convention in CONTEXT.md.
+    ``error_prefix`` overrides the default ``"<stage>/<provider> failed"``
+    prefix for a branch (like the no-OPeNDAP-fallback case) that already has its
+    own explanatory prefix to preserve verbatim.
+    """
+    message = _exc_message(exc)
+    prefix = error_prefix if error_prefix is not None else f"{stage}/{spec.provider} failed"
+    await _provenance(ctx).record_event(
+        spec.workspace_id,
+        spec.obs_handle,
+        ProvenanceEventType.JOB_FAILED,
+        detail={
+            "stage": stage,
+            "provider": spec.provider,
+            "error_type": type(exc).__name__,
+            "message": message,
+        },
+    )
+    async with _session_factory(ctx)() as session:
+        await crud.transition_state(
+            session, job_id, JobState.FAILED, error=f"{prefix}: {message}"
+        )
+
+
 def _exc_message(exc: BaseException) -> str:
     """A clean, human-readable message for an exception — never a raw args tuple.
 
@@ -165,16 +203,19 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
                     "had_bbox": spec.aoi_bbox is not None,
                 },
             )
-            error_message = (
-                f"Harmony failed and no OPeNDAP fallback is available for this "
-                f"collection: {_exc_message(exc)}"
+            await _fail_job(
+                ctx,
+                job_id,
+                spec,
+                "submit",
+                exc,
+                error_prefix=(
+                    "Harmony failed and no OPeNDAP fallback is available for "
+                    "this collection"
+                ),
             )
         else:
-            error_message = _exc_message(exc)
-        async with session_factory() as session:
-            await crud.transition_state(
-                session, job_id, JobState.FAILED, error=error_message
-            )
+            await _fail_job(ctx, job_id, spec, "submit", exc)
         raise
 
     async with session_factory() as session:
@@ -215,10 +256,7 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
     try:
         status = await provider.poll(ref)
     except Exception as exc:
-        async with session_factory() as session:
-            await crud.transition_state(
-                session, job_id, JobState.FAILED, error=_exc_message(exc)
-            )
+        await _fail_job(ctx, job_id, spec, "poll", exc)
         raise
 
     async with session_factory() as session:
@@ -256,10 +294,7 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
     except BaseException as exc:
         # BaseException catches CancelledError (raised when Arq's job_timeout fires
         # inside asyncio.to_thread) which Exception alone does not.
-        async with session_factory() as session:
-            await crud.transition_state(
-                session, job_id, JobState.FAILED, error=_exc_message(exc)
-            )
+        await _fail_job(ctx, job_id, spec, "materialize", exc)
         raise
 
     # Resolve the pending obs_ handle to the durable storage key (not a URL).
