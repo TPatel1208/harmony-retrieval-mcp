@@ -64,6 +64,7 @@ def build(spec: RequestSpec, caps: CollectionCapabilities) -> RetrievalProvider:
             opendap_urls=list(spec.opendap_urls),
             coord_lat=spec.coord_lat or "lat",
             coord_lon=spec.coord_lon or "lon",
+            coord_time=spec.coord_time,
             lat_axis=spec.lat_axis,
             lon_axis=spec.lon_axis,
             var_dims=spec.var_dims,

@@ -55,6 +55,7 @@ class RequestSpec:
     opendap_urls: tuple[str, ...]
     coord_lat: str | None
     coord_lon: str | None
+    coord_time: str | None
     lat_axis: AxisGeometry | None
     lon_axis: AxisGeometry | None
     var_dims: dict[str, VarDimPlan]
@@ -80,6 +81,7 @@ class RequestSpec:
         opendap_urls: list[str] | tuple[str, ...] = (),
         coord_lat: str | None = None,
         coord_lon: str | None = None,
+        coord_time: str | None = None,
         lat_axis: AxisGeometry | None = None,
         lon_axis: AxisGeometry | None = None,
         var_dims: dict[str, VarDimPlan] | None = None,
@@ -120,6 +122,7 @@ class RequestSpec:
             opendap_urls=tuple(opendap_urls or ()),
             coord_lat=coord_lat,
             coord_lon=coord_lon,
+            coord_time=coord_time,
             lat_axis=lat_axis,
             lon_axis=lon_axis,
             var_dims=dict(var_dims or {}),
@@ -151,6 +154,7 @@ class RequestSpec:
             "opendap_url": self.opendap_urls[0] if self.opendap_urls else None,
             "coord_lat": self.coord_lat,
             "coord_lon": self.coord_lon,
+            "coord_time": self.coord_time,
             "lat_axis": _serialize_axis(self.lat_axis),
             "lon_axis": _serialize_axis(self.lon_axis),
             "var_dims": _serialize_var_dims(self.var_dims),
@@ -184,6 +188,7 @@ class RequestSpec:
             opendap_urls=tuple(opendap_urls or ()),
             coord_lat=data.get("coord_lat"),
             coord_lon=data.get("coord_lon"),
+            coord_time=data.get("coord_time"),
             lat_axis=_axis_from_jsonb(data.get("lat_axis")),
             lon_axis=_axis_from_jsonb(data.get("lon_axis")),
             var_dims=_var_dims_from_jsonb(data.get("var_dims")),
