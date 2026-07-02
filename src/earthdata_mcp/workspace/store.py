@@ -17,7 +17,16 @@ from earthdata_mcp.workspace.models import Base, Handle, HandleType, mint_handle
 
 
 class HandleNotFoundError(KeyError):
-    """No handle with this id exists at all."""
+    """No handle with this id exists at all.
+
+    Subclasses ``KeyError`` for callers that pattern-match on it, but
+    ``KeyError.__str__`` renders as ``repr(args[0])`` regardless of subclass —
+    left un-overridden, that bare ``'some_handle'`` is what reaches the MCP
+    client as the tool error, indistinguishable from an unhandled ``KeyError``.
+    """
+
+    def __str__(self) -> str:
+        return f"unknown handle: {self.args[0]!r}"
 
 
 class CrossWorkspaceError(PermissionError):

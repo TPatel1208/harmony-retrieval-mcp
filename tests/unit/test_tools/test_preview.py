@@ -269,6 +269,31 @@ async def test_summarize_materialized_cube(
     assert "ndvi" in out["summary"]["data_vars"]
 
 
+async def test_summarize_materialized_result_with_numpy_attrs_is_json_safe(
+    workspace_store, local_backend, workspace_id
+):
+    """Regression: summarize_dataset threw "Output validation error: outputSchema
+    defined but no structured output returned" on a real obs_ handle — the
+    underlying cause was numpy scalar attrs (np.int32/np.float64, as h5netcdf
+    reads netCDF global attributes) surviving into the returned dict, which
+    FastMCP's output-schema JSON serialization can't handle."""
+    import json
+
+    ds = _grid()
+    ds.attrs["scan_num"] = np.int32(17)
+    ds.attrs["version_id"] = np.int64(4)
+    ds.attrs["lon_min"] = np.float32(-105.0)
+    cube = await _seed_cube(workspace_store, local_backend, workspace_id, ds)
+
+    out = await summarize_dataset(
+        cube, workspace_id=workspace_id, store=workspace_store, storage=local_backend
+    )
+
+    json.dumps(out)  # must not raise TypeError
+    assert out["summary"]["attrs"]["scan_num"] == 17
+    assert isinstance(out["summary"]["attrs"]["scan_num"], int)
+
+
 async def test_summarize_unmaterialized_obs_returns_status(
     workspace_store, workspace_id
 ):
@@ -328,6 +353,47 @@ def test_statistics_fused_matches_eager():
     assert fused["ndvi"]["max"] == pytest.approx(eager["ndvi"]["max"])
     assert fused["ndvi"]["mean"] == pytest.approx(eager["ndvi"]["mean"])
     assert fused["ndvi"]["count"] == eager["ndvi"]["count"]
+
+
+def _grid_with_fill_and_valid_range() -> xr.Dataset:
+    """A grid whose ``ndvi`` carries a fill value and out-of-range values.
+
+    Values are ``[-1e30 (fill), 1, 2, 3, 4, 999 (out of valid_range)]``; masking
+    should drop the fill and the out-of-range outlier, leaving ``[1, 2, 3, 4]``.
+    """
+    ds = xr.Dataset(
+        {
+            "ndvi": (
+                ("lat", "lon"),
+                np.array([[-1e30, 1.0, 2.0], [3.0, 4.0, 999.0]], dtype="float32"),
+            )
+        },
+        coords={"lat": [37.0, 38.0], "lon": [-105.0, -104.5, -104.0]},
+    )
+    ds["ndvi"].attrs["_FillValue"] = np.float32(-1e30)
+    ds["ndvi"].attrs["valid_range"] = [0.0, 10.0]
+    return ds
+
+
+def test_statistics_masks_fill_and_valid_range():
+    from earthdata_mcp.tools.preview import _statistics
+
+    stats = _statistics(_grid_with_fill_and_valid_range(), None)["ndvi"]
+    assert stats["min"] == 1.0
+    assert stats["max"] == 4.0
+    assert stats["mean"] == pytest.approx(2.5)
+    assert stats["count"] == 4
+
+
+def test_statistics_fused_masks_fill_and_valid_range():
+    from earthdata_mcp.tools.preview import _statistics_fused
+
+    ds = _grid_with_fill_and_valid_range().chunk({"lat": 1, "lon": 1})
+    stats = _statistics_fused(ds, None)["ndvi"]
+    assert stats["min"] == 1.0
+    assert stats["max"] == 4.0
+    assert stats["mean"] == pytest.approx(2.5)
+    assert stats["count"] == 4
 
 
 async def test_inspect_statistics_takes_fused_path(

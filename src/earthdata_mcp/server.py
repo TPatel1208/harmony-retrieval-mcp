@@ -203,7 +203,14 @@ async def cancel_retrieval(
     job_handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
 ) -> dict:
-    """Cancel a non-terminal retrieval job (illegal once it is already terminal)."""
+    """Cancel a non-terminal retrieval job.
+
+    Idempotent: a job that is already terminal (ready/failed/expired/cancelled)
+    is left as-is and its current status is returned rather than raising — the
+    caller's intent ("stop this job") is already satisfied by the time the call
+    lands, since a job's state can change between when a caller decides to
+    cancel and when the request arrives.
+    """
     return await retrieval.cancel_retrieval(job_handle, workspace_id)
 
 

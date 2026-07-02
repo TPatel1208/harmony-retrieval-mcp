@@ -93,6 +93,18 @@ class _FailingProvider:
         raise RuntimeError("variable subsetting on C1-X is unsupported")
 
 
+class _MultiArgFailingProvider:
+    """Fails every submit the way harmony-py does: ``Exception(reason, message)``,
+    a bare two-positional-arg exception (see ``harmony.client``: ``raise
+    Exception(response.reason, message)``)."""
+
+    async def submit(self, plan) -> JobRef:
+        raise Exception(
+            "Unprocessable Entity",
+            "Error: the requested combination of operations is not supported",
+        )
+
+
 class _MaterializingProvider:
     async def materialize(self, job: JobRef) -> MaterializedResult:
         return MaterializedResult(
@@ -217,6 +229,34 @@ async def test_submit_job_non_harmony_failure_records_no_new_events(
         job = await crud.get_job(session, job_id)
     assert job.state == JobState.FAILED.value
     assert job.error == "variable subsetting on C1-X is unsupported"
+
+
+async def test_submit_job_error_message_is_not_a_raw_args_tuple(
+    session_factory, provenance_store, workspace_id, monkeypatch
+) -> None:
+    """Regression: a GPM variable-subset rejection surfaced as the raw Python
+    tuple repr ``('Unprocessable Entity', 'Error: ...')`` instead of a message —
+    harmony-py raises a bare multi-arg ``Exception``, and Python's default
+    ``BaseException.__str__`` renders that as ``repr(args)`` rather than text."""
+    job_id, obs_handle = await _seed_pending_job(
+        session_factory, workspace_id, provider="opendap", opendap_urls=None
+    )
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_MultiArgFailingProvider())
+    )
+    ctx = _ctx(session_factory)
+
+    try:
+        await worker_mod.submit_job(ctx, job_id)
+    except Exception:
+        pass
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.FAILED.value
+    assert not job.error.startswith("(")
+    assert "Unprocessable Entity" in job.error
+    assert "requested combination of operations" in job.error
 
 
 # -- MATERIALIZED detail fields ----------------------------------------------
