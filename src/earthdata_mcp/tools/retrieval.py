@@ -34,7 +34,13 @@ from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, TransformSpec
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.providers.harmony import HarmonyProvider
-from earthdata_mcp.providers.opendap import AxisGeometry, OPeNDAPProvider, VarDimPlan, plan_subset
+from earthdata_mcp.providers.opendap import (
+    AxisGeometry,
+    OPeNDAPProvider,
+    VarDimPlan,
+    plan_subset,
+    validate_variables,
+)
 from earthdata_mcp.providers.request_spec import RequestSpec
 from earthdata_mcp.providers.router import Router
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
@@ -349,6 +355,13 @@ async def _submit_retrieval(
     ):
         opendap_plan = await plan_subset(cmr, caps, concept_id, bbox, time_range, variables)
     opendap_urls = opendap_plan.opendap_urls if opendap_plan else []
+
+    # Plan-time gate (PRD 002): reject an unknown/typo'd variable before any job
+    # row or handle exists, reusing plan_subset's UMM-V fetch above rather than a
+    # second CMR round-trip. A no-op when opendap_plan wasn't computed (no bbox,
+    # point-sample) or its collection has no registered UMM-V catalog.
+    if needs_variable and variables and opendap_plan is not None:
+        validate_variables(opendap_plan.cmr_vars, variables)
 
     # Format by shape (grid/swath → netCDF-4). An explicit caller format still wins.
     if needs_point_sample:

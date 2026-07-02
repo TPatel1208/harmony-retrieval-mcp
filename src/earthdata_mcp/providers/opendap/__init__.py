@@ -33,6 +33,7 @@ from earthdata_mcp.providers.opendap._planning import (
     _opendap_url_of,
     _resolve_from_cmr,
     plan_subset,
+    validate_variables,
 )
 from earthdata_mcp.providers.opendap._runtime import PROVIDER, OPeNDAPProvider
 from earthdata_mcp.providers.opendap._serialization import (
@@ -49,4 +50,5 @@ __all__ = [
     "VarDimPlan",
     "build_constraint_expression",
     "plan_subset",
+    "validate_variables",
 ]

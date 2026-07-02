@@ -88,6 +88,7 @@ async def _fail_job(
     exc: BaseException,
     *,
     error_prefix: str | None = None,
+    classification: str | None = None,
 ) -> None:
     """The one choke point every lifecycle task's exception handler routes
     through on its way to ``FAILED``: records a ``JOB_FAILED`` provenance event
@@ -97,20 +98,23 @@ async def _fail_job(
     CMR/Harmony call — per the failure-legibility convention in CONTEXT.md.
     ``error_prefix`` overrides the default ``"<stage>/<provider> failed"``
     prefix for a branch (like the no-OPeNDAP-fallback case) that already has its
-    own explanatory prefix to preserve verbatim.
+    own explanatory prefix to preserve verbatim. ``classification`` (PRD 002)
+    tags the submit-failure branch that led here (``invalid_request`` vs
+    ``infrastructure``) so the provenance trail explains *why* fallback was or
+    wasn't attempted.
     """
     message = _exc_message(exc)
     prefix = error_prefix if error_prefix is not None else f"{stage}/{spec.provider} failed"
+    detail: dict[str, Any] = {
+        "stage": stage,
+        "provider": spec.provider,
+        "error_type": type(exc).__name__,
+        "message": message,
+    }
+    if classification is not None:
+        detail["classification"] = classification
     await _provenance(ctx).record_event(
-        spec.workspace_id,
-        spec.obs_handle,
-        ProvenanceEventType.JOB_FAILED,
-        detail={
-            "stage": stage,
-            "provider": spec.provider,
-            "error_type": type(exc).__name__,
-            "message": message,
-        },
+        spec.workspace_id, spec.obs_handle, ProvenanceEventType.JOB_FAILED, detail=detail
     )
     async with _session_factory(ctx)() as session:
         await crud.transition_state(
@@ -132,6 +136,42 @@ def _exc_message(exc: BaseException) -> str:
     if len(exc.args) > 1:
         return ": ".join(str(a) for a in exc.args)
     return str(exc) or type(exc).__name__
+
+
+#: HTTP reason phrases (lowercased) harmony-py's ``_handle_error_response``
+#: passes as ``exc.args[0]`` for a client-error (4xx) JSON response.
+_INVALID_REQUEST_REASONS = frozenset({"bad request", "unprocessable entity"})
+
+#: Known Harmony rejection phrasings that show up in the message body even when
+#: the reason string alone isn't diagnostic.
+_INVALID_REQUEST_PHRASES = (
+    "coverages were not found",
+    "the requested combination of operations",
+)
+
+
+def _classify_submit_failure(exc: BaseException) -> str:
+    """Classify a caught Harmony submit exception as ``"invalid_request"`` (the
+    request itself is bad — a different provider can't fix it, don't fall back)
+    or ``"infrastructure"`` (timeout/5xx/connection error — OPeNDAP fallback is
+    the safer next step).
+
+    harmony-py raises a plain two-arg ``Exception(response.reason, message)``
+    for a JSON-bodied HTTP error response (see ``_exc_message``); ``reason`` is
+    the HTTP reason phrase (e.g. ``"Bad Request"``, ``"Unprocessable Entity"``).
+    A non-JSON error body instead raises ``requests.exceptions.HTTPError``, and
+    a client-side validation failure in harmony-py's own ``submit()`` raises a
+    single-arg ``Exception`` — neither carries a reason in ``args[0]``, so both
+    fall through to the phrase check and then the ``"infrastructure"`` default.
+    Defaulting to ``"infrastructure"`` when unsure is the safer wrong answer: it
+    only costs a wasted OPeNDAP round-trip, never a swallowed real rejection.
+    """
+    if len(exc.args) > 1 and str(exc.args[0]).strip().lower() in _INVALID_REQUEST_REASONS:
+        return "invalid_request"
+    message = _exc_message(exc).lower()
+    if any(phrase in message for phrase in _INVALID_REQUEST_PHRASES):
+        return "invalid_request"
+    return "infrastructure"
 
 
 # -- lifecycle tasks --------------------------------------------------------
@@ -162,7 +202,8 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
     try:
         ref = await provider.submit(plan)
     except Exception as exc:
-        if spec.provider == "harmony" and spec.opendap_urls:
+        classification = _classify_submit_failure(exc) if spec.provider == "harmony" else None
+        if spec.provider == "harmony" and classification == "infrastructure" and spec.opendap_urls:
             logger.warning(
                 "Harmony submit failed for job %s (%s); falling back to OPeNDAP",
                 job_id,
@@ -188,7 +229,20 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
                 await session.commit()
             await ctx["redis"].enqueue_job("submit_job", job_id)
             return
-        if spec.provider == "harmony":
+        if spec.provider == "harmony" and classification == "invalid_request":
+            # PRD 002: Harmony rejected the request itself (bad variable, unsupported
+            # operation combo) — a different provider can't fix that, so no OPeNDAP
+            # fallback is attempted regardless of whether opendap_urls were discovered.
+            await _fail_job(
+                ctx,
+                job_id,
+                spec,
+                "submit",
+                exc,
+                error_prefix="Harmony rejected the request",
+                classification=classification,
+            )
+        elif spec.provider == "harmony":
             await _provenance(ctx).record_event(
                 spec.workspace_id,
                 spec.obs_handle,
@@ -213,6 +267,7 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
                     "Harmony failed and no OPeNDAP fallback is available for "
                     "this collection"
                 ),
+                classification=classification,
             )
         else:
             await _fail_job(ctx, job_id, spec, "submit", exc)

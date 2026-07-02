@@ -951,23 +951,50 @@ async def test_retrieve_subset_passes_through_already_qualified_path(
     assert job.request_spec["variables"] == ["/product/vertical_column_total"]
 
 
-async def test_retrieve_subset_passes_through_unmatched_variable(
+async def test_retrieve_subset_rejects_unknown_variable_with_no_orphan_job(
     workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
 ) -> None:
-    """A bare name absent from CMR UMM-V passes through unchanged (degrade, no fail)."""
+    """A typo'd variable absent from CMR UMM-V is rejected at plan time (PRD 002),
+    before any job/handle exists, with a near-miss suggestion in the message."""
     cmr = _make_cmr_with_grouped_vars(_grid_no_service_caps())
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
 
+    with pytest.raises(ValueError) as exc_info:
+        await retrieve_subset(
+            ds, aoi, _TIME, ["vertical_column_totl"], workspace_id=workspace_id,
+            cmr=cmr, store=workspace_store, provenance=provenance_store,
+            session_factory=session_factory, enqueue_fn=mock_enqueue,
+        )
+    msg = str(exc_info.value)
+    assert "vertical_column_totl" in msg
+    assert "vertical_column_total" in msg  # near-miss suggestion
+
+    obs_handles = await workspace_store.list_handles(workspace_id, HandleType.OBS)
+    job_handles = await workspace_store.list_handles(workspace_id, HandleType.JOB)
+    assert obs_handles == []
+    assert job_handles == []
+    mock_enqueue.assert_not_awaited()
+
+
+async def test_retrieve_subset_unknown_variable_with_empty_catalog_submits_normally(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """When the collection has no registered UMM-V variables at all, validation
+    is skipped entirely (PRD 002 user story 10) — the request still submits."""
+    cmr = _make_cmr_with_opendap_granule(_grid_no_service_caps())
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
     out = await retrieve_subset(
-        ds, aoi, _TIME, ["unknown_var"], workspace_id=workspace_id,
+        ds, aoi, _TIME, ["definitely_not_real"], workspace_id=workspace_id,
         cmr=cmr, store=workspace_store, provenance=provenance_store,
         session_factory=session_factory, enqueue_fn=mock_enqueue,
     )
 
     async with session_factory() as session:
         job = await get_job_by_handle(session, out["job_handle"])
-    assert job.request_spec["variables"] == ["unknown_var"]
+    assert job.request_spec["variables"] == ["definitely_not_real"]
 
 
 async def test_retrieve_subset_raises_fast_on_ambiguous_variable(

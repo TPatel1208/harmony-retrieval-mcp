@@ -105,6 +105,26 @@ class _MultiArgFailingProvider:
         )
 
 
+class _InvalidRequestProvider:
+    """Fails the way harmony-py does for a rejected (422) request — a real
+    Harmony rejection phrase in the message, per ``harmony.client``'s
+    ``raise Exception(response.reason, description)``."""
+
+    async def submit(self, plan) -> JobRef:
+        raise Exception(
+            "Unprocessable Entity",
+            "Error: Coverages were not found for the provided variables: "
+            "definitely_not_real",
+        )
+
+
+class _ServiceUnavailableProvider:
+    """Fails the way harmony-py does for a transient 5xx outage."""
+
+    async def submit(self, plan) -> JobRef:
+        raise Exception("Service Unavailable", "upstream request timed out")
+
+
 class _MaterializingProvider:
     async def materialize(self, job: JobRef) -> MaterializedResult:
         return MaterializedResult(
@@ -243,6 +263,71 @@ async def test_submit_job_records_fallback_then_submitted_on_retry(
     assert ordered[1].detail["provider"] == "opendap"
 
 
+# -- invalid-request classification skips the OPeNDAP fallback (PRD 002) ----
+
+
+async def test_submit_job_invalid_request_fails_without_opendap_fallback(
+    session_factory, provenance_store, workspace_id, monkeypatch
+) -> None:
+    """A Harmony rejection (bad variable) must not be retried against OPeNDAP —
+    it fails immediately with Harmony's own message, verbatim."""
+    job_id, obs_handle = await _seed_pending_job(
+        session_factory,
+        workspace_id,
+        provider="harmony",
+        opendap_urls=["https://opendap.earthdata.nasa.gov/g1.nc"],
+    )
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_InvalidRequestProvider())
+    )
+    ctx = _ctx(session_factory)
+
+    try:
+        await worker_mod.submit_job(ctx, job_id)
+    except Exception:
+        pass
+
+    events = await provenance_store.events(workspace_id, obs_handle)
+    assert [e for e in events if e.event_type == "provider-fallback"] == []
+    ctx["redis"].enqueue_job.assert_not_awaited()
+
+    failed = [e for e in events if e.event_type == "job-failed"]
+    assert len(failed) == 1
+    assert failed[0].detail["classification"] == "invalid_request"
+    assert "Coverages were not found" in failed[0].detail["message"]
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.FAILED.value
+    assert job.error.startswith("Harmony rejected the request:")
+    assert "Coverages were not found" in job.error
+
+
+async def test_submit_job_infrastructure_5xx_still_falls_back_to_opendap(
+    session_factory, provenance_store, workspace_id, monkeypatch
+) -> None:
+    """A harmony-py-shaped 5xx exception is classified infrastructure — today's
+    fallback behavior stays, unlike the invalid-request case above."""
+    job_id, obs_handle = await _seed_pending_job(
+        session_factory,
+        workspace_id,
+        provider="harmony",
+        opendap_urls=["https://opendap.earthdata.nasa.gov/g1.nc"],
+    )
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_ServiceUnavailableProvider())
+    )
+    ctx = _ctx(session_factory)
+
+    await worker_mod.submit_job(ctx, job_id)
+
+    events = await provenance_store.events(workspace_id, obs_handle)
+    fallback = [e for e in events if e.event_type == "provider-fallback"]
+    assert len(fallback) == 1
+    assert fallback[0].detail["reason"]["message"].startswith("Service Unavailable")
+    ctx["redis"].enqueue_job.assert_any_await("submit_job", job_id)
+
+
 # -- OPENDAP_NOT_APPLICABLE on Harmony-fails-with-no-opendap-urls -----------
 
 
@@ -281,6 +366,7 @@ async def test_submit_job_records_opendap_not_applicable_when_no_urls(
         "provider": "harmony",
         "error_type": "RuntimeError",
         "message": "variable subsetting on C1-X is unsupported",
+        "classification": "infrastructure",
     }
 
     async with session_factory() as session:

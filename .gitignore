@@ -36,3 +36,5 @@ Thumbs.db
 # Data (local storage backend root)
 /data/
 *.zarr/
+
+/prds/

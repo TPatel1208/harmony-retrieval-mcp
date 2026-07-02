@@ -11,6 +11,7 @@ mirroring the no-op behaviour this planning seam replaces.
 
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass
 
 from earthdata_mcp.providers._capabilities import CollectionCapabilities
@@ -21,15 +22,20 @@ async def _resolve_from_cmr(
     cmr: object,
     concept_id: str,
     variables: tuple[str, ...],
+    *,
+    cmr_vars: list[dict] | None = None,
 ) -> tuple[str, str, str | None, tuple[str, ...]]:
     """Resolve variable names and discover coordinate names from CMR UMM-V.
 
-    Makes exactly one ``get_variables()`` call for the collection. Returns
-    ``(lat_name, lon_name, time_name, resolved_variables)`` where each
-    resolved path is the full CMR UMM-V ``Name`` value for that variable.
-    ``time_name`` is ``None`` when the collection has no UMM-V variable whose
-    standard_name/leaf name marks it as time — many L3 products encode time in
-    the filename instead of a variable, and there's nothing to project there.
+    Makes exactly one ``get_variables()`` call for the collection, unless the
+    caller already fetched it (``cmr_vars`` given — :func:`plan_subset` shares
+    its one fetch with :func:`_discover_grid_geometry` and plan-time variable
+    validation this way). Returns ``(lat_name, lon_name, time_name,
+    resolved_variables)`` where each resolved path is the full CMR UMM-V
+    ``Name`` value for that variable. ``time_name`` is ``None`` when the
+    collection has no UMM-V variable whose standard_name/leaf name marks it as
+    time — many L3 products encode time in the filename instead of a variable,
+    and there's nothing to project there.
 
     Variable matching:
     * Already a full path (starts with ``/``) → used as-is, no lookup.
@@ -42,10 +48,11 @@ async def _resolve_from_cmr(
     or CMR error. The ambiguity ``ValueError`` is raised *after* the try block
     so it is never swallowed by the network-error handler.
     """
-    try:
-        cmr_vars = await cmr.get_variables(concept_id)  # type: ignore[attr-defined]
-    except Exception:
-        return ("lat", "lon", None, variables)
+    if cmr_vars is None:
+        try:
+            cmr_vars = await cmr.get_variables(concept_id)  # type: ignore[attr-defined]
+        except Exception:
+            return ("lat", "lon", None, variables)
 
     # Discover coordinate variable names from CMR UMM-V standard_name or
     # canonical leaf name.
@@ -152,14 +159,17 @@ async def _discover_grid_geometry(
     variables: tuple[str, ...],
     coord_lat: str,
     coord_lon: str,
+    *,
+    cmr_vars: list[dict] | None = None,
 ) -> tuple[AxisGeometry | None, AxisGeometry | None, dict[str, VarDimPlan]]:
     """Derive regular lat/lon axis geometry from UMM-C extent + UMM-V dimensions.
 
-    Mirrors :func:`_resolve_from_cmr`'s fail-soft posture and reuses the same
-    ``get_variables()`` call — one extra CMR round trip, made in the same
-    planning pass that already resolves coordinate names. Any error, missing
-    extent, or unresolvable axis length yields ``(None, None, {})`` — the
-    caller's whole-array fallback. Never raises into the retrieval path.
+    Mirrors :func:`_resolve_from_cmr`'s fail-soft posture. Reuses the caller's
+    already-fetched ``cmr_vars`` when given (:func:`plan_subset` shares its one
+    fetch across coordinate resolution, grid geometry, and plan-time variable
+    validation); otherwise makes its own ``get_variables()`` call. Any error,
+    missing extent, or unresolvable axis length yields ``(None, None, {})`` —
+    the caller's whole-array fallback. Never raises into the retrieval path.
 
     Each requested variable is independently resolved to a :data:`VarDimPlan`
     (see :func:`_variable_dim_plan`); a variable that fails resolution is
@@ -175,10 +185,11 @@ async def _discover_grid_geometry(
     """
     if spatial_extent is None:
         return (None, None, {})
-    try:
-        cmr_vars = await cmr.get_variables(concept_id)  # type: ignore[attr-defined]
-    except Exception:
-        return (None, None, {})
+    if cmr_vars is None:
+        try:
+            cmr_vars = await cmr.get_variables(concept_id)  # type: ignore[attr-defined]
+        except Exception:
+            return (None, None, {})
 
     lat_len = _dimension_length(cmr_vars, coord_lat)
     lon_len = _dimension_length(cmr_vars, coord_lon)
@@ -238,6 +249,11 @@ class OpendapPlan:
     lon_axis: AxisGeometry | None
     var_dims: dict[str, VarDimPlan]
     variables: tuple[str, ...]
+    #: The raw UMM-V records fetched for this collection (``[]`` when no granule
+    #: advertised an OPeNDAP URL, or the fetch failed). Exposed so a caller can
+    #: run plan-time variable validation (:func:`validate_variables`) without a
+    #: second ``get_variables`` round trip (PRD 002).
+    cmr_vars: list[dict]
 
 
 async def plan_subset(
@@ -258,6 +274,11 @@ async def plan_subset(
     the plan carries the untouched inputs (fail-soft, mirrors the no-op this
     replaces). Grid-geometry discovery only runs for a ``"grid"`` collection —
     a swath's curvilinear geolocation cannot use a 1D index hyperslab.
+
+    Fetches ``get_variables()`` exactly once here and passes it into both
+    ``_resolve_from_cmr`` and ``_discover_grid_geometry`` (previously two
+    separate fetches for a grid collection) — the single fetch this module's
+    docstring promises.
     """
     urls = await _discover_opendap_urls(cmr, concept_id, bbox, time_range)
     if not urls:
@@ -270,17 +291,29 @@ async def plan_subset(
             lon_axis=None,
             var_dims={},
             variables=tuple(variables),
+            cmr_vars=[],
         )
 
+    try:
+        cmr_vars = await cmr.get_variables(concept_id)  # type: ignore[attr-defined]
+    except Exception:
+        cmr_vars = []
+
     coord_lat, coord_lon, coord_time, resolved_variables = await _resolve_from_cmr(
-        cmr, concept_id, variables
+        cmr, concept_id, variables, cmr_vars=cmr_vars
     )
     lat_axis: AxisGeometry | None = None
     lon_axis: AxisGeometry | None = None
     var_dims: dict[str, VarDimPlan] = {}
     if caps.output_shape == "grid":
         lat_axis, lon_axis, var_dims = await _discover_grid_geometry(
-            cmr, concept_id, caps.spatial_extent, resolved_variables, coord_lat, coord_lon
+            cmr,
+            concept_id,
+            caps.spatial_extent,
+            resolved_variables,
+            coord_lat,
+            coord_lon,
+            cmr_vars=cmr_vars,
         )
     return OpendapPlan(
         opendap_urls=urls,
@@ -291,7 +324,43 @@ async def plan_subset(
         lon_axis=lon_axis,
         var_dims=var_dims,
         variables=resolved_variables,
+        cmr_vars=cmr_vars,
     )
+
+
+def validate_variables(cmr_vars: list[dict], variables: tuple[str, ...]) -> None:
+    """Raise ``ValueError`` if any requested variable doesn't resolve against
+    ``cmr_vars`` — the same normalization :func:`_resolve_from_cmr` applies
+    (full slash-path match, or unambiguous bare-leaf match). A no-op when
+    ``cmr_vars`` is empty: an unregistered or unavailable UMM-Var catalog must
+    never block retrieval (PRD 002 user story 10).
+
+    Lists up to a handful of closest-matching leaf names (difflib) per unknown
+    variable, so a typo (``"vertical_column_totl"``) is correctable without a
+    separate ``describe_dataset`` call.
+    """
+    if not cmr_vars or not variables:
+        return
+    full_names = [str(v.get("name") or "") for v in cmr_vars if v.get("name")]
+    if not full_names:
+        return
+    full_lower = {n.lower() for n in full_names}
+    leaves_lower = {n.rsplit("/", 1)[-1].lower() for n in full_names}
+
+    unknown = [
+        v
+        for v in variables
+        if v.lower() not in full_lower and v.lstrip("/").lower() not in leaves_lower
+    ]
+    if not unknown:
+        return
+
+    all_leaves = sorted({n.rsplit("/", 1)[-1] for n in full_names})
+    parts = []
+    for v in unknown:
+        matches = difflib.get_close_matches(v.rsplit("/", 1)[-1], all_leaves, n=5)
+        parts.append(f"{v!r} (closest matches: {matches})" if matches else repr(v))
+    raise ValueError(f"Unknown variable(s) for this collection: {'; '.join(parts)}")
 
 
 async def _discover_opendap_urls(
