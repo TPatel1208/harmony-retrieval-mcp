@@ -93,6 +93,7 @@ class OPeNDAPProvider:
         opendap_urls: list[str] | None = None,
         coord_lat: str = "lat",
         coord_lon: str = "lon",
+        coord_time: str | None = None,
         lat_axis: AxisGeometry | None = None,
         lon_axis: AxisGeometry | None = None,
         var_dims: dict[str, VarDimPlan] | None = None,
@@ -109,6 +110,9 @@ class OPeNDAPProvider:
         # time and injected here so the CE uses the correct names.
         self._coord_lat = coord_lat
         self._coord_lon = coord_lon
+        # Resolved from UMM-V the same way as coord_lat/coord_lon; None when
+        # the collection has no real time variable (time-in-filename L3).
+        self._coord_time = coord_time
         # Regular-grid axis geometry, discovered at planning time the same way as
         # coord_lat/coord_lon. Only threaded into the CE for a "grid" collection —
         # a 1D index hyperslab cannot express a bbox on a swath's 2D geolocation.
@@ -220,6 +224,7 @@ class OPeNDAPProvider:
             plan,
             coord_lat=self._coord_lat,
             coord_lon=self._coord_lon,
+            coord_time=self._coord_time,
             lat_axis=self._lat_axis if is_grid else None,
             lon_axis=self._lon_axis if is_grid else None,
             var_dims=self._var_dims if is_grid else None,
@@ -364,6 +369,7 @@ def _constraint_expression(
     *,
     coord_lat: str = "lat",
     coord_lon: str = "lon",
+    coord_time: str | None = None,
     lat_axis: AxisGeometry | None = None,
     lon_axis: AxisGeometry | None = None,
     var_dims: dict[str, VarDimPlan] | None = None,
@@ -398,13 +404,17 @@ def _constraint_expression(
     plain ``[lat][lon]`` pair (the caller is asserting it already knows the
     variable is exactly 2-D over these two axes).
 
-    ``/time`` is intentionally omitted as its own *projection*: temporal
-    filtering happens at the CMR granule-search level (selecting which files
-    to fetch), not within a file via DAP4 CE, and many L3 monthly products
-    have no ``time`` variable at all (time is encoded in the filename) — so
-    projecting ``/time`` on its own causes a 400 from Hyrax. A data variable's
-    own ``time`` *dimension*, when present, is still handled — see
-    ``var_dims`` above.
+    Temporal *filtering* (which granules to fetch) happens at the CMR
+    granule-search level, not within a file via DAP4 CE. Many L3 monthly
+    products have no ``time`` variable at all (time is encoded in the
+    filename) — projecting a nonexistent ``/time`` causes a 400 from Hyrax —
+    so ``coord_time`` is only projected when the caller resolved one from
+    UMM-V (``None`` by default, matching that L3 case). When a collection
+    does carry a real ``time`` coordinate (e.g. TROPOMI's per-scanline
+    ``time``), omitting it would still leave a data variable's ``time``
+    *dimension* in the response but without coordinate values, degrading it
+    to a plain integer index downstream — so it is projected whole-array,
+    same as lat/lon when no axis geometry narrows it.
     """
     # No variables requested → no CE; OPeNDAP returns the full file.
     if plan.transform is None or not plan.transform.variables:
@@ -440,6 +450,8 @@ def _constraint_expression(
     if plan.needs_bbox:
         _add(coord_lat, lat_range)
         _add(coord_lon, lon_range)
+    if coord_time:
+        _add(coord_time)
     for var in plan.transform.variables:
         if not plan.needs_bbox:
             _add(var)
@@ -458,12 +470,15 @@ async def _resolve_from_cmr(
     cmr: object,
     concept_id: str,
     variables: tuple[str, ...],
-) -> tuple[str, str, tuple[str, ...]]:
+) -> tuple[str, str, str | None, tuple[str, ...]]:
     """Resolve variable names and discover coordinate names from CMR UMM-V.
 
     Makes exactly one ``get_variables()`` call for the collection. Returns
-    ``(lat_name, lon_name, resolved_variables)`` where each resolved path is
-    the full CMR UMM-V ``Name`` value for that variable.
+    ``(lat_name, lon_name, time_name, resolved_variables)`` where each
+    resolved path is the full CMR UMM-V ``Name`` value for that variable.
+    ``time_name`` is ``None`` when the collection has no UMM-V variable whose
+    standard_name/leaf name marks it as time — many L3 products encode time in
+    the filename instead of a variable, and there's nothing to project there.
 
     Variable matching:
     * Already a full path (starts with ``/``) → used as-is, no lookup.
@@ -472,19 +487,20 @@ async def _resolve_from_cmr(
       Exactly one match → substitute the full CMR path.
       More than one match → raise ``ValueError`` naming all conflicting paths.
 
-    Falls back to ``("lat", "lon", variables_as_passed)`` on any network or
-    CMR error. The ambiguity ``ValueError`` is raised *after* the try block so
-    it is never swallowed by the network-error handler.
+    Falls back to ``("lat", "lon", None, variables_as_passed)`` on any network
+    or CMR error. The ambiguity ``ValueError`` is raised *after* the try block
+    so it is never swallowed by the network-error handler.
     """
     try:
         cmr_vars = await cmr.get_variables(concept_id)  # type: ignore[attr-defined]
     except Exception:
-        return ("lat", "lon", variables)
+        return ("lat", "lon", None, variables)
 
     # Discover coordinate variable names from CMR UMM-V standard_name or
     # canonical leaf name.
     lat_name = "lat"
     lon_name = "lon"
+    time_name: str | None = None
     for var in cmr_vars:
         name: str = var.get("name") or ""
         std = (var.get("standard_name") or "").lower()
@@ -493,6 +509,8 @@ async def _resolve_from_cmr(
             lat_name = name
         elif std == "longitude" or leaf in ("lon", "longitude"):
             lon_name = name
+        elif std == "time" or leaf == "time":
+            time_name = name
 
     # Resolve data variable names: exact full paths pass through; bare names
     # are matched against CMR leaf segments (case-insensitive).
@@ -517,7 +535,7 @@ async def _resolve_from_cmr(
                 f"paths: {', '.join(matches)}"
             )
 
-    return (lat_name, lon_name, tuple(resolved))
+    return (lat_name, lon_name, time_name, tuple(resolved))
 
 
 def _leaf(name: str) -> str:
@@ -659,11 +677,16 @@ class OpendapPlan:
     UMM-V group path where CMR resolves them unambiguously). ``opendap_urls``
     empty means no OPeNDAP endpoint was found for this window — every other
     field is then the untouched default (fail-soft, never raises).
+
+    ``coord_time`` is ``None`` unless UMM-V resolves a real time coordinate
+    variable for the collection — most L3 products encode time in the
+    filename instead, and there's nothing to project there.
     """
 
     opendap_urls: list[str]
     coord_lat: str
     coord_lon: str
+    coord_time: str | None
     lat_axis: AxisGeometry | None
     lon_axis: AxisGeometry | None
     var_dims: dict[str, VarDimPlan]
@@ -695,13 +718,14 @@ async def plan_subset(
             opendap_urls=[],
             coord_lat="lat",
             coord_lon="lon",
+            coord_time=None,
             lat_axis=None,
             lon_axis=None,
             var_dims={},
             variables=tuple(variables),
         )
 
-    coord_lat, coord_lon, resolved_variables = await _resolve_from_cmr(
+    coord_lat, coord_lon, coord_time, resolved_variables = await _resolve_from_cmr(
         cmr, concept_id, variables
     )
     lat_axis: AxisGeometry | None = None
@@ -715,6 +739,7 @@ async def plan_subset(
         opendap_urls=urls,
         coord_lat=coord_lat,
         coord_lon=coord_lon,
+        coord_time=coord_time,
         lat_axis=lat_axis,
         lon_axis=lon_axis,
         var_dims=var_dims,

@@ -380,11 +380,13 @@ async def _submit_retrieval(
     # primary submit and the OPeNDAP fallback via the durable spec, so neither
     # path re-derives them.
     coord_lat, coord_lon = "lat", "lon"
+    coord_time: str | None = None
     lat_axis: AxisGeometry | None = None
     lon_axis: AxisGeometry | None = None
     var_dims: dict[str, VarDimPlan] = {}
     if opendap_plan is not None:
         coord_lat, coord_lon = opendap_plan.coord_lat, opendap_plan.coord_lon
+        coord_time = opendap_plan.coord_time
         lat_axis, lon_axis, var_dims = (
             opendap_plan.lat_axis, opendap_plan.lon_axis, opendap_plan.var_dims
         )
@@ -396,6 +398,7 @@ async def _submit_retrieval(
             opendap_urls=opendap_urls,
             coord_lat=coord_lat,
             coord_lon=coord_lon,
+            coord_time=coord_time,
             lat_axis=lat_axis,
             lon_axis=lon_axis,
             var_dims=var_dims,
@@ -430,6 +433,7 @@ async def _submit_retrieval(
         opendap_urls=opendap_urls,
         coord_lat=coord_lat if opendap_urls else None,
         coord_lon=coord_lon if opendap_urls else None,
+        coord_time=coord_time if opendap_urls else None,
         lat_axis=lat_axis,
         lon_axis=lon_axis,
         var_dims=var_dims,

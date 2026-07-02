@@ -139,11 +139,40 @@ async def test_submit_builds_dap4_url_with_projected_variables() -> None:
     assert ref.provider_job_url.startswith(OPENDAP_URL + ".dap.nc4?dap4.ce=")
 
     # The constraint expression projects the requested variable + needed coords.
-    # /time is NOT projected — temporal filtering is at CMR granule-search level;
-    # many L3 files have no time variable at all (time is in the filename).
+    # /time is NOT projected when no real time coordinate was resolved — many
+    # L3 files have no time variable at all (time is in the filename), and
+    # this provider was built without a coord_time.
     ce = unquote(ref.provider_job_url.split("dap4.ce=", 1)[1])
     assert "precipitation" in ce
     assert "lat" in ce and "lon" in ce  # needs_bbox
+    assert "/time" not in ce
+
+
+@pytest.mark.asyncio
+async def test_submit_projects_time_when_coord_time_resolved() -> None:
+    """A collection with a real time coordinate (e.g. TROPOMI's per-scanline
+    ``time``) must have it projected — otherwise Hyrax returns the data
+    variable's ``time`` dimension without coordinate values, and xarray
+    degrades it to a plain RangeIndex, breaking any downstream time-based
+    resample."""
+    provider = OPeNDAPProvider(
+        _swath_caps(),
+        opendap_urls=[OPENDAP_URL],
+        coord_time="/product/time",
+        settings=_settings(),
+    )
+    plan = _subset_plan(needs_temporal=True)
+    ref = await provider.submit(plan)
+
+    ce = unquote(ref.provider_job_url.split("dap4.ce=", 1)[1])
+    assert "/product/time" in ce.split(";")
+
+
+@pytest.mark.asyncio
+async def test_submit_omits_time_when_coord_time_not_resolved() -> None:
+    """No behavior change for collections with no UMM-V time variable at all."""
+    ref = await _provider(_swath_caps()).submit(_subset_plan(needs_temporal=True))
+    ce = unquote(ref.provider_job_url.split("dap4.ce=", 1)[1])
     assert "/time" not in ce
 
 
@@ -552,7 +581,7 @@ def test_constraint_expression_var_dims_unresolved_variable_is_whole_array() -> 
 async def test_resolve_from_cmr_grouped_file() -> None:
     """A bare leaf name is resolved to its full grouped CMR path (case-insensitive)."""
     cmr = _CmrStub([{"name": "/product/ScienceData", "standard_name": None}])
-    lat, lon, resolved = await _resolve_from_cmr(cmr, "C1", ("sciencedata",))
+    lat, lon, time, resolved = await _resolve_from_cmr(cmr, "C1", ("sciencedata",))
     assert resolved == ("/product/ScienceData",)
 
 
@@ -560,7 +589,7 @@ async def test_resolve_from_cmr_grouped_file() -> None:
 async def test_resolve_from_cmr_exact_path_passthrough() -> None:
     """A variable name that already starts with '/' is used as-is, no CMR lookup."""
     cmr = _CmrStub([{"name": "/product/ScienceData", "standard_name": None}])
-    lat, lon, resolved = await _resolve_from_cmr(cmr, "C1", ("/product/ScienceData",))
+    lat, lon, time, resolved = await _resolve_from_cmr(cmr, "C1", ("/product/ScienceData",))
     assert resolved == ("/product/ScienceData",)
 
 
@@ -581,17 +610,41 @@ async def test_resolve_from_cmr_ambiguity_raises() -> None:
 async def test_resolve_from_cmr_cmr_failure_fallback() -> None:
     """On any CMR exception the bare name flows through and no exception propagates."""
     cmr = _CmrStub(RuntimeError("network down"))
-    lat, lon, resolved = await _resolve_from_cmr(cmr, "C1", ("precipitation",))
+    lat, lon, time, resolved = await _resolve_from_cmr(cmr, "C1", ("precipitation",))
     assert resolved == ("precipitation",)
     assert lat == "lat" and lon == "lon"
+    assert time is None
 
 
 @pytest.mark.asyncio
 async def test_resolve_from_cmr_not_found_passthrough() -> None:
     """A bare name absent from CMR variables passes through unchanged."""
     cmr = _CmrStub([{"name": "/product/other_var", "standard_name": None}])
-    lat, lon, resolved = await _resolve_from_cmr(cmr, "C1", ("myvar",))
+    lat, lon, time, resolved = await _resolve_from_cmr(cmr, "C1", ("myvar",))
     assert resolved == ("myvar",)
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_cmr_discovers_time_by_standard_name() -> None:
+    cmr = _CmrStub([{"name": "/product/time", "standard_name": "time"}])
+    _lat, _lon, time, _resolved = await _resolve_from_cmr(cmr, "C1", ("no2",))
+    assert time == "/product/time"
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_cmr_discovers_time_by_leaf_name() -> None:
+    cmr = _CmrStub([{"name": "/product/time", "standard_name": None}])
+    _lat, _lon, time, _resolved = await _resolve_from_cmr(cmr, "C1", ("no2",))
+    assert time == "/product/time"
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_cmr_no_time_variable_stays_none() -> None:
+    """L3 collections with no UMM-V time variable resolve time to None — the
+    fail-soft default that keeps /time out of the CE."""
+    cmr = _CmrStub([{"name": "/precipitation", "standard_name": None}])
+    _lat, _lon, time, _resolved = await _resolve_from_cmr(cmr, "C1", ("precipitation",))
+    assert time is None
 
 
 # -- _discover_grid_geometry: plan-time axis geometry -----------------------
@@ -708,6 +761,16 @@ _GROUPED_VARS = [
     {"name": "/product/longitude", "standard_name": "longitude"},
 ]
 
+# TROPOMI-shaped: a swath (L2) collection whose science variable carries a
+# real per-scanline time coordinate — the case _resolve_from_cmr must surface
+# via coord_time so the OPeNDAP CE actually projects it.
+_SWATH_VARS_WITH_TIME = [
+    {"name": "/PRODUCT/nitrogendioxide_tropospheric_column", "standard_name": None},
+    {"name": "/PRODUCT/latitude", "standard_name": "latitude"},
+    {"name": "/PRODUCT/longitude", "standard_name": "longitude"},
+    {"name": "/PRODUCT/time", "standard_name": "time"},
+]
+
 _AMBIGUOUS_VARS = [
     {"name": "/a/ndvi", "standard_name": None},
     {"name": "/b/ndvi", "standard_name": None},
@@ -819,6 +882,28 @@ async def test_plan_subset_ambiguous_variable_raises() -> None:
         await plan_subset(cmr, _grid_caps(), "C1-GES_DISC", _PLAN_BBOX, "", ("ndvi",))
     msg = str(exc_info.value)
     assert "/a/ndvi" in msg and "/b/ndvi" in msg
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_resolves_time_coordinate_for_swath_collection() -> None:
+    """TROPOMI-shaped case: a swath collection whose science variable has a
+    real per-scanline time coordinate must have that coordinate carried on the
+    plan (and then projected by OPeNDAPProvider) — otherwise the resulting
+    netCDF's ``time`` dimension has no coordinate values and degrades to a
+    plain integer index, breaking downstream ``resample``."""
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)],
+        variables=_SWATH_VARS_WITH_TIME,
+    )
+    plan = await plan_subset(
+        cmr,
+        _swath_caps(),
+        "C1-TROPOMI",
+        None,
+        "",
+        ("nitrogendioxide_tropospheric_column",),
+    )
+    assert plan.coord_time == "/PRODUCT/time"
 
 
 @pytest.mark.asyncio
