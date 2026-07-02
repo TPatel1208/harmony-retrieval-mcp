@@ -150,8 +150,9 @@ async def resample(
     provenance: ProvenanceStore | None = None,
     storage: StorageBackend | None = None,
 ) -> dict:
-    """Temporal (``time_freq``, e.g. ``"1D"``) and/or spatial (integer ``spatial_factor``
-    coarsening) resampling of a gridded result → a ``cube_``."""
+    """Temporal (``time_freq``, e.g. ``"D"`` daily, ``"h"`` hourly, ``"ME"`` month-end)
+    and/or spatial (integer ``spatial_factor`` coarsening) resampling of a gridded
+    result → a ``cube_``."""
     store, provenance, storage = _resolve_deps(store, provenance, storage)
     obj, _payload = await _load_source(source_handle, workspace_id, store, storage)
     if not isinstance(obj, xr.Dataset):
@@ -162,7 +163,16 @@ async def resample(
     result = obj
     if time_freq and "time" in result.dims:
         result = _maybe_decode_float_time(result)
-        result = result.resample(time=time_freq).mean()
+        try:
+            result = result.resample(time=time_freq).mean()
+        except Exception as exc:
+            raise ValueError(
+                f"resample: {time_freq!r} is not a valid pandas frequency alias "
+                "(pandas rejected it, possibly deprecated or removed). Try one "
+                "of: 'D' (daily), 'h' (hourly), 'ME' (month-end) — see pandas' "
+                "offset-alias docs: https://pandas.pydata.org/docs/user_guide/"
+                "timeseries.html#offset-aliases"
+            ) from exc
     if spatial_factor:
         lon, lat = _lon_name(result), _lat_name(result)
         if lon is None and lat is None:

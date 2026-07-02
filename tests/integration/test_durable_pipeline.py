@@ -263,6 +263,102 @@ async def test_harmony_path_runs_to_ready_with_provenance(
     )
     assert {a["handle"] for a in prov["ancestors"]} == {ds}
 
+    # The job-lifecycle event trail: a clean first-attempt Harmony success records
+    # SUBMITTED -> MATERIALIZED, with no phantom PROVIDER_FALLBACK event (this is
+    # the gap this test previously missed: it asserted only on ancestry).
+    assert prov["events"], "get_provenance returned no events for a completed job"
+    ordered_types = [e["event_type"] for e in reversed(prov["events"])]
+    assert ordered_types == ["submitted", "materialized"]
+
+    submitted = prov["events"][-1]
+    assert submitted["detail"]["provider"] == "harmony"
+
+    materialized = prov["events"][0]
+    assert materialized["detail"]["provider"] == "harmony"
+    assert materialized["detail"]["storage_key"] == obs.payload["storage_key"]
+    assert materialized["detail"]["media_type"] == "application/netcdf4"
+    assert materialized["detail"]["size_bytes"] == len(b"\x89HDF\r\n")
+
+
+# -- the fallback path: Harmony fails, OPeNDAP succeeds --------------------
+
+
+async def test_harmony_fallback_path_records_fallback_then_submitted_then_materialized(
+    workspace_store, provenance_store, session_factory, patch_worker_seam,
+    local_backend, workspace_id, monkeypatch,
+) -> None:
+    """A job that falls back from Harmony to OPeNDAP records the full trail:
+    PROVIDER_FALLBACK -> SUBMITTED -> MATERIALIZED, with the fallback's reason
+    naming the Harmony failure and the eventual SUBMITTED/MATERIALIZED naming
+    the provider that actually produced the result (opendap)."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    class _FailThenOpendapProvider:
+        """Fails submit() once (as if it were the Harmony provider), then the
+        worker's real fallback re-routes to OPeNDAP and ``_load_provider`` is
+        asked again — we hand back a provider that succeeds from then on."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self._ok = _FakeProvider(
+                "opendap", "application/netcdf4", b"\x89HDF\r\n", local_backend
+            )
+
+        async def submit(self, plan):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("harmony 503")
+            return await self._ok.submit(plan)
+
+        async def poll(self, job):
+            return await self._ok.poll(job)
+
+        async def materialize(self, job):
+            return await self._ok.materialize(job)
+
+    patch_worker_seam(_FailThenOpendapProvider())
+
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        cmr=_make_cmr_opendap_window(), store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=AsyncMock(),
+    )
+
+    async with session_factory() as session:
+        job = await crud.get_job_by_handle(session, out["job_handle"])
+        job_id = job.job_id
+
+    ctx = {"session_factory": session_factory, "redis": AsyncMock()}
+    await worker_mod.submit_job(ctx, job_id)  # Harmony fails -> re-routes to OPeNDAP
+    await worker_mod.submit_job(ctx, job_id)  # retry succeeds via OPeNDAP
+    await worker_mod.poll_job(ctx, job_id)
+    await worker_mod.materialize_job(ctx, job_id)
+
+    async with session_factory() as session:
+        job = await crud.get_job_by_handle(session, out["job_handle"])
+    assert job.state == JobState.READY.value
+    assert job.provider == "opendap"
+
+    prov = await get_provenance(
+        out["obs_handle"], workspace_id=workspace_id,
+        store=workspace_store, provenance=provenance_store,
+    )
+    ordered_types = [e["event_type"] for e in reversed(prov["events"])]
+    assert ordered_types == ["provider-fallback", "submitted", "materialized"]
+
+    fallback = prov["events"][-1]
+    assert fallback["detail"]["from_provider"] == "harmony"
+    assert fallback["detail"]["to_provider"] == "opendap"
+    assert fallback["detail"]["reason"]["error_type"] == "RuntimeError"
+    assert "harmony 503" in fallback["detail"]["reason"]["message"]
+
+    submitted = prov["events"][1]
+    assert submitted["detail"]["provider"] == "opendap"
+
+    materialized = prov["events"][0]
+    assert materialized["detail"]["provider"] == "opendap"
+
 
 # -- the AppEEARS point path (hold-firm: Parquet AND provider==appeears) ----
 
