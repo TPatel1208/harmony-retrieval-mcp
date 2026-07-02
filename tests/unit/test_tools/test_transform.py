@@ -188,6 +188,72 @@ async def test_subset_bbox_raises_when_no_spatial_axis_found(
         )
 
 
+async def test_subset_time_range_raises_when_time_has_no_coordinate(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """Regression: a source already index-sliced on time (e.g. an OPeNDAP hyperslab
+    against a time-in-filename product) can carry a bare 'time' dimension with no
+    coordinate values. Re-applying a time_range must raise a clear validation error,
+    not xarray's raw positional-slice TypeError ("'str' object cannot be interpreted
+    as an integer") that leaks out of .sel() when there's no index to select against.
+    """
+    ds = xr.Dataset(
+        {"ndvi": (("time", "lat", "lon"), np.zeros((2, 3, 3), dtype="float32"))},
+        coords={"lat": [37.0, 38.0, 39.0], "lon": [-105.0, -104.5, -104.0]},
+    )
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, ds)
+
+    with pytest.raises(ValueError, match="time"):
+        await subset(
+            src, time_range="2020-01-01/2020-01-02", workspace_id=workspace_id,
+            **_deps(workspace_store, provenance_store, local_backend),
+        )
+
+
+async def test_subset_time_range_decodes_raw_cf_time_before_selecting(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """Regression: a netCDF source reaches subset with time still raw CF-encoded
+    (``open_result`` uses ``decode_times=False``, same as the resample/align paths
+    fixed by ``_maybe_decode_float_time``). Selecting a ``time_range`` against that
+    undecoded numeric coordinate must not silently mis-slice (e.g. comparing string
+    bounds to raw seconds-since-epoch floats and coming back empty) — it must decode
+    first and return exactly the requested days.
+    """
+    time_vals = np.array([0.0, 86_400.0, 172_800.0], dtype="float64")  # day 0, 1, 2
+    ds = xr.Dataset(
+        {"no2": (("time", "lat", "lon"), np.ones((3, 3, 3), dtype="float32"))},
+        coords={
+            "time": ("time", time_vals, {"units": "seconds since 2020-01-01T00:00:00Z"}),
+            "lat": [37.0, 38.0, 39.0],
+            "lon": [-105.0, -104.5, -104.0],
+        },
+    )
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        nc_path = os.path.join(tmp, "granule.nc")
+        ds.to_netcdf(nc_path, engine="h5netcdf", mode="w")
+        with open(nc_path, "rb") as f:
+            nc_bytes = f.read()
+
+    key = f"results/{uuid4().hex}/granule.nc"
+    await local_backend.put(key, nc_bytes)
+    src = await workspace_store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "ready", "storage_key": key, "media_type": "application/netcdf4"},
+    )
+
+    out = await subset(
+        src, time_range="2020-01-01/2020-01-02", workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    # Days 0 and 1 fall in range; day 2 does not — must be exactly 2 steps, not 0.
+    assert cube.sizes["time"] == 2
+    assert cube["time"].values[-1] < np.datetime64("2020-01-03")
+
+
 # -- reproject -------------------------------------------------------------
 
 
