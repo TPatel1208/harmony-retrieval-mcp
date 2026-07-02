@@ -43,7 +43,11 @@ from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.tools import discovery as discovery_mod
 from earthdata_mcp.tools._dataio import NETCDF_BUNDLE_MEDIA_TYPE, open_result
 from earthdata_mcp.tools.provenance import get_provenance
-from earthdata_mcp.tools.retrieval import retrieve_data, retrieve_timeseries
+from earthdata_mcp.tools.retrieval import (
+    get_retrieval_status,
+    retrieve_data,
+    retrieve_timeseries,
+)
 from earthdata_mcp.workspace.models import HandleType
 
 _CONCEPT_ID = "C1234567890-LPCLOUD"
@@ -358,6 +362,65 @@ async def test_harmony_fallback_path_records_fallback_then_submitted_then_materi
 
     materialized = prov["events"][0]
     assert materialized["detail"]["provider"] == "opendap"
+
+
+# -- the no-fallback-possible path: Harmony fails, no OPeNDAP URLs discovered --
+
+
+async def test_harmony_failure_with_no_opendap_urls_records_not_applicable(
+    workspace_store, provenance_store, session_factory, patch_worker_seam,
+    local_backend, workspace_id,
+) -> None:
+    """A collection with no OPeNDAP endpoint (empty ``opendap_urls`` at plan
+    time) fails its Harmony submit and stays FAILED — but the failure is
+    legible: get_provenance records OPENDAP_NOT_APPLICABLE and
+    get_retrieval_status's error string says explicitly that no fallback was
+    available, rather than surfacing a bare terminal exception."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    class _AlwaysFailsProvider:
+        async def submit(self, plan):
+            raise RuntimeError("variable subsetting on C1234567890-LPCLOUD is unsupported")
+
+    patch_worker_seam(_AlwaysFailsProvider())
+
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        cmr=_make_cmr(), store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=AsyncMock(),
+    )
+    assert out["provider"] == "harmony"
+
+    async with session_factory() as session:
+        job = await crud.get_job_by_handle(session, out["job_handle"])
+        job_id = job.job_id
+        assert not job.request_spec.get("opendap_urls")
+
+    ctx = {"session_factory": session_factory, "redis": AsyncMock()}
+    with pytest.raises(RuntimeError):
+        await worker_mod.submit_job(ctx, job_id)
+
+    async with session_factory() as session:
+        job = await crud.get_job_by_handle(session, out["job_handle"])
+    assert job.state == JobState.FAILED.value
+
+    prov = await get_provenance(
+        out["obs_handle"], workspace_id=workspace_id,
+        store=workspace_store, provenance=provenance_store,
+    )
+    ordered_types = [e["event_type"] for e in reversed(prov["events"])]
+    assert ordered_types == ["opendap-not-applicable"]
+    not_applicable = prov["events"][0]
+    assert not_applicable["detail"]["reason"] == "no_opendap_endpoint_discovered"
+    assert "unsupported" in not_applicable["detail"]["harmony_error"]["message"]
+
+    status = await get_retrieval_status(
+        out["job_handle"], workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+    assert "no OPeNDAP fallback is available" in status["error"]
+    assert "unsupported" in status["error"]
 
 
 # -- the AppEEARS point path (hold-firm: Parquet AND provider==appeears) ----

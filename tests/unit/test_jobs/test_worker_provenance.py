@@ -14,6 +14,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+from earthdata_mcp.jobs import crud
 from earthdata_mcp.jobs.models import Job
 from earthdata_mcp.jobs.state import JobState
 from earthdata_mcp.jobs import worker as worker_mod
@@ -85,6 +86,13 @@ class _FlakyProvider:
         )
 
 
+class _FailingProvider:
+    """Fails every submit — the no-fallback-possible path."""
+
+    async def submit(self, plan) -> JobRef:
+        raise RuntimeError("variable subsetting on C1-X is unsupported")
+
+
 class _MaterializingProvider:
     async def materialize(self, job: JobRef) -> MaterializedResult:
         return MaterializedResult(
@@ -147,6 +155,68 @@ async def test_submit_job_records_fallback_then_submitted_on_retry(
     assert "harmony 503" in fallback.detail["reason"]["message"]
 
     assert ordered[1].detail["provider"] == "opendap"
+
+
+# -- OPENDAP_NOT_APPLICABLE on Harmony-fails-with-no-opendap-urls -----------
+
+
+async def test_submit_job_records_opendap_not_applicable_when_no_urls(
+    session_factory, provenance_store, workspace_id, monkeypatch
+) -> None:
+    job_id, obs_handle = await _seed_pending_job(
+        session_factory, workspace_id, provider="harmony", opendap_urls=None
+    )
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_FailingProvider())
+    )
+    ctx = _ctx(session_factory)
+
+    try:
+        await worker_mod.submit_job(ctx, job_id)
+    except RuntimeError:
+        pass
+
+    events = await provenance_store.events(workspace_id, obs_handle)
+    not_applicable = [e for e in events if e.event_type == "opendap-not-applicable"]
+    assert len(not_applicable) == 1
+    assert [e for e in events if e.event_type == "provider-fallback"] == []
+
+    detail = not_applicable[0].detail
+    assert detail["harmony_error"]["error_type"] == "RuntimeError"
+    assert "unsupported" in detail["harmony_error"]["message"]
+    assert detail["reason"] == "no_opendap_endpoint_discovered"
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.FAILED.value
+    assert "no OPeNDAP fallback is available" in job.error
+    assert "unsupported" in job.error
+
+
+async def test_submit_job_non_harmony_failure_records_no_new_events(
+    session_factory, provenance_store, workspace_id, monkeypatch
+) -> None:
+    job_id, obs_handle = await _seed_pending_job(
+        session_factory, workspace_id, provider="opendap", opendap_urls=None
+    )
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_FailingProvider())
+    )
+    ctx = _ctx(session_factory)
+
+    try:
+        await worker_mod.submit_job(ctx, job_id)
+    except RuntimeError:
+        pass
+
+    events = await provenance_store.events(workspace_id, obs_handle)
+    assert [e for e in events if e.event_type == "opendap-not-applicable"] == []
+    assert [e for e in events if e.event_type == "provider-fallback"] == []
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.FAILED.value
+    assert job.error == "variable subsetting on C1-X is unsupported"
 
 
 # -- MATERIALIZED detail fields ----------------------------------------------

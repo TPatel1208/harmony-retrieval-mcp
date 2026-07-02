@@ -90,6 +90,11 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
     in the spec, the job is transparently re-routed to OPeNDAP: the spec's
     ``provider`` field is updated to ``"opendap"`` in Postgres and ``submit_job``
     is re-enqueued so the worker retries via OPeNDAP on the next pass.
+
+    If the provider is Harmony and the submit fails but no OPeNDAP URLs were
+    discovered at plan time, the fallback cannot be attempted; an
+    ``OPENDAP_NOT_APPLICABLE`` provenance event is recorded and the job's stored
+    error is prefixed to say so explicitly before it transitions to ``FAILED``.
     """
     session_factory = _session_factory(ctx)
     async with session_factory() as session:
@@ -129,9 +134,30 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
                 await session.commit()
             await ctx["redis"].enqueue_job("submit_job", job_id)
             return
+        if spec.provider == "harmony":
+            await _provenance(ctx).record_event(
+                spec.workspace_id,
+                spec.obs_handle,
+                ProvenanceEventType.OPENDAP_NOT_APPLICABLE,
+                detail={
+                    "harmony_error": {
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                    "reason": "no_opendap_endpoint_discovered",
+                    "output_shape": spec.output_shape,
+                    "had_bbox": spec.aoi_bbox is not None,
+                },
+            )
+            error_message = (
+                f"Harmony failed and no OPeNDAP fallback is available for this "
+                f"collection: {exc}"
+            )
+        else:
+            error_message = str(exc)
         async with session_factory() as session:
             await crud.transition_state(
-                session, job_id, JobState.FAILED, error=str(exc)
+                session, job_id, JobState.FAILED, error=error_message
             )
         raise
 
