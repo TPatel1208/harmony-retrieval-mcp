@@ -552,3 +552,136 @@ async def test_materialize_job_failure_records_job_failed_with_stage_and_provide
         job = await crud.get_job(session, job_id)
     assert job.state == JobState.FAILED.value
     assert job.error == "materialize/opendap failed: materialize: storage backend unreachable"
+
+
+# -- PRD 004: the failure path must never fail ------------------------------
+#
+# Live evidence: 106 jobs stuck non-terminal with null workspace_id — the
+# JOB_FAILED provenance INSERT violates a NOT NULL constraint before the state
+# transition to FAILED, so the job that was trying to fail can never fail.
+
+
+async def _seed_pending_job_without_workspace_coords(
+    session_factory, *, provider: str = "opendap"
+) -> str:
+    """A legacy/malformed spec: workspace_id and obs_handle are both None."""
+    job_id = uuid4().hex
+    request_spec = {
+        "concept_id": "C1-X",
+        "provider": provider,
+        "workspace_id": None,
+        "obs_handle": None,
+        "job_handle": f"job_{uuid4().hex[:16]}",
+    }
+    async with session_factory() as session:
+        session.add(
+            Job(
+                job_id=job_id,
+                job_handle=request_spec["job_handle"],
+                obs_handle=None,
+                provider=provider,
+                request_spec=request_spec,
+                state=JobState.PENDING.value,
+                progress=0,
+            )
+        )
+        await session.commit()
+    return job_id
+
+
+async def test_submit_job_with_null_workspace_id_still_reaches_failed(
+    session_factory, monkeypatch
+) -> None:
+    """The literal live bug: a spec with no workspace_id/obs_handle must not
+    prevent the job from reaching FAILED when its provider submit fails."""
+    job_id = await _seed_pending_job_without_workspace_coords(session_factory)
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_FailingProvider())
+    )
+    ctx = _ctx(session_factory)
+
+    try:
+        await worker_mod.submit_job(ctx, job_id)
+    except RuntimeError:
+        pass
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.FAILED.value
+    assert job.error == "submit/opendap failed: variable subsetting on C1-X is unsupported"
+
+
+async def test_fail_job_reaches_failed_even_when_provenance_store_raises(
+    session_factory, workspace_id, monkeypatch, caplog
+) -> None:
+    """Ordering guarantee: even with a *valid* spec, a provenance store that
+    throws for any reason (DB hiccup, etc.) must never block the transition to
+    FAILED — and the original failure must still be logged."""
+    job_id, _obs_handle = await _seed_pending_job(
+        session_factory, workspace_id, provider="opendap"
+    )
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_FailingProvider())
+    )
+
+    class _ThrowingProvenanceStore:
+        async def record_event(self, *args, **kwargs) -> None:
+            raise RuntimeError("provenance DB unreachable")
+
+    ctx = _ctx(session_factory)
+    ctx["provenance"] = _ThrowingProvenanceStore()
+
+    with caplog.at_level("WARNING"):
+        try:
+            await worker_mod.submit_job(ctx, job_id)
+        except RuntimeError:
+            pass
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.FAILED.value
+    assert job.error == "submit/opendap failed: variable subsetting on C1-X is unsupported"
+    assert any(job_id in record.getMessage() for record in caplog.records)
+
+
+async def test_submit_job_with_malformed_spec_fails_without_calling_provider(
+    session_factory, monkeypatch,
+) -> None:
+    """A field-stripped spec (bad axis geometry) must fail the job cleanly at
+    the load seam — never reach the provider, never raise out of the task."""
+    job_id = uuid4().hex
+    request_spec = {
+        "concept_id": "C1-X",
+        "provider": "opendap",
+        "lat_axis": {"name": "/product/latitude"},  # missing origin/step/length
+        "job_handle": f"job_{uuid4().hex[:16]}",
+    }
+    async with session_factory() as session:
+        session.add(
+            Job(
+                job_id=job_id,
+                job_handle=request_spec["job_handle"],
+                obs_handle=None,
+                provider="opendap",
+                request_spec=request_spec,
+                state=JobState.PENDING.value,
+                progress=0,
+            )
+        )
+        await session.commit()
+
+    class _MustNotBeCalledProvider:
+        async def submit(self, plan):
+            raise AssertionError("provider.submit must not be called for an invalid spec")
+
+    load_provider = AsyncMock(return_value=_MustNotBeCalledProvider())
+    monkeypatch.setattr(worker_mod, "_load_provider", load_provider)
+    ctx = _ctx(session_factory)
+
+    await worker_mod.submit_job(ctx, job_id)  # must not raise
+
+    load_provider.assert_not_awaited()
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.FAILED.value
+    assert "invalid job spec" in job.error

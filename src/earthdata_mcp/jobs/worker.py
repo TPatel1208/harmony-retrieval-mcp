@@ -19,10 +19,12 @@ the row.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
 from arq.connections import RedisSettings
+from arq.worker import func
 
 from earthdata_mcp import providers
 from earthdata_mcp.config import get_settings
@@ -32,7 +34,7 @@ from earthdata_mcp.jobs.models import Job
 from earthdata_mcp.jobs.state import TERMINAL_STATES, JobState
 from earthdata_mcp.providers.base import JobRef, RetrievalProvider
 from earthdata_mcp.providers.cmr import CMRProvider
-from earthdata_mcp.providers.request_spec import RequestSpec
+from earthdata_mcp.providers.request_spec import InvalidSpecError, RequestSpec
 from earthdata_mcp.workspace.models import ProvenanceEventType
 from earthdata_mcp.workspace.provenance import ProvenanceStore
 
@@ -80,6 +82,36 @@ def _provenance(ctx: dict[str, Any]) -> ProvenanceStore:
     return store
 
 
+async def _record_event_safe(
+    ctx: dict[str, Any],
+    job_id: str,
+    workspace_id: str | None,
+    handle: str | None,
+    event_type: ProvenanceEventType,
+    detail: dict[str, Any],
+) -> None:
+    """Record a provenance event without ever letting it block the lifecycle
+    (PRD 004): a legacy/malformed spec with no ``workspace_id``/``handle`` skips
+    the write (logged) rather than violating the tables' NOT NULL columns, and
+    any other write failure (DB hiccup, etc.) is logged and swallowed instead of
+    propagating — a routing/failure-legibility event explains a decision, it
+    must never be the reason a job gets stuck.
+    """
+    if not workspace_id or not handle:
+        logger.warning(
+            "job %s: skipping %s provenance event — spec has no workspace_id/obs_handle",
+            job_id,
+            event_type,
+        )
+        return
+    try:
+        await _provenance(ctx).record_event(workspace_id, handle, event_type, detail=detail)
+    except Exception:
+        logger.exception(
+            "job %s: failed to record %s provenance event", job_id, event_type
+        )
+
+
 async def _fail_job(
     ctx: dict[str, Any],
     job_id: str,
@@ -91,20 +123,30 @@ async def _fail_job(
     classification: str | None = None,
 ) -> None:
     """The one choke point every lifecycle task's exception handler routes
-    through on its way to ``FAILED``: records a ``JOB_FAILED`` provenance event
-    and persists the stage- and provider-prefixed error string.
+    through on its way to ``FAILED``: persists the stage- and provider-prefixed
+    error string, then records a ``JOB_FAILED`` provenance event.
 
-    Built only from ``spec``, ``stage``, and the caught ``exc`` — never a fresh
-    CMR/Harmony call — per the failure-legibility convention in CONTEXT.md.
-    ``error_prefix`` overrides the default ``"<stage>/<provider> failed"``
-    prefix for a branch (like the no-OPeNDAP-fallback case) that already has its
-    own explanatory prefix to preserve verbatim. ``classification`` (PRD 002)
-    tags the submit-failure branch that led here (``invalid_request`` vs
-    ``infrastructure``) so the provenance trail explains *why* fallback was or
-    wasn't attempted.
+    The state transition happens **first** and needs nothing but the job id
+    (PRD 004): a job that is failing must reach ``FAILED`` even if the
+    provenance write that explains *why* can't itself succeed (missing
+    workspace/obs coordinates on a legacy spec, a DB hiccup, ...) — see
+    :func:`_record_event_safe`. Built only from ``spec``, ``stage``, and the
+    caught ``exc`` — never a fresh CMR/Harmony call — per the failure-legibility
+    convention in CONTEXT.md. ``error_prefix`` overrides the default
+    ``"<stage>/<provider> failed"`` prefix for a branch (like the
+    no-OPeNDAP-fallback case) that already has its own explanatory prefix to
+    preserve verbatim. ``classification`` (PRD 002) tags the submit-failure
+    branch that led here (``invalid_request`` vs ``infrastructure``) so the
+    provenance trail explains *why* fallback was or wasn't attempted.
     """
     message = _exc_message(exc)
     prefix = error_prefix if error_prefix is not None else f"{stage}/{spec.provider} failed"
+
+    async with _session_factory(ctx)() as session:
+        await crud.transition_state(
+            session, job_id, JobState.FAILED, error=f"{prefix}: {message}"
+        )
+
     detail: dict[str, Any] = {
         "stage": stage,
         "provider": spec.provider,
@@ -113,13 +155,30 @@ async def _fail_job(
     }
     if classification is not None:
         detail["classification"] = classification
-    await _provenance(ctx).record_event(
-        spec.workspace_id, spec.obs_handle, ProvenanceEventType.JOB_FAILED, detail=detail
+    await _record_event_safe(
+        ctx, job_id, spec.workspace_id, spec.obs_handle, ProvenanceEventType.JOB_FAILED, detail
     )
-    async with _session_factory(ctx)() as session:
+
+
+async def _load_spec_or_fail(
+    session: Any, job_id: str, raw_spec: dict
+) -> RequestSpec | None:
+    """Deserialize the durable spec, failing the job cleanly on a malformed
+    payload instead of letting the task crash uncaught (PRD 004).
+
+    ``RequestSpec.from_jsonb`` raises :class:`InvalidSpecError` for a
+    field-stripped nested payload (bad axis geometry, var-dims, ...); the
+    caller must never let that reach the provider. Returns ``None`` after
+    already transitioning the job to ``FAILED`` — the caller should bail out.
+    """
+    try:
+        return RequestSpec.from_jsonb(raw_spec)
+    except InvalidSpecError as exc:
+        logger.warning("job %s has an invalid durable spec, failing: %s", job_id, exc)
         await crud.transition_state(
-            session, job_id, JobState.FAILED, error=f"{prefix}: {message}"
+            session, job_id, JobState.FAILED, error=f"invalid job spec: {exc}"
         )
+        return None
 
 
 def _exc_message(exc: BaseException) -> str:
@@ -195,7 +254,9 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
         job = await crud.get_job(session, job_id)
         if job is None or JobState(job.state) is not JobState.PENDING:
             return
-        spec = RequestSpec.from_jsonb(job.request_spec)
+        spec = await _load_spec_or_fail(session, job_id, job.request_spec)
+        if spec is None:
+            return
 
     provider = await _load_provider(spec)
     plan = spec.to_plan()
@@ -209,7 +270,9 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
                 job_id,
                 exc,
             )
-            await _provenance(ctx).record_event(
+            await _record_event_safe(
+                ctx,
+                job_id,
                 spec.workspace_id,
                 spec.obs_handle,
                 ProvenanceEventType.PROVIDER_FALLBACK,
@@ -243,7 +306,9 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
                 classification=classification,
             )
         elif spec.provider == "harmony":
-            await _provenance(ctx).record_event(
+            await _record_event_safe(
+                ctx,
+                job_id,
                 spec.workspace_id,
                 spec.obs_handle,
                 ProvenanceEventType.OPENDAP_NOT_APPLICABLE,
@@ -299,7 +364,9 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
             JobState.RUNNING,
         ):
             return
-        spec = RequestSpec.from_jsonb(job.request_spec)
+        spec = await _load_spec_or_fail(session, job_id, job.request_spec)
+        if spec is None:
+            return
         url = job.provider_job_url
 
     provider = await _load_provider(spec)
@@ -334,7 +401,9 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
         job = await crud.get_job(session, job_id)
         if job is None or JobState(job.state) is not JobState.MATERIALIZING:
             return
-        spec = RequestSpec.from_jsonb(job.request_spec)
+        spec = await _load_spec_or_fail(session, job_id, job.request_spec)
+        if spec is None:
+            return
         url = job.provider_job_url
 
     provider = await _load_provider(spec)
@@ -392,18 +461,59 @@ async def healthcheck(ctx: dict[str, Any]) -> str:
 
 
 async def startup(ctx: dict[str, Any]) -> None:
-    """Reclaim every non-terminal job and re-enqueue it from its current state.
+    """Reclaim every non-terminal job and re-enqueue it from its current state —
+    unless it can never make progress, in which case it is failed instead
+    (PRD 004).
 
     This is what makes a long Harmony job survive a worker restart (§4.3): the
     work list comes straight from Postgres, and each job is dispatched to the task
     that resumes its state — ``PENDING`` re-submits, ``SUBMITTED``/``RUNNING``
     re-poll, ``MATERIALIZING`` re-materializes. Terminal jobs are left alone.
+
+    Two classes of non-terminal job are dead ends rather than resumable, and
+    blindly re-enqueueing them forever is exactly how debris jobs accumulate
+    (live evidence: 106 stuck rows): a job whose spec can't be reconstructed is
+    failed immediately, and a job older than the configured staleness horizon
+    (generous — real Harmony/AppEEARS jobs run long) is failed as stale. Both
+    checks happen once, in this same reclaim pass, so one worker restart
+    converges existing debris to an honest terminal state.
     """
     session_factory = _session_factory(ctx)
+    stale_before = datetime.now(timezone.utc) - timedelta(
+        days=get_settings().job_stale_after_days
+    )
+
+    resumable: list[tuple[str, JobState]] = []
     async with session_factory() as session:
         jobs = await crud.reclaim_non_terminal(session)
-        # Read fields inside the session; the instances detach when it closes.
-        resumable = [(job.job_id, JobState(job.state)) for job in jobs]
+        for job in jobs:
+            try:
+                RequestSpec.from_jsonb(job.request_spec)
+            except InvalidSpecError as exc:
+                logger.warning(
+                    "reclaimed job %s has an invalid durable spec, failing: %s",
+                    job.job_id,
+                    exc,
+                )
+                crud.set_state(job, JobState.FAILED, error=f"invalid job spec: {exc}")
+                continue
+            if job.created_at < stale_before:
+                logger.warning(
+                    "reclaimed job %s is stale (non-terminal since %s), failing",
+                    job.job_id,
+                    job.created_at,
+                )
+                crud.set_state(
+                    job,
+                    JobState.FAILED,
+                    error=(
+                        f"reclaimed as stale: non-terminal since "
+                        f"{job.created_at.isoformat()}"
+                    ),
+                )
+                continue
+            resumable.append((job.job_id, JobState(job.state)))
+        await session.commit()
 
     redis = ctx["redis"]
     for job_id, state in resumable:
@@ -480,7 +590,15 @@ def _job_id_from_url(url: str | None) -> str | None:
 class WorkerSettings:
     """Arq worker configuration. Run with ``arq earthdata_mcp.jobs.worker.WorkerSettings``."""
 
-    functions = [submit_job, poll_job, materialize_job, healthcheck]
+    # Bounded retries (PRD 004): an unforeseen repeating crash degrades to a
+    # logged dead task instead of retrying forever; the startup staleness sweep
+    # then catches the job on the next reclaim pass.
+    functions = [
+        func(submit_job, max_tries=5),
+        func(poll_job, max_tries=5),
+        func(materialize_job, max_tries=5),
+        healthcheck,
+    ]
     on_startup = startup
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     # Harmony downloads can be large (100s of MB); give them up to 1 hour.

@@ -30,9 +30,20 @@ from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, Transfor
 from earthdata_mcp.providers.opendap import AxisGeometry, VarDimPlan
 from earthdata_mcp.providers.router import RoutingDecision
 
-__all__ = ["RequestSpec"]
+__all__ = ["InvalidSpecError", "RequestSpec"]
 
 _DEFAULT_FORMAT = "application/netcdf4"
+
+
+class InvalidSpecError(ValueError):
+    """A durable spec's stored JSONB can't be reconstructed (PRD 004).
+
+    Raised by :meth:`RequestSpec.from_jsonb` for a field-stripped or malformed
+    nested payload (e.g. an axis-geometry dict missing a key) instead of letting
+    the underlying ``KeyError``/``TypeError`` leak out of whichever helper first
+    touches the missing field. The worker catches this once, at the load seam,
+    and fails the job with a clear message rather than crashing the task.
+    """
 
 
 @dataclass(frozen=True)
@@ -166,37 +177,46 @@ class RequestSpec:
 
     @classmethod
     def from_jsonb(cls, data: dict) -> RequestSpec:
-        """Reconstruct from stored JSONB, tolerant of already-persisted legacy specs."""
-        opendap_urls = data.get("opendap_urls")
-        if not opendap_urls and data.get("opendap_url"):
-            opendap_urls = [data["opendap_url"]]
-        bbox = data.get("aoi_bbox")
-        return cls(
-            concept_id=data.get("concept_id"),
-            short_name=data.get("short_name"),
-            output_format=data.get("output_format") or _DEFAULT_FORMAT,
-            output_shape=data.get("output_shape"),
-            needs_bbox=bool(data.get("needs_bbox")),
-            needs_variable=bool(data.get("needs_variable")),
-            needs_temporal=bool(data.get("needs_temporal")),
-            needs_point_sample=bool(data.get("needs_point_sample")),
-            aoi_bbox=tuple(bbox) if bbox else None,
-            time_range=data.get("time_range"),
-            variables=tuple(data.get("variables") or ()),
-            provider=data.get("provider") or "harmony",
-            service_name=data.get("service_name"),
-            opendap_urls=tuple(opendap_urls or ()),
-            coord_lat=data.get("coord_lat"),
-            coord_lon=data.get("coord_lon"),
-            coord_time=data.get("coord_time"),
-            lat_axis=_axis_from_jsonb(data.get("lat_axis")),
-            lon_axis=_axis_from_jsonb(data.get("lon_axis")),
-            var_dims=_var_dims_from_jsonb(data.get("var_dims")),
-            workspace_id=data.get("workspace_id"),
-            job_handle=data.get("job_handle"),
-            obs_handle=data.get("obs_handle"),
-            cache_key_value=data.get("cache_key") or "",
-        )
+        """Reconstruct from stored JSONB, tolerant of already-persisted legacy specs.
+
+        Missing top-level fields default (see the legacy-tolerance tests); a
+        malformed *nested* payload (an axis-geometry or var-dims dict stripped of
+        a required key) raises :class:`InvalidSpecError` instead of the raw
+        ``KeyError``/``TypeError`` a helper would otherwise leak (PRD 004).
+        """
+        try:
+            opendap_urls = data.get("opendap_urls")
+            if not opendap_urls and data.get("opendap_url"):
+                opendap_urls = [data["opendap_url"]]
+            bbox = data.get("aoi_bbox")
+            return cls(
+                concept_id=data.get("concept_id"),
+                short_name=data.get("short_name"),
+                output_format=data.get("output_format") or _DEFAULT_FORMAT,
+                output_shape=data.get("output_shape"),
+                needs_bbox=bool(data.get("needs_bbox")),
+                needs_variable=bool(data.get("needs_variable")),
+                needs_temporal=bool(data.get("needs_temporal")),
+                needs_point_sample=bool(data.get("needs_point_sample")),
+                aoi_bbox=tuple(bbox) if bbox else None,
+                time_range=data.get("time_range"),
+                variables=tuple(data.get("variables") or ()),
+                provider=data.get("provider") or "harmony",
+                service_name=data.get("service_name"),
+                opendap_urls=tuple(opendap_urls or ()),
+                coord_lat=data.get("coord_lat"),
+                coord_lon=data.get("coord_lon"),
+                coord_time=data.get("coord_time"),
+                lat_axis=_axis_from_jsonb(data.get("lat_axis")),
+                lon_axis=_axis_from_jsonb(data.get("lon_axis")),
+                var_dims=_var_dims_from_jsonb(data.get("var_dims")),
+                workspace_id=data.get("workspace_id"),
+                job_handle=data.get("job_handle"),
+                obs_handle=data.get("obs_handle"),
+                cache_key_value=data.get("cache_key") or "",
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise InvalidSpecError(f"malformed request spec: {exc}") from exc
 
     # -- worker-side reconstruction -------------------------------------------
 

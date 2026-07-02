@@ -13,11 +13,13 @@ rows from other tests can't make a pass or a failure spurious.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
+from earthdata_mcp.jobs import crud
 from earthdata_mcp.jobs.models import Job
 from earthdata_mcp.jobs.state import JobState
 from earthdata_mcp.jobs.worker import startup
@@ -119,3 +121,93 @@ async def test_startup_skips_terminal_states(session_factory, state) -> None:
     # This specific job id must appear in no enqueue call, whatever else is queued.
     enqueued_ids = [args[1] for args in _enqueued(ctx["redis"])]
     assert job_id not in enqueued_ids
+
+
+# -- PRD 004: startup reclaim gets a staleness + invalid-spec policy --------
+#
+# Blind re-enqueue-forever is what let 106 debris jobs sit non-terminal
+# indefinitely; a non-terminal job that can never make progress (an unreadable
+# spec, or one stale well past any real Harmony/AppEEARS run time) must be
+# failed on reclaim instead of re-enqueued again.
+
+
+async def _seed_job_with_spec_and_age(
+    session_factory, state: JobState, request_spec: dict, created_at: datetime
+) -> str:
+    job_id = uuid4().hex
+    async with session_factory() as session:
+        session.add(
+            Job(
+                job_id=job_id,
+                job_handle=f"job_{uuid4().hex[:16]}",
+                obs_handle=f"obs_{uuid4().hex[:16]}",
+                provider="harmony",
+                request_spec=request_spec,
+                state=state.value,
+                progress=0,
+                provider_job_url="https://harmony.earthdata.nasa.gov/jobs/abc",
+                created_at=created_at,
+            )
+        )
+        await session.commit()
+    return job_id
+
+
+async def test_startup_fails_stale_job_instead_of_reenqueuing(session_factory) -> None:
+    """A non-terminal job far older than the staleness horizon (default 7 days)
+    is failed as stale on reclaim, not re-enqueued forever."""
+    stale_created_at = datetime.now(timezone.utc) - timedelta(days=10)
+    job_id = await _seed_job_with_spec_and_age(
+        session_factory, JobState.SUBMITTED, {"concept_id": "C1-X"}, stale_created_at
+    )
+    ctx = _ctx(session_factory)
+
+    await startup(ctx)
+
+    enqueued_ids = [args[1] for args in _enqueued(ctx["redis"])]
+    assert job_id not in enqueued_ids
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.FAILED.value
+    assert "stale" in job.error.lower()
+
+
+async def test_startup_fails_invalid_spec_job_instead_of_reenqueuing(session_factory) -> None:
+    """A non-terminal job whose spec can't be reconstructed is failed
+    immediately on reclaim, not re-enqueued to crash again."""
+    recent = datetime.now(timezone.utc)
+    job_id = await _seed_job_with_spec_and_age(
+        session_factory,
+        JobState.RUNNING,
+        {"concept_id": "C1-X", "lat_axis": {"name": "/product/latitude"}},
+        recent,
+    )
+    ctx = _ctx(session_factory)
+
+    await startup(ctx)
+
+    enqueued_ids = [args[1] for args in _enqueued(ctx["redis"])]
+    assert job_id not in enqueued_ids
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.FAILED.value
+    assert "invalid job spec" in job.error
+
+
+async def test_startup_still_reenqueues_valid_recent_job(session_factory) -> None:
+    """A valid, recently-created non-terminal job is unaffected by the new
+    policy — the existing resume behavior is preserved."""
+    recent = datetime.now(timezone.utc) - timedelta(hours=1)
+    job_id = await _seed_job_with_spec_and_age(
+        session_factory, JobState.SUBMITTED, {"concept_id": "C1-X"}, recent
+    )
+    ctx = _ctx(session_factory)
+
+    await startup(ctx)
+
+    ctx["redis"].enqueue_job.assert_any_await("poll_job", job_id)
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.SUBMITTED.value

@@ -45,3 +45,18 @@ string and records a `JOB_FAILED` provenance event with structured detail
 like `OPENDAP_NOT_APPLICABLE`'s no-fallback-available event and its verbatim
 error prefix — are recorded *in addition to* `JOB_FAILED`, not instead of it:
 they explain a decision, `JOB_FAILED` records the terminal outcome.
+
+**The failure path must never fail (PRD 004).** The state transition to
+`FAILED` happens *first* and needs nothing but the job id; every provenance
+write that explains the failure happens after, through `_record_event_safe`,
+which skips (with a log line) when the spec has no `workspace_id`/handle to
+key the event to, and otherwise wraps the write so any exception is logged and
+swallowed rather than propagated. A secondary write can never re-create the
+"job that was trying to fail can never fail" bug. Deserialization is hardened
+the same way: `RequestSpec.from_jsonb` raises one typed `InvalidSpecError` for
+a malformed nested payload instead of leaking a raw `KeyError`/`TypeError`
+from whichever helper first touches the missing field, and every lifecycle
+task (plus startup reclaim) catches it at the load seam and fails the job
+cleanly instead of crashing the task. Startup reclaim also fails (rather than
+re-enqueues) a non-terminal job older than `job_stale_after_days` — blind
+re-enqueue-forever is how debris jobs accumulate.

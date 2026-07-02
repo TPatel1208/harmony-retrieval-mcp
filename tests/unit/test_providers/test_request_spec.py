@@ -8,13 +8,15 @@ external behavior, not the names of internal helpers.
 
 from __future__ import annotations
 
+import pytest
+
 from earthdata_mcp.providers._capabilities import (
     CollectionCapabilities,
     ServiceCapability,
 )
 from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange
 from earthdata_mcp.providers.opendap import AxisGeometry
-from earthdata_mcp.providers.request_spec import RequestSpec
+from earthdata_mcp.providers.request_spec import InvalidSpecError, RequestSpec
 from earthdata_mcp.providers.router import RoutingDecision
 
 _CONCEPT_ID = "C1234567890-LPCLOUD"
@@ -321,3 +323,32 @@ def test_from_jsonb_missing_needs_flags_default_to_false() -> None:
     assert spec.needs_variable is False
     assert spec.needs_temporal is False
     assert spec.needs_point_sample is False
+
+
+# -- PRD 004: malformed payloads raise one typed error, not a raw KeyError ---
+
+
+def test_from_jsonb_malformed_lat_axis_raises_invalid_spec_error() -> None:
+    """A field-stripped ``lat_axis`` (missing origin/step/length) used to leak a
+    raw ``KeyError('origin')`` straight out of ``from_jsonb`` — "crashing wherever
+    a field is first touched" rather than being rejected in one place with one
+    error shape."""
+    with pytest.raises(InvalidSpecError):
+        RequestSpec.from_jsonb(
+            {
+                "concept_id": _CONCEPT_ID,
+                "provider": "opendap",
+                "lat_axis": {"name": "/product/latitude"},
+            }
+        )
+
+
+def test_from_jsonb_malformed_var_dims_raises_invalid_spec_error() -> None:
+    with pytest.raises(InvalidSpecError):
+        RequestSpec.from_jsonb(
+            {
+                "concept_id": _CONCEPT_ID,
+                "provider": "opendap",
+                "var_dims": {"/product/x": [None]},
+            }
+        )
