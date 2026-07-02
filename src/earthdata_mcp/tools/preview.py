@@ -401,6 +401,47 @@ async def inspect_statistics(
     }
 
 
+def _valid_mask(da: xr.DataArray) -> xr.DataArray | None:
+    """Boolean mask of non-fill, in-range values from CF attrs.
+
+    Covers two gaps xarray's own CF decoding leaves open for statistics: (1)
+    ``_FillValue``/``missing_value`` may still be present as a plain attr (not
+    yet moved to ``encoding``) when the caller opened with reduced decoding, and
+    (2) ``valid_range``/``valid_min``/``valid_max`` are CF conventions xarray does
+    *not* auto-mask on open at all — a variable can pass CF fill-decoding and
+    still carry physically-invalid values (e.g. TEMPO NO2 retrieval noise) inside
+    its raw numeric range. Returns ``None`` (skip masking) when none of these
+    attrs are present.
+    """
+    mask = None
+    for key in ("_FillValue", "missing_value"):
+        fill = da.attrs.get(key, da.encoding.get(key))
+        if fill is not None and not (isinstance(fill, float) and math.isnan(fill)):
+            m = da != fill
+            mask = m if mask is None else mask & m
+    valid_range = da.attrs.get("valid_range")
+    if valid_range is not None and len(valid_range) == 2:
+        lo, hi = valid_range
+        m = (da >= lo) & (da <= hi)
+        mask = m if mask is None else mask & m
+    else:
+        valid_min = da.attrs.get("valid_min")
+        valid_max = da.attrs.get("valid_max")
+        if valid_min is not None:
+            m = da >= valid_min
+            mask = m if mask is None else mask & m
+        if valid_max is not None:
+            m = da <= valid_max
+            mask = m if mask is None else mask & m
+    return mask
+
+
+def _masked(da: xr.DataArray) -> xr.DataArray:
+    """``da`` with fill/out-of-valid-range values replaced by NaN (see :func:`_valid_mask`)."""
+    mask = _valid_mask(da)
+    return da.where(mask) if mask is not None else da
+
+
 def _statistics_fused(obj: xr.Dataset, variables: list[str] | None) -> dict:
     """Per-variable stats via a single dask.compute() spanning all variables.
 
@@ -408,7 +449,8 @@ def _statistics_fused(obj: xr.Dataset, variables: list[str] | None) -> dict:
     variable and lazy count for non-numeric ones, then calls dask.compute() once
     so the scheduler executes the entire graph in a single pass — each chunk of
     each dask-backed array is read from the storage layer only once per variable
-    (the scheduler sees the shared source nodes and avoids redundant I/O).
+    (the scheduler sees the shared source nodes and avoids redundant I/O). Numeric
+    variables are masked (fill/valid-range, see :func:`_masked`) before reduction.
     """
     names = variables or [str(v) for v in obj.data_vars]
     numeric = [n for n in names if np.issubdtype(obj[n].dtype, np.number)]
@@ -418,7 +460,7 @@ def _statistics_fused(obj: xr.Dataset, variables: list[str] | None) -> dict:
     schedule: list[tuple[str, str]] = []  # parallel to lazy_vals
 
     for name in numeric:
-        da = obj[name]
+        da = _masked(obj[name])
         for stat, reduction in (
             ("min",   da.min()),
             ("max",   da.max()),
@@ -472,6 +514,7 @@ def _statistics(obj: xr.Dataset | pa.Table, variables: list[str] | None) -> dict
                 # Non-numeric (datetime, string, object): count only.
                 stats[name] = {"count": int(da.count()), "dtype": str(da.dtype)}
                 continue
+            da = _masked(da)
             stats[name] = {
                 "min": _finite(da.min()),
                 "max": _finite(da.max()),
