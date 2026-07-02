@@ -424,7 +424,7 @@ def _apply_subset(
 
     result = obj
     if variables:
-        result = result[variables]
+        result = result[_resolve_variable_names(result, variables)]
     if bbox is not None:
         result = _bbox_sel(result, bbox)
     if time_range and "time" in result.dims:
@@ -439,6 +439,36 @@ def _apply_subset(
         start, _, end = time_range.partition("/")
         result = result.sel(time=slice(start or None, end or None))
     return result
+
+
+def _resolve_variable_names(ds: xr.Dataset, variables: list[str]) -> list[str]:
+    """Map requested variable names onto the flattened dataset's actual names.
+
+    Grouped netCDF products (TEMPO/OMI) are flattened by ``_merge_groups`` in
+    ``tools/_dataio`` into ``group__name`` keys, but ``retrieve_subset`` stores and
+    accepts variable names in slash-path form (``group/name``) — the form Harmony
+    and OPeNDAP expect at request time. A name that worked to retrieve the data
+    must also work here, so translate slash paths to double-underscore joins
+    before indexing, falling back to the name as given.
+    """
+    available = set(ds.data_vars) | set(ds.coords)
+    resolved = []
+    unknown = []
+    for name in variables:
+        if name in available:
+            resolved.append(name)
+            continue
+        flattened = name.strip("/").replace("/", "__")
+        if flattened in available:
+            resolved.append(flattened)
+        else:
+            unknown.append(name)
+    if unknown:
+        raise ValueError(
+            f"subset: unknown variable(s) {unknown!r}; available variables are "
+            f"{sorted(available)!r}"
+        )
+    return resolved
 
 
 def _bbox_sel(ds: xr.Dataset, bbox: tuple[float, float, float, float]) -> xr.Dataset:

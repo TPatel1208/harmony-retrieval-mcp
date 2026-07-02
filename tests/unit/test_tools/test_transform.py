@@ -118,6 +118,38 @@ async def _seed_bundle_obs(store, storage, workspace_id: str, data: bytes) -> st
     )
 
 
+def _grouped_netcdf_bytes() -> bytes:
+    """A netCDF-4 file with science vars under ``/product`` and ``/geolocation``.
+
+    Mirrors the TEMPO/OMI shape that ``_dataio._merge_groups`` flattens into
+    ``group__name`` keys (see ``test_tools/test_dataio.py``).
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = os.path.join(tmp, "granule.nc")
+        xr.Dataset().to_netcdf(path, engine="h5netcdf", mode="w")
+        xr.Dataset(
+            {"vertical_column_troposphere": ("time", np.array([1.0, 2.0], dtype="float64"))},
+            coords={"time": np.array([0, 1], dtype="int64")},
+        ).to_netcdf(path, group="product", engine="h5netcdf", mode="a")
+        xr.Dataset(
+            {"latitude": ("time", np.array([40.0, 41.0], dtype="float64"))},
+            coords={"time": np.array([0, 1], dtype="int64")},
+        ).to_netcdf(path, group="geolocation", engine="h5netcdf", mode="a")
+        with open(path, "rb") as f:
+            return f.read()
+
+
+async def _seed_grouped_netcdf_obs(store, storage, workspace_id: str) -> str:
+    """Seed an ``obs_`` handle backed by a single grouped-netCDF granule (not a bundle)."""
+    key = f"results/{uuid4().hex}/granule.nc"
+    await storage.put(key, _grouped_netcdf_bytes())
+    return await store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "ready", "storage_key": key, "media_type": NETCDF_WRITE_MEDIA_TYPE},
+    )
+
+
 async def _ancestor_handles(provenance_store, workspace_id, cube_handle) -> set[str]:
     rows = await provenance_store.ancestry(workspace_id, cube_handle)
     return {a.handle for a in rows}
@@ -170,6 +202,45 @@ async def test_subset_bbox_applies_to_capitalized_axis_names(
 
     cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
     assert cube.sizes["Latitude"] == 1
+
+
+async def test_subset_variable_accepts_slash_path_against_flattened_group_names(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """Regression: retrieve_subset stores/accepts variable names in slash-path form
+    (``product/vertical_column_troposphere``) — the form Harmony/OPeNDAP expect — but
+    ``_open_netcdf_flattened`` renames grouped netCDF vars to ``group__name`` when it
+    reads the resulting obs_ handle. A variable name that worked to retrieve the data
+    must not raise a bare KeyError when passed to subset() on that same handle."""
+    src = await _seed_grouped_netcdf_obs(workspace_store, local_backend, workspace_id)
+
+    out = await subset(
+        src,
+        variables=["product/vertical_column_troposphere"],
+        workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    assert out["handle"].startswith("cube_")
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    assert "product__vertical_column_troposphere" in cube.data_vars
+    assert cube["product__vertical_column_troposphere"].values.tolist() == [1.0, 2.0]
+
+
+async def test_subset_variable_unknown_raises_clear_value_error(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """A genuinely unknown variable name must raise a clear ValueError, not a bare
+    KeyError from xarray's ``__getitem__``."""
+    src = await _seed_grouped_netcdf_obs(workspace_store, local_backend, workspace_id)
+
+    with pytest.raises(ValueError, match="unknown variable"):
+        await subset(
+            src,
+            variables=["product/does_not_exist"],
+            workspace_id=workspace_id,
+            **_deps(workspace_store, provenance_store, local_backend),
+        )
 
 
 async def test_subset_bbox_raises_when_no_spatial_axis_found(
