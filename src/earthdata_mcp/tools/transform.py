@@ -418,6 +418,14 @@ def _apply_subset(
     if bbox is not None:
         result = _bbox_sel(result, bbox)
     if time_range and "time" in result.dims:
+        result = _maybe_decode_float_time(result)
+        if "time" not in result.coords:
+            raise ValueError(
+                "subset: requested a time_range but the source's 'time' dimension "
+                "has no coordinate values (e.g. a source already index-sliced by an "
+                "upstream hyperslab, or a time-in-filename product with no time "
+                "variable); cannot select time labels on a bare dimension"
+            )
         start, _, end = time_range.partition("/")
         result = result.sel(time=slice(start or None, end or None))
     return result
