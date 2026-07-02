@@ -34,6 +34,8 @@ from earthdata_mcp.storage import StorageBackend, get_storage_backend
 from earthdata_mcp.tools._dataio import (
     PARQUET_MEDIA_TYPE,
     ZARR_MEDIA_TYPE,
+    decode_cf_time_values,
+    is_standard_calendar,
     normalize_output_format,
     open_result,
     serialize_result,
@@ -162,10 +164,16 @@ async def resample(
 
     result = obj
     if time_freq and "time" in result.dims:
+        calendar = _time_calendar(result)
         result = _maybe_decode_float_time(result)
         try:
             result = result.resample(time=time_freq).mean()
         except Exception as exc:
+            if not is_standard_calendar(calendar):
+                raise ValueError(
+                    f"resample: cannot apply time_freq={time_freq!r} (operation: "
+                    f"resample) on a {calendar!r}-calendar time axis ({exc})"
+                ) from exc
             raise ValueError(
                 f"resample: {time_freq!r} is not a valid pandas frequency alias "
                 "(pandas rejected it, possibly deprecated or removed). Try one "
@@ -260,15 +268,19 @@ async def align(
     store, provenance, storage = _resolve_deps(store, provenance, storage)
 
     datasets = []
+    calendars: dict[str, str] = {}
     for handle in source_handles:
         obj, _payload = await _load_source(handle, workspace_id, store, storage)
         if not isinstance(obj, xr.Dataset):
             raise ValueError("align requires gridded (Zarr) sources")
+        calendars[handle] = _time_calendar(obj)
         obj = _cast_int_vars_to_float(obj)
         obj = _maybe_decode_float_time(obj)
         if snap_time_freq is not None:
             obj = _snap_time(obj, snap_time_freq)
         datasets.append(obj)
+
+    _check_calendars_compatible(calendars)
 
     shapes_before = [{str(k): int(v) for k, v in d.sizes.items()} for d in datasets]
     aligned = xr.align(*datasets, join=method)
@@ -507,25 +519,68 @@ def _lat_name(ds: xr.Dataset) -> str | None:
     return next((names[n] for n in _LAT_NAMES if n in names), None)
 
 
+def _time_calendar(ds: xr.Dataset) -> str:
+    """Best-effort CF calendar name for ``ds``'s time coordinate.
+
+    Prefers the raw CF ``calendar`` attr (present before decode); falls back to
+    inspecting an already-decoded cftime value's own ``.calendar``; defaults to
+    ``"standard"`` (covers datetime64 and the no-time-coordinate case).
+    """
+    if "time" not in ds.coords:
+        return "standard"
+    calendar = ds["time"].attrs.get("calendar")
+    if calendar:
+        return str(calendar).lower()
+    values = ds["time"].values
+    if values.size and hasattr(values.flat[0], "calendar"):
+        return str(values.flat[0].calendar).lower()
+    return "standard"
+
+
+def _check_calendars_compatible(calendars: dict[str, str]) -> None:
+    """Raise if ``align``'s sources don't share a CF calendar family.
+
+    Standard/gregorian/proleptic_gregorian are treated as one interchangeable
+    family (today's pandas-backed fast path); any other calendar (julian,
+    360_day, noleap, ...) is a genuine incompatibility with that family and with
+    every other non-standard calendar — mixing them is not a silent no-op
+    (CLAUDE.md), it's a clear error naming every distinct calendar (PRD 001).
+    """
+    def _family(name: str) -> str:
+        return "standard" if is_standard_calendar(name) else name
+
+    families = {_family(c) for c in calendars.values()}
+    if len(families) > 1:
+        detail = ", ".join(f"{handle}={calendar!r}" for handle, calendar in calendars.items())
+        raise ValueError(
+            f"align: sources use incompatible CF calendars ({detail}); "
+            "calendars are not comparable — retrieve/convert sources onto the "
+            "same calendar before aligning them"
+        )
+
+
 def _maybe_decode_float_time(ds: xr.Dataset) -> xr.Dataset:
-    """Decode a float/int CF-encoded time coordinate to datetime64.
+    """Decode a float/int CF-encoded time coordinate via the shared calendar policy.
 
     Data opened with ``decode_times=False`` (all netCDF paths in _dataio) keeps
-    ``time`` as raw numeric CF units (e.g. "minutes since 2020-09-15"). Both
-    ``resample`` (pandas needs a DatetimeIndex) and ``align`` (two datasets on
-    different CF epochs/units are otherwise not comparable, even when their raw
-    encodings happen to share a dtype) need real datetime64 values to work with.
-    Decode here if the coordinate carries a CF ``units`` attr. No-op when time
-    is already datetime64, absent, or ``units`` is missing (the caller raises
-    its own clear error in that case).
+    ``time`` as raw numeric CF units (e.g. "minutes since 2020-09-15"). ``resample``
+    (needs a DatetimeIndex/CFTimeIndex), ``subset`` (time_range selection), and
+    ``align`` (two datasets on different CF epochs/units are otherwise not
+    comparable, even when their raw encodings happen to share a dtype) all need
+    real datetime64/cftime values to work with. Decode here if the coordinate
+    carries a CF ``units`` attr, routing through :func:`decode_cf_time_values` so a
+    non-standard ``calendar`` (julian, 360_day, noleap, ...) decodes to cftime
+    instead of being silently mislabeled as standard (PRD 001). No-op when time is
+    already decoded (datetime64 or cftime — no ``units`` attr survives a first
+    decode) or absent.
     """
-    if "time" not in ds.coords or np.issubdtype(ds["time"].dtype, np.datetime64):
+    if "time" not in ds.coords or not np.issubdtype(ds["time"].dtype, np.number):
         return ds
     units = ds["time"].attrs.get("units", "")
     if not units:
         return ds
-    decoded = xr.coding.times.decode_cf_datetime(
-        ds["time"].values, units=units, use_cftime=False
+    decoded = decode_cf_time_values(
+        ds["time"].values, units=units, calendar=ds["time"].attrs.get("calendar")
     )
     new_attrs = {k: v for k, v in ds["time"].attrs.items() if k not in ("units", "calendar")}
     return ds.assign_coords(time=("time", decoded, new_attrs))

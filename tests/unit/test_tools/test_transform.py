@@ -325,6 +325,59 @@ async def test_subset_time_range_decodes_raw_cf_time_before_selecting(
     assert cube["time"].values[-1] < np.datetime64("2020-01-03")
 
 
+async def test_subset_time_range_selects_correctly_on_julian_calendar(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """PRD 001: ``_maybe_decode_float_time`` currently omits the ``calendar`` attr
+    entirely, so it always decodes with ``use_cftime=False`` — for a julian-calendar
+    source (e.g. GPM IMERG) that raises pandas' ``OutOfBoundsDatetime`` instead of
+    slicing. The shared calendar-aware decode must route this through cftime and
+    still honor an ISO ``time_range`` selection (xarray's CFTimeIndex accepts ISO
+    strings in ``.sel(time=slice(...))``)."""
+    time_vals = np.array([0.0, 86_400.0, 172_800.0], dtype="float64")  # day 0, 1, 2
+    ds = xr.Dataset(
+        {"no2": (("time", "lat", "lon"), np.ones((3, 3, 3), dtype="float32"))},
+        coords={
+            "time": (
+                "time",
+                time_vals,
+                {"units": "seconds since 2020-01-01T00:00:00Z", "calendar": "julian"},
+            ),
+            "lat": [37.0, 38.0, 39.0],
+            "lon": [-105.0, -104.5, -104.0],
+        },
+    )
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        nc_path = os.path.join(tmp, "granule.nc")
+        ds.to_netcdf(nc_path, engine="h5netcdf", mode="w")
+        with open(nc_path, "rb") as f:
+            nc_bytes = f.read()
+
+    key = f"results/{uuid4().hex}/granule.nc"
+    await local_backend.put(key, nc_bytes)
+    src = await workspace_store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "ready", "storage_key": key, "media_type": "application/netcdf4"},
+    )
+
+    out = await subset(
+        src, time_range="2020-01-01/2020-01-02", workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    assert cube.sizes["time"] == 2
+    # The genuine bug: today's decoder never passes `calendar` through at all, so
+    # it silently treats every axis as standard — a julian-calendar source loses
+    # its calendar identity permanently (round-tripped through Zarr as
+    # proleptic_gregorian). It must still carry `julian` after the fix.
+    import cftime
+
+    assert all(isinstance(t, cftime.datetime) for t in cube["time"].values)
+    assert all(t.calendar == "julian" for t in cube["time"].values)
+
+
 # -- reproject -------------------------------------------------------------
 
 
@@ -416,6 +469,91 @@ async def test_resample_invalid_time_freq_raises_clear_value_error(
     message = str(exc_info.value)
     assert "no longer supported for offsets" not in message
     assert "ME" in message
+
+
+async def test_resample_julian_calendar_time_works(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """PRD 001 story 5: temporal resample must work on a non-standard-calendar
+    (julian) source. xarray supports ``resample`` natively on a ``CFTimeIndex``;
+    once ``_maybe_decode_float_time`` decodes to cftime instead of crashing/
+    mislabeling, ``.resample(time="1D").mean()`` should just work."""
+    time_vals = np.array([0.0, 3_600.0, 7_200.0], dtype="float64")  # all day 0
+    ds = xr.Dataset(
+        {"no2": (("time", "lat", "lon"), np.ones((3, 3, 3), dtype="float32"))},
+        coords={
+            "time": (
+                "time",
+                time_vals,
+                {"units": "seconds since 2020-01-01T00:00:00Z", "calendar": "julian"},
+            ),
+            "lat": [37.0, 38.0, 39.0],
+            "lon": [-105.0, -104.5, -104.0],
+        },
+    )
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        nc_path = os.path.join(tmp, "granule.nc")
+        ds.to_netcdf(nc_path, engine="h5netcdf", mode="w")
+        with open(nc_path, "rb") as f:
+            nc_bytes = f.read()
+
+    key = f"results/{uuid4().hex}/granule.nc"
+    await local_backend.put(key, nc_bytes)
+    src = await workspace_store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "ready", "storage_key": key, "media_type": "application/netcdf4"},
+    )
+
+    out = await resample(
+        src, time_freq="1D", workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    assert out["handle"].startswith("cube_")
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    assert cube.sizes["time"] == 1
+
+
+async def test_resample_invalid_time_freq_on_non_standard_calendar_names_calendar(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """PRD 001 story 5: when resample genuinely can't proceed on a non-standard
+    calendar, the error must name the calendar and the operation rather than
+    leaking a raw pandas-only exception."""
+    time_vals = np.array([0.0, 3_600.0, 7_200.0], dtype="float64")
+    ds = xr.Dataset(
+        {"no2": (("time", "lat", "lon"), np.ones((3, 3, 3), dtype="float32"))},
+        coords={
+            "time": (
+                "time",
+                time_vals,
+                {"units": "seconds since 2020-01-01T00:00:00Z", "calendar": "julian"},
+            ),
+            "lat": [37.0, 38.0, 39.0],
+            "lon": [-105.0, -104.5, -104.0],
+        },
+    )
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        nc_path = os.path.join(tmp, "granule.nc")
+        ds.to_netcdf(nc_path, engine="h5netcdf", mode="w")
+        with open(nc_path, "rb") as f:
+            nc_bytes = f.read()
+
+    key = f"results/{uuid4().hex}/granule.nc"
+    await local_backend.put(key, nc_bytes)
+    src = await workspace_store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "ready", "storage_key": key, "media_type": "application/netcdf4"},
+    )
+
+    with pytest.raises(ValueError, match="julian") as exc_info:
+        await resample(
+            src, time_freq="B", workspace_id=workspace_id,
+            **_deps(workspace_store, provenance_store, local_backend),
+        )
+    assert "resample" in str(exc_info.value)
 
 
 # -- convert_format --------------------------------------------------------
@@ -543,6 +681,50 @@ async def test_align_requires_two_sources(
             [a], workspace_id=workspace_id,
             **_deps(workspace_store, provenance_store, local_backend),
         )
+
+
+async def test_align_mixed_calendars_raises_naming_both_calendars(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """PRD 001 story 6: aligning a standard-calendar dataset against a
+    non-standard-calendar (julian) one is a genuine incompatibility — it must
+    raise a clear error naming both calendars, never silently coerce."""
+    standard = await _seed_cube(workspace_store, local_backend, workspace_id, _time_grid("no2"))
+
+    time_vals = np.array([0.0, 3_600.0, 7_200.0], dtype="float64")
+    julian_ds = xr.Dataset(
+        {"hcho": (("time", "lat", "lon"), np.ones((3, 3, 3), dtype="float32"))},
+        coords={
+            "time": (
+                "time",
+                time_vals,
+                {"units": "seconds since 2020-01-01T00:00:00Z", "calendar": "julian"},
+            ),
+            "lat": [37.0, 38.0, 39.0],
+            "lon": [-105.0, -104.5, -104.0],
+        },
+    )
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        nc_path = os.path.join(tmp, "granule.nc")
+        julian_ds.to_netcdf(nc_path, engine="h5netcdf", mode="w")
+        with open(nc_path, "rb") as f:
+            nc_bytes = f.read()
+    key = f"results/{uuid4().hex}/granule.nc"
+    await local_backend.put(key, nc_bytes)
+    julian = await workspace_store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "ready", "storage_key": key, "media_type": "application/netcdf4"},
+    )
+
+    with pytest.raises(ValueError, match="calendar") as exc_info:
+        await align(
+            [standard, julian], workspace_id=workspace_id,
+            **_deps(workspace_store, provenance_store, local_backend),
+        )
+    message = str(exc_info.value)
+    assert "standard" in message
+    assert "julian" in message
 
 
 def _time_grid(var: str, time_offset_ns: int = 0) -> xr.Dataset:

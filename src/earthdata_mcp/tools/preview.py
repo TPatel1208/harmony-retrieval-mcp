@@ -334,6 +334,7 @@ def _summarize_obj(obj: xr.Dataset | pa.Table) -> dict:
             "data_vars": [str(v) for v in obj.data_vars],
             "coords": [str(c) for c in obj.coords],
             "attrs": {str(k): _json_safe(v) for k, v in obj.attrs.items()},
+            "time_dtype": _time_dtype(obj),
         }
     return {
         "type": "table",
@@ -341,6 +342,20 @@ def _summarize_obj(obj: xr.Dataset | pa.Table) -> dict:
         "columns": list(obj.column_names),
         "schema": {f.name: str(f.type) for f in obj.schema},
     }
+
+
+def _time_dtype(ds: xr.Dataset) -> str | None:
+    """PRD 001 story 12: which representation the ``time`` coordinate decoded to.
+
+    ``"datetime64"`` for the pandas-backed fast path (standard calendar),
+    ``"cftime"`` for a non-standard calendar (julian, 360_day, noleap, ...),
+    ``None`` when there is no ``time`` coordinate at all.
+    """
+    if "time" not in ds.coords:
+        return None
+    if np.issubdtype(ds["time"].dtype, np.datetime64):
+        return "datetime64"
+    return "cftime"
 
 
 def _json_safe(value):

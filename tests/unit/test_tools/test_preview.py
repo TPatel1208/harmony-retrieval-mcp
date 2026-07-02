@@ -9,6 +9,9 @@ constructs a GIBS request — so it is fully exercised offline.
 
 from __future__ import annotations
 
+import os
+import tempfile
+import zipfile
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -17,7 +20,11 @@ import pytest
 import xarray as xr
 
 import earthdata_mcp.tools.preview as _preview_module
-from earthdata_mcp.tools._dataio import ZARR_MEDIA_TYPE, serialize_result
+from earthdata_mcp.tools._dataio import (
+    NETCDF_BUNDLE_MEDIA_TYPE,
+    ZARR_MEDIA_TYPE,
+    serialize_result,
+)
 from earthdata_mcp.tools.preview import (
     _select_gibs_layer,
     inspect_statistics,
@@ -83,6 +90,51 @@ async def _seed_cube(
         handle_type,
         {"status": "ready", "storage_key": key, "media_type": ZARR_MEDIA_TYPE},
     )
+
+
+def _julian_granule_bytes(time_value: float, x_value: float) -> bytes:
+    """A flat single-time netCDF granule with a julian-calendar ``time`` coordinate
+    (mirrors GPM IMERG, PRD 001's live repro)."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = os.path.join(tmp, "granule.nc")
+        xr.Dataset(
+            {"precip": ("time", np.array([x_value], dtype="float64"))},
+            coords={
+                "time": (
+                    "time",
+                    np.array([time_value], dtype="float64"),
+                    {
+                        "units": "days since 2020-01-01T00:00:00",
+                        "calendar": "julian",
+                    },
+                )
+            },
+        ).to_netcdf(path, engine="h5netcdf", mode="w")
+        with open(path, "rb") as f:
+            return f.read()
+
+
+async def _seed_julian_bundle_obs(store, storage, workspace_id: str) -> str:
+    buf_path_bytes = _bundle_zip_bytes(
+        [("g0.nc", _julian_granule_bytes(0.0, 1.0)), ("g1.nc", _julian_granule_bytes(1.0, 2.0))]
+    )
+    key = f"results/{uuid4().hex}/bundle.nc.zip"
+    await storage.put(key, buf_path_bytes)
+    return await store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "ready", "storage_key": key, "media_type": NETCDF_BUNDLE_MEDIA_TYPE},
+    )
+
+
+def _bundle_zip_bytes(members: list[tuple[str, bytes]]) -> bytes:
+    import io
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in members:
+            zf.writestr(name, data)
+    return buf.getvalue()
 
 
 # -- preview_dataset -------------------------------------------------------
@@ -305,6 +357,36 @@ async def test_summarize_unmaterialized_obs_returns_status(
     assert out["summary"] is None
 
 
+async def test_summarize_julian_calendar_obs_does_not_crash(
+    workspace_store, local_backend, workspace_id
+):
+    """PRD 001 live repro: a GPM IMERG-style retrieval (julian calendar) must be
+    summarizable, not crash with pandas' ``OutOfBoundsDatetime``. The summary must
+    also record the decoded time dtype (story 12) so callers know they're looking
+    at cftime, not datetime64."""
+    obs = await _seed_julian_bundle_obs(workspace_store, local_backend, workspace_id)
+
+    out = await summarize_dataset(
+        obs, workspace_id=workspace_id, store=workspace_store, storage=local_backend
+    )
+
+    assert out["summary"]["type"] == "grid"
+    assert out["summary"]["dims"]["time"] == 2
+    assert out["summary"]["time_dtype"] == "cftime"
+
+
+async def test_summarize_standard_calendar_obs_reports_datetime64(
+    workspace_store, local_backend, workspace_id
+):
+    """Regression guard: the fast path's summary still reports datetime64."""
+    cube = await _seed_cube(workspace_store, local_backend, workspace_id, _grid())
+    out = await summarize_dataset(
+        cube, workspace_id=workspace_id, store=workspace_store, storage=local_backend
+    )
+    # _grid() carries no time coordinate at all.
+    assert out["summary"]["time_dtype"] is None
+
+
 # -- inspect_statistics ----------------------------------------------------
 
 
@@ -328,6 +410,24 @@ async def test_inspect_statistics_rejects_dataset_handle(
     ds = await _seed_dataset(workspace_store, workspace_id)
     with pytest.raises(ValueError, match="obs_ or cube_"):
         await inspect_statistics(ds, workspace_id=workspace_id, store=workspace_store)
+
+
+async def test_inspect_statistics_julian_calendar_does_not_crash(
+    workspace_store, local_backend, workspace_id
+):
+    """PRD 001 story 2: inspect_statistics must work on julian-calendar data —
+    the live repro crashed with pandas' OutOfBoundsDatetime immediately after a
+    successful GPM IMERG retrieval."""
+    obs = await _seed_julian_bundle_obs(workspace_store, local_backend, workspace_id)
+
+    out = await inspect_statistics(
+        obs, workspace_id=workspace_id, store=workspace_store, storage=local_backend
+    )
+
+    stats = out["statistics"]["precip"]
+    assert stats["min"] == 1.0
+    assert stats["max"] == 2.0
+    assert stats["count"] == 2
 
 
 async def test_inspect_statistics_cross_workspace_denied(

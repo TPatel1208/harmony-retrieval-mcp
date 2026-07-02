@@ -99,6 +99,39 @@ _BUNDLE_CONCAT_DIM = "time"
 #: netCDF read engine — pure-Python h5py-based, no C library (see pyproject).
 _NETCDF_ENGINE = "h5netcdf"
 
+#: CF calendars pandas' datetime64 can represent exactly (xarray's fast path).
+#: Anything else (julian, 360_day, noleap/365_day, all_leap, ...) must decode to
+#: cftime objects instead — pandas raises ``OutOfBoundsDatetime`` for those.
+_PANDAS_COMPATIBLE_CALENDARS = frozenset(
+    {"standard", "gregorian", "proleptic_gregorian"}
+)
+
+
+def is_standard_calendar(calendar: str | None) -> bool:
+    """Whether ``calendar`` is one pandas' datetime64 can represent exactly.
+
+    ``None``/absent is treated as standard (CF's own default). Anything else
+    non-standard (julian, 360_day, noleap/365_day, all_leap, ...) needs cftime.
+    """
+    return (calendar or "standard").lower() in _PANDAS_COMPATIBLE_CALENDARS
+
+
+def decode_cf_time_values(values, units: str, calendar: str | None = None):
+    """The one CF time-decoding policy for the whole codebase (PRD 001).
+
+    Standard/gregorian/proleptic-gregorian (or no ``calendar`` attr at all) decodes
+    with ``use_cftime=False`` — today's fast path, yielding ``datetime64[ns]``.
+    Every other calendar (``julian``, ``360_day``, ``noleap``/``365_day``,
+    ``all_leap``, ...) decodes with ``use_cftime=True``, yielding cftime objects,
+    since pandas cannot represent them (it raises ``OutOfBoundsDatetime``).
+    Never hardcode ``use_cftime=False`` at a call site — call this instead.
+    """
+    calendar = calendar or "standard"
+    use_cftime = not is_standard_calendar(calendar)
+    return xr.coding.times.decode_cf_datetime(
+        values, units=units, calendar=calendar, use_cftime=use_cftime
+    )
+
 
 class UnsupportedMediaType(ValueError):
     """A media type this server cannot open or serialize in-process."""
@@ -378,11 +411,8 @@ def _decode_member_time(ds: xr.Dataset) -> xr.Dataset:
     units = time_var.attrs.get("units")
     if not units:
         return ds
-    decoded = xr.coding.times.decode_cf_datetime(
-        time_var.values,
-        units=units,
-        calendar=time_var.attrs.get("calendar", "standard"),
-        use_cftime=False,
+    decoded = decode_cf_time_values(
+        time_var.values, units=units, calendar=time_var.attrs.get("calendar")
     )
     return ds.assign_coords({_BUNDLE_CONCAT_DIM: (_BUNDLE_CONCAT_DIM, decoded)})
 

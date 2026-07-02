@@ -150,13 +150,17 @@ def test_open_result_lazy_flattens_groups_in_bundle_multi_member(tmp_path) -> No
 
 
 def _cf_time_netcdf_bytes(
-    time_value: int, x_value: float, units: str = "seconds since 2000-01-01T00:00:00Z"
+    time_value: int,
+    x_value: float,
+    units: str = "seconds since 2000-01-01T00:00:00Z",
+    calendar: str = "standard",
 ) -> bytes:
     """A flat single-time granule with a CF-encoded float64 ``time`` coordinate.
 
-    Defaults to ``seconds since 2000-01-01T00:00:00Z`` to mimic the encoding
-    TEMPO/OMI L3 products write. ``units`` is overridable so a test can give
-    different members different reference epochs (as MERRA-2 daily granules do).
+    Defaults to ``seconds since 2000-01-01T00:00:00Z`` / ``standard`` to mimic the
+    encoding TEMPO/OMI L3 products write. ``units``/``calendar`` are overridable so
+    a test can give different members different reference epochs (as MERRA-2 daily
+    granules do) or a non-standard CF calendar (julian, 360_day, noleap).
     """
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         path = os.path.join(tmp, "granule.nc")
@@ -167,7 +171,7 @@ def _cf_time_netcdf_bytes(
                 "time": (
                     "time",
                     time_arr,
-                    {"units": units, "calendar": "standard"},
+                    {"units": units, "calendar": calendar},
                 )
             },
         )
@@ -232,6 +236,112 @@ def test_open_netcdf_bundle_decodes_each_member_against_its_own_epoch() -> None:
         np.datetime64("2020-09-15T03:00:00"),
         np.datetime64("2020-09-16T03:00:00"),
     ]
+
+
+def test_open_netcdf_bundle_decodes_julian_calendar_to_cftime() -> None:
+    """PRD 001: a julian-calendar bundle (e.g. GPM IMERG) must open, not crash.
+
+    Today ``_decode_member_time`` hardcodes ``use_cftime=False``, which forces
+    pandas datetime64 decoding — pandas raises ``OutOfBoundsDatetime`` (or, for
+    small offsets, silently mis-decodes) for any non-standard calendar. The
+    shared decode policy must route a ``julian`` calendar through
+    ``use_cftime=True`` instead, yielding a correctly-valued cftime index.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "g0.nc",
+            _cf_time_netcdf_bytes(
+                0, 10.0, units="days since 2000-01-01T00:00:00", calendar="julian"
+            ),
+        )
+        zf.writestr(
+            "g1.nc",
+            _cf_time_netcdf_bytes(
+                1, 20.0, units="days since 2000-01-01T00:00:00", calendar="julian"
+            ),
+        )
+
+    ds = open_result(buf.getvalue(), NETCDF_BUNDLE_MEDIA_TYPE)
+
+    assert ds.sizes["time"] == 2
+    import cftime
+
+    assert all(isinstance(t, cftime.datetime) for t in ds["time"].values)
+    assert [t.calendar for t in ds["time"].values] == ["julian", "julian"]
+
+
+def test_open_netcdf_bundle_decodes_360_day_calendar_including_feb_30() -> None:
+    """A 360_day calendar (climate-model convention: every month has 30 days) must
+    decode correctly, including dates like Feb 30 that don't exist in any real
+    calendar — the defining correctness check for this calendar."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "g0.nc",
+            _cf_time_netcdf_bytes(
+                # day 0 = Jan 1; day 59 (Jan's 30 days + Feb's next 29) in a
+                # 360_day calendar lands on Feb 30 — a date only this calendar has.
+                59, 10.0, units="days since 2000-01-01T00:00:00", calendar="360_day",
+            ),
+        )
+        zf.writestr(
+            "g1.nc",
+            _cf_time_netcdf_bytes(
+                60, 20.0, units="days since 2000-01-01T00:00:00", calendar="360_day",
+            ),
+        )
+
+    ds = open_result(buf.getvalue(), NETCDF_BUNDLE_MEDIA_TYPE)
+
+    assert ds.sizes["time"] == 2
+    import cftime
+
+    times = list(ds["time"].values)
+    assert all(isinstance(t, cftime.Datetime360Day) for t in times)
+    assert (times[0].month, times[0].day) == (2, 30)
+    assert (times[1].month, times[1].day) == (3, 1)
+
+
+def test_open_netcdf_bundle_decodes_noleap_calendar() -> None:
+    """A noleap/365_day calendar (no Feb 29 ever) must decode correctly."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "g0.nc",
+            _cf_time_netcdf_bytes(
+                0, 10.0, units="days since 2001-01-01T00:00:00", calendar="noleap",
+            ),
+        )
+        zf.writestr(
+            "g1.nc",
+            _cf_time_netcdf_bytes(
+                365, 20.0, units="days since 2001-01-01T00:00:00", calendar="noleap",
+            ),
+        )
+
+    ds = open_result(buf.getvalue(), NETCDF_BUNDLE_MEDIA_TYPE)
+
+    assert ds.sizes["time"] == 2
+    import cftime
+
+    times = list(ds["time"].values)
+    assert all(isinstance(t, cftime.DatetimeNoLeap) for t in times)
+    # 365 days after 2001-01-01 with no leap day is exactly 2002-01-01.
+    assert (times[1].year, times[1].month, times[1].day) == (2002, 1, 1)
+
+
+def test_open_netcdf_bundle_standard_calendar_still_yields_datetime64() -> None:
+    """Regression guard: the fast path (standard/absent calendar) must not
+    change — the 95% case still decodes to real ``datetime64[ns]``, not cftime."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("g0.nc", _cf_time_netcdf_bytes(0, 10.0))
+        zf.writestr("g1.nc", _cf_time_netcdf_bytes(86400, 20.0))
+
+    ds = open_result(buf.getvalue(), NETCDF_BUNDLE_MEDIA_TYPE)
+
+    assert np.issubdtype(ds["time"].dtype, np.datetime64)
 
 
 def _no_time_coord_netcdf_bytes(range_beginning_date: str, x_value: float) -> bytes:
