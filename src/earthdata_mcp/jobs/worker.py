@@ -33,6 +33,8 @@ from earthdata_mcp.jobs.state import TERMINAL_STATES, JobState
 from earthdata_mcp.providers.base import JobRef, RetrievalProvider
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.providers.request_spec import RequestSpec
+from earthdata_mcp.workspace.models import ProvenanceEventType
+from earthdata_mcp.workspace.provenance import ProvenanceStore
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,20 @@ def _session_factory(ctx: dict[str, Any]):
     return factory
 
 
+def _provenance(ctx: dict[str, Any]) -> ProvenanceStore:
+    """Return the ctx-cached :class:`ProvenanceStore`, building it once.
+
+    Mirrors :func:`_session_factory`'s ctx-caching convention rather than reusing
+    ``tools/retrieval.py``'s module-global singleton, so the worker doesn't mix two
+    different lifecycle-caching strategies.
+    """
+    store = ctx.get("provenance")
+    if store is None:
+        store = ProvenanceStore(_session_factory(ctx))
+        ctx["provenance"] = store
+    return store
+
+
 # -- lifecycle tasks --------------------------------------------------------
 
 
@@ -93,6 +109,16 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
                 job_id,
                 exc,
             )
+            await _provenance(ctx).record_event(
+                spec.workspace_id,
+                spec.obs_handle,
+                ProvenanceEventType.PROVIDER_FALLBACK,
+                detail={
+                    "from_provider": "harmony",
+                    "to_provider": "opendap",
+                    "reason": {"error_type": type(exc).__name__, "message": str(exc)},
+                },
+            )
             async with session_factory() as session:
                 job = await crud.get_job(session, job_id)
                 if job is None:
@@ -116,6 +142,12 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
             JobState.SUBMITTED,
             provider_job_url=ref.provider_job_url,
         )
+    await _provenance(ctx).record_event(
+        spec.workspace_id,
+        spec.obs_handle,
+        ProvenanceEventType.SUBMITTED,
+        detail={"provider": spec.provider},
+    )
     await ctx["redis"].enqueue_job("poll_job", job_id)
 
 
@@ -204,6 +236,17 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
             },
         )
 
+    await _provenance(ctx).record_event(
+        spec.workspace_id,
+        spec.obs_handle,
+        ProvenanceEventType.MATERIALIZED,
+        detail={
+            "provider": spec.provider,
+            "storage_key": result.storage_key,
+            "media_type": result.media_type,
+            "size_bytes": result.size_bytes,
+        },
+    )
     async with session_factory() as session:
         await crud.transition_state(session, job_id, JobState.READY, progress=100)
 

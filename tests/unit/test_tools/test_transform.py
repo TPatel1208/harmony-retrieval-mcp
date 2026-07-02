@@ -324,6 +324,29 @@ async def test_resample_requires_a_parameter(
         )
 
 
+async def test_resample_invalid_time_freq_raises_clear_value_error(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """A deprecated/invalid pandas alias must not leak pandas' raw exception text.
+
+    ``"M"`` was deprecated in favor of ``"ME"``; pandas' own message
+    ("no longer supported for offsets...") is internal wording callers shouldn't
+    have to parse. The re-raised error must name the bad value and point to valid
+    alternatives instead.
+    """
+    ds = _tempo_like_grid("no2", include_time_units=True)
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, ds)
+
+    with pytest.raises(ValueError, match="'M'") as exc_info:
+        await resample(
+            src, time_freq="M", workspace_id=workspace_id,
+            **_deps(workspace_store, provenance_store, local_backend),
+        )
+    message = str(exc_info.value)
+    assert "no longer supported for offsets" not in message
+    assert "ME" in message
+
+
 # -- convert_format --------------------------------------------------------
 
 

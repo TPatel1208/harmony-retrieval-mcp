@@ -57,6 +57,8 @@ class ProvenanceEventType(StrEnum):
     """First-class provenance events (PLAN.md §4.5)."""
 
     CREATED = "created"
+    SUBMITTED = "submitted"
+    PROVIDER_FALLBACK = "provider-fallback"
     MATERIALIZED = "materialized"
     EXPIRED = "expired"
     RE_MATERIALIZED = "re-materialized"
@@ -111,8 +113,8 @@ class ProvenanceEdge(Base):
 
 
 class ProvenanceEvent(Base):
-    """A first-class lineage event (``created``/``materialized``/``expired``/
-    ``re-materialized``) attached to a handle."""
+    """A first-class lineage event (``created``/``submitted``/``provider-fallback``/
+    ``materialized``/``expired``/``re-materialized``) attached to a handle."""
 
     __tablename__ = "provenance_events"
 
