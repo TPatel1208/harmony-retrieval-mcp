@@ -20,6 +20,7 @@ payloads — never from anything ephemeral.
 from __future__ import annotations
 
 from earthdata_mcp.config import Settings, get_settings
+from earthdata_mcp.providers.base import normalize_time_range
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.handles import resolve_aoi, resolve_dataset
@@ -31,6 +32,24 @@ _SIZE_SAMPLE_LIMIT = 50
 
 #: Sample size for ``check_coverage``'s eyeball list.
 _COVERAGE_SAMPLE_LIMIT = 10
+
+#: The literal that opts a coverage tool into querying the whole archive
+#: (PRD 003) — any other empty/whitespace ``time_range`` is a validation error,
+#: never a silent "all time".
+_ALL_TIME_TOKEN = "all"
+
+
+def _coverage_time_window(time_range: str) -> tuple[str | None, bool]:
+    """Resolve a coverage tool's ``time_range`` into ``(cmr_temporal, all_time)``.
+
+    The literal ``"all"`` (case-insensitive) is the one documented escape
+    hatch for "no time bound" — every other value goes through
+    :func:`normalize_time_range`, which raises before any CMR call rather than
+    silently treating empty/whitespace as "all time".
+    """
+    if time_range.strip().lower() == _ALL_TIME_TOKEN:
+        return None, True
+    return normalize_time_range(time_range), False
 
 
 async def check_coverage(
@@ -52,20 +71,26 @@ async def check_coverage(
     reported as ``sampled_granules``. Full granule records (URs, URLs, sizes)
     are ``inspect_granules``'s job — this tool answers "is it there", not "what
     is it".
+
+    ``time_range`` accepts ``start/end`` or ``start,end`` with ISO-8601
+    endpoints (date-only or full timestamp, open ranges allowed); empty input
+    is rejected before any CMR call. Pass the literal ``"all"`` to query the
+    whole archive deliberately — the response then carries ``all_time: true``.
     """
     cmr = cmr or CMRProvider()
     store = store or _default_store()
+    temporal, all_time = _coverage_time_window(time_range)
 
     concept_id, bbox_str = await _resolve_handles(
         dataset_handle, aoi_handle, workspace_id, store
     )
     availability = await cmr.check_availability(
-        concept_id, bounding_box=bbox_str, temporal=time_range
+        concept_id, bounding_box=bbox_str, temporal=temporal
     )
     granules = await cmr.search_granules(
         concept_id,
         bounding_box=bbox_str,
-        temporal=time_range,
+        temporal=temporal,
         limit=_COVERAGE_SAMPLE_LIMIT,
     )
     sample = [
@@ -81,6 +106,7 @@ async def check_coverage(
         "dataset_handle": dataset_handle,
         "aoi_handle": aoi_handle,
         "time_range": time_range,
+        "all_time": all_time,
         "granule_count": availability["granule_count"],
         "covered": availability["available"],
         "sampled_granules": len(sample),
@@ -97,20 +123,28 @@ async def check_availability(
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
 ) -> dict:
-    """Fast count-only availability check — uses CMR-Hits, fetches no granule data."""
+    """Fast count-only availability check — uses CMR-Hits, fetches no granule data.
+
+    ``time_range`` accepts ``start/end`` or ``start,end`` with ISO-8601
+    endpoints (date-only or full timestamp, open ranges allowed); empty input
+    is rejected before any CMR call. Pass the literal ``"all"`` to query the
+    whole archive deliberately — the response then carries ``all_time: true``.
+    """
     cmr = cmr or CMRProvider()
     store = store or _default_store()
+    temporal, all_time = _coverage_time_window(time_range)
 
     concept_id, bbox_str = await _resolve_handles(
         dataset_handle, aoi_handle, workspace_id, store
     )
     result = await cmr.check_availability(
-        concept_id, bounding_box=bbox_str, temporal=time_range
+        concept_id, bounding_box=bbox_str, temporal=temporal
     )
     return {
         "dataset_handle": dataset_handle,
         "aoi_handle": aoi_handle,
         "time_range": time_range,
+        "all_time": all_time,
         "available": result["available"],
         "granule_count": result["granule_count"],
     }
@@ -126,9 +160,16 @@ async def inspect_granules(
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
 ) -> dict:
-    """Return up to ``limit`` granule records (CMR caps the effective limit at 50)."""
+    """Return up to ``limit`` granule records (CMR caps the effective limit at 50).
+
+    ``time_range`` accepts ``start/end`` or ``start,end`` with ISO-8601
+    endpoints (date-only or full timestamp, open ranges allowed); empty input
+    is rejected before any CMR call. Pass the literal ``"all"`` to query the
+    whole archive deliberately — the response then carries ``all_time: true``.
+    """
     cmr = cmr or CMRProvider()
     store = store or _default_store()
+    temporal, all_time = _coverage_time_window(time_range)
 
     concept_id, bbox_str = await _resolve_handles(
         dataset_handle, aoi_handle, workspace_id, store
@@ -136,13 +177,14 @@ async def inspect_granules(
     granules = await cmr.search_granules(
         concept_id,
         bounding_box=bbox_str,
-        temporal=time_range,
+        temporal=temporal,
         limit=limit,
     )
     return {
         "dataset_handle": dataset_handle,
         "aoi_handle": aoi_handle,
         "time_range": time_range,
+        "all_time": all_time,
         "granules": granules,
         "count": len(granules),
     }
@@ -172,22 +214,30 @@ async def estimate_retrieval_size(
     ~10 GB), ``warning`` instead advises narrowing the AOI, time window, or
     variables before any byte moves — the no-granules/no-sizes warnings above
     take priority since they are mutually exclusive with a large estimate.
+
+    ``time_range`` accepts ``start/end`` or ``start,end`` with ISO-8601
+    endpoints (date-only or full timestamp, open ranges allowed); empty input
+    is rejected before any CMR call. Pass the literal ``"all"`` to query the
+    whole archive deliberately — the response then carries ``all_time: true``
+    (and, being unbounded, is exactly the case this tool's size warning exists
+    to catch).
     """
     cmr = cmr or CMRProvider()
     store = store or _default_store()
     settings = settings or get_settings()
+    temporal, all_time = _coverage_time_window(time_range)
 
     concept_id, bbox_str = await _resolve_handles(
         dataset_handle, aoi_handle, workspace_id, store
     )
     availability = await cmr.check_availability(
-        concept_id, bounding_box=bbox_str, temporal=time_range
+        concept_id, bounding_box=bbox_str, temporal=temporal
     )
     total_granules = availability["granule_count"]
     granules = await cmr.search_granules(
         concept_id,
         bounding_box=bbox_str,
-        temporal=time_range,
+        temporal=temporal,
         limit=_SIZE_SAMPLE_LIMIT,
     )
 
@@ -213,6 +263,7 @@ async def estimate_retrieval_size(
         "dataset_handle": dataset_handle,
         "aoi_handle": aoi_handle,
         "time_range": time_range,
+        "all_time": all_time,
         "total_granules": total_granules,
         "sampled_granules": len(granules),
         "avg_size_mb": round(avg_size_mb, 3),

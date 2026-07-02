@@ -58,6 +58,75 @@ class TimeRange:
         return cls(start=_parse_iso(start_s), end=_parse_iso(end_s))
 
 
+#: The grammar every ``time_range``-accepting tool enforces (PRD 003). Quoted
+#: verbatim in every rejection so a caller can self-correct in one step.
+_TIME_RANGE_GRAMMAR = (
+    "time_range must be 'start/end' or 'start,end' with ISO-8601 endpoints "
+    "(date-only like '2024-01-01', or a full timestamp with an optional 'Z' "
+    "suffix); open ranges omit one side, e.g. 'start/' or '/end'"
+)
+
+
+def normalize_time_range(value: str, *, allow_open: bool = True) -> str:
+    """Parse the union ``time_range`` grammar into the canonical ``start/end`` form.
+
+    Both CMR delimiters (``/`` and ``,``) are accepted, so a string copied
+    verbatim from ``check_coverage`` into ``retrieve_data`` — or vice versa —
+    always parses (PRD 003). Endpoints may be date-only or a full ISO-8601
+    timestamp with an optional ``Z`` suffix. Raises ``ValueError`` — quoting
+    :data:`_TIME_RANGE_GRAMMAR` — for empty/whitespace input, a single instant
+    with no delimiter, an unparseable endpoint, or ``end < start``; this is a
+    pure, side-effect-free check so it always runs before any network call.
+
+    ``allow_open=False`` additionally rejects a range missing either bound:
+    retrieval tools need both to build a closed :class:`TimeRange`, while
+    coverage tools may pass ``allow_open=True`` (the default) to keep CMR's
+    open-range forms working.
+    """
+    if value is None or not value.strip():
+        raise ValueError(
+            f"time_range is required and cannot be empty. {_TIME_RANGE_GRAMMAR}"
+        )
+    text = value.strip()
+    if "/" in text:
+        delim = "/"
+    elif "," in text:
+        delim = ","
+    else:
+        raise ValueError(
+            f"time_range {value!r} has no '/' or ',' delimiter. {_TIME_RANGE_GRAMMAR}"
+        )
+
+    start_s, _, end_s = text.partition(delim)
+    start_s, end_s = start_s.strip(), end_s.strip()
+    if not start_s and not end_s:
+        raise ValueError(
+            f"time_range {value!r} needs at least one bound. {_TIME_RANGE_GRAMMAR}"
+        )
+    if not allow_open and (not start_s or not end_s):
+        raise ValueError(
+            f"time_range {value!r} must specify both a start and an end. "
+            f"{_TIME_RANGE_GRAMMAR}"
+        )
+
+    start_dt = _parse_time_range_endpoint(start_s) if start_s else None
+    end_dt = _parse_time_range_endpoint(end_s) if end_s else None
+    if start_dt is not None and end_dt is not None and end_dt < start_dt:
+        raise ValueError(
+            f"time_range {value!r} has end before start. {_TIME_RANGE_GRAMMAR}"
+        )
+    return f"{start_s}/{end_s}"
+
+
+def _parse_time_range_endpoint(text: str) -> datetime:
+    try:
+        return _parse_iso(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"time_range endpoint {text!r} is not ISO-8601. {_TIME_RANGE_GRAMMAR}"
+        ) from exc
+
+
 @dataclass(frozen=True)
 class AOI:
     """An area of interest: a bbox, a GeoJSON geometry, or both.

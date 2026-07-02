@@ -16,6 +16,7 @@ import pytest
 from earthdata_mcp.config import Settings
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.tools.coverage import (
+    _COVERAGE_SAMPLE_LIMIT,
     check_availability,
     check_coverage,
     estimate_retrieval_size,
@@ -95,6 +96,55 @@ async def _seed_aoi(store, workspace_id: str) -> str:
 # -- check_availability ---------------------------------------------------
 
 
+async def test_check_availability_accepts_comma_form_same_as_slash(
+    fake_cmr, workspace_store, workspace_id
+) -> None:
+    """PRD 003: the comma form CMR itself accepts must normalize identically
+    to the slash form already used by ``_TIME``."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    comma_time = "2024-01-01,2024-03-31"
+
+    out = await check_availability(
+        ds, aoi, comma_time, workspace_id=workspace_id, cmr=fake_cmr, store=workspace_store
+    )
+
+    assert out["available"] is True
+    fake_cmr.check_availability.assert_awaited_once_with(
+        _CONCEPT_ID, bounding_box=_BBOX_STR, temporal=_TIME
+    )
+
+
+async def test_check_availability_empty_raises_before_cmr_call(
+    fake_cmr, workspace_store, workspace_id
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        await check_availability(
+            ds, aoi, "", workspace_id=workspace_id, cmr=fake_cmr, store=workspace_store
+        )
+    fake_cmr.check_availability.assert_not_awaited()
+    fake_cmr.search_granules.assert_not_awaited()
+
+
+async def test_check_availability_all_time_token_queries_whole_archive(
+    fake_cmr, workspace_store, workspace_id
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await check_availability(
+        ds, aoi, "all", workspace_id=workspace_id, cmr=fake_cmr, store=workspace_store
+    )
+
+    assert out["all_time"] is True
+    fake_cmr.check_availability.assert_awaited_once_with(
+        _CONCEPT_ID, bounding_box=_BBOX_STR, temporal=None
+    )
+
+
 async def test_check_availability_resolves_and_delegates(
     fake_cmr, workspace_store, workspace_id
 ) -> None:
@@ -148,6 +198,39 @@ async def test_check_coverage_returns_sample_granules(
     )
 
 
+async def test_check_coverage_empty_raises_before_cmr_call(
+    fake_cmr, workspace_store, workspace_id
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        await check_coverage(
+            ds, aoi, "  ", workspace_id=workspace_id, cmr=fake_cmr, store=workspace_store
+        )
+    fake_cmr.check_availability.assert_not_awaited()
+    fake_cmr.search_granules.assert_not_awaited()
+
+
+async def test_check_coverage_all_time_token_acknowledged_in_response(
+    fake_cmr, workspace_store, workspace_id
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await check_coverage(
+        ds, aoi, "ALL", workspace_id=workspace_id, cmr=fake_cmr, store=workspace_store
+    )
+
+    assert out["all_time"] is True
+    fake_cmr.check_availability.assert_awaited_once_with(
+        _CONCEPT_ID, bounding_box=_BBOX_STR, temporal=None
+    )
+    fake_cmr.search_granules.assert_awaited_once_with(
+        _CONCEPT_ID, bounding_box=_BBOX_STR, temporal=None, limit=_COVERAGE_SAMPLE_LIMIT
+    )
+
+
 async def test_check_coverage_empty_is_not_covered(
     workspace_store, workspace_id
 ) -> None:
@@ -171,6 +254,19 @@ async def test_check_coverage_empty_is_not_covered(
 
 
 # -- inspect_granules -----------------------------------------------------
+
+
+async def test_inspect_granules_empty_raises_before_cmr_call(
+    fake_cmr, workspace_store, workspace_id
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        await inspect_granules(
+            ds, aoi, "", workspace_id=workspace_id, cmr=fake_cmr, store=workspace_store
+        )
+    fake_cmr.search_granules.assert_not_awaited()
 
 
 async def test_inspect_granules_forwards_limit(
@@ -197,6 +293,36 @@ async def test_inspect_granules_forwards_limit(
 
 
 # -- estimate_retrieval_size ----------------------------------------------
+
+
+async def test_estimate_retrieval_size_empty_raises_before_cmr_call(
+    fake_cmr, workspace_store, workspace_id
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        await estimate_retrieval_size(
+            ds, aoi, "", workspace_id=workspace_id, cmr=fake_cmr, store=workspace_store
+        )
+    fake_cmr.check_availability.assert_not_awaited()
+    fake_cmr.search_granules.assert_not_awaited()
+
+
+async def test_estimate_retrieval_size_all_time_token_acknowledged(
+    fake_cmr, workspace_store, workspace_id
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await estimate_retrieval_size(
+        ds, aoi, "all", workspace_id=workspace_id, cmr=fake_cmr, store=workspace_store
+    )
+
+    assert out["all_time"] is True
+    fake_cmr.check_availability.assert_awaited_once_with(
+        _CONCEPT_ID, bounding_box=_BBOX_STR, temporal=None
+    )
 
 
 async def test_estimate_retrieval_size_extrapolates_from_sample(

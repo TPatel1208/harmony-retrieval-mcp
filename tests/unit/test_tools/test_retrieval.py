@@ -401,6 +401,66 @@ async def test_retrieve_data_returns_handles(
     assert mock_enqueue.await_args.args[0] == "submit_job"
 
 
+async def test_retrieve_data_accepts_comma_form_same_as_slash(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """PRD 003: the comma form ``check_coverage`` accepts (and CMR itself
+    accepts) must produce the exact same persisted spec as the slash form —
+    the natural check-then-retrieve workflow must never fail on format."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    comma_time = "2024-01-01,2024-03-31"
+
+    out = await retrieve_data(
+        ds, aoi, comma_time, workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    assert job.request_spec["time_range"] == _TIME
+
+
+async def test_retrieve_data_empty_time_range_raises_no_orphan_job(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """PRD 003: empty is never silently "all time" for retrieval tools — the
+    plan always needs a bounded range, and validation runs before any handle
+    is minted, so a rejected call leaves no orphan job/obs handle behind."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        await retrieve_data(
+            ds, aoi, "", workspace_id=workspace_id,
+            **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+        )
+
+    obs_handles = await workspace_store.list_handles(workspace_id, HandleType.OBS)
+    job_handles = await workspace_store.list_handles(workspace_id, HandleType.JOB)
+    assert obs_handles == []
+    assert job_handles == []
+    mock_enqueue.assert_not_awaited()
+
+
+async def test_retrieve_data_open_range_rejected(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """Retrieval tools need a closed range (both bounds) unlike coverage tools,
+    which may accept an open range."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    with pytest.raises(ValueError, match="must specify both a start and an end"):
+        await retrieve_data(
+            ds, aoi, "2024-01-01/", workspace_id=workspace_id,
+            **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+        )
+
+
 async def test_retrieve_data_creates_pending_job_in_db(
     grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
     workspace_id,
@@ -634,6 +694,37 @@ async def test_retrieve_data_collects_all_window_granules_for_opendap_fallback(
 # -- retrieve_subset -------------------------------------------------------
 
 
+async def test_retrieve_subset_accepts_comma_form_same_as_slash(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_subset(
+        ds, aoi, "2024-01-01,2024-03-31", ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    assert job.request_spec["time_range"] == _TIME
+
+
+async def test_retrieve_subset_empty_time_range_raises(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        await retrieve_subset(
+            ds, aoi, "", ["NDVI"], workspace_id=workspace_id,
+            **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+        )
+
+
 async def test_retrieve_subset_sets_variable_flag(
     grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
     workspace_id,
@@ -655,6 +746,35 @@ async def test_retrieve_subset_sets_variable_flag(
 
 
 # -- retrieve_timeseries ---------------------------------------------------
+
+
+async def test_retrieve_timeseries_accepts_comma_form_same_as_slash(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+
+    out = await retrieve_timeseries(
+        ds, "2024-01-01,2024-03-31", ["NDVI"], workspace_id=workspace_id, aoi_handle=None,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    assert job.request_spec["time_range"] == _TIME
+
+
+async def test_retrieve_timeseries_empty_time_range_raises(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        await retrieve_timeseries(
+            ds, "", ["NDVI"], workspace_id=workspace_id, aoi_handle=None,
+            **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+        )
 
 
 async def test_retrieve_timeseries_no_aoi_required(

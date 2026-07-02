@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from earthdata_mcp.config import Settings
 from earthdata_mcp.jobs.state import JobState
 from earthdata_mcp.providers import _capabilities
@@ -24,6 +26,7 @@ from earthdata_mcp.providers.base import (
     RetrievalProvider,
     TimeRange,
     TransformSpec,
+    normalize_time_range,
 )
 from earthdata_mcp.providers.cmr import CMRProvider
 
@@ -122,6 +125,56 @@ def test_aoi_to_bbox_str() -> None:
 def test_job_status_accepts_a_job_state() -> None:
     status = JobStatus(state=JobState.READY, progress=100)
     assert status.state is JobState.READY
+
+
+# -- normalize_time_range (PRD 003) ----------------------------------------
+
+
+def test_normalize_time_range_comma_and_slash_are_equivalent() -> None:
+    slash = normalize_time_range("2024-01-01T00:00:00Z/2024-02-01T00:00:00Z")
+    comma = normalize_time_range("2024-01-01T00:00:00Z,2024-02-01T00:00:00Z")
+    assert slash == comma == "2024-01-01T00:00:00Z/2024-02-01T00:00:00Z"
+
+
+def test_normalize_time_range_accepts_date_only_endpoints() -> None:
+    assert normalize_time_range("2024-01-01/2024-02-01") == "2024-01-01/2024-02-01"
+
+
+def test_normalize_time_range_open_range_default_allowed() -> None:
+    assert normalize_time_range("2024-01-01/") == "2024-01-01/"
+    assert normalize_time_range("/2024-01-01") == "/2024-01-01"
+    assert normalize_time_range(",2024-01-01") == "/2024-01-01"
+
+
+def test_normalize_time_range_open_range_rejected_when_disallowed() -> None:
+    with pytest.raises(ValueError, match="must specify both a start and an end"):
+        normalize_time_range("2024-01-01/", allow_open=False)
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_normalize_time_range_rejects_empty(value) -> None:
+    with pytest.raises(ValueError, match="cannot be empty"):
+        normalize_time_range(value)
+
+
+def test_normalize_time_range_rejects_single_instant_with_no_delimiter() -> None:
+    with pytest.raises(ValueError, match="no '/' or ','"):
+        normalize_time_range("2024-01-01")
+
+
+def test_normalize_time_range_rejects_unparseable_endpoint() -> None:
+    with pytest.raises(ValueError, match="not ISO-8601"):
+        normalize_time_range("not-a-date/2024-01-01")
+
+
+def test_normalize_time_range_rejects_end_before_start() -> None:
+    with pytest.raises(ValueError, match="end before start"):
+        normalize_time_range("2024-02-01/2024-01-01")
+
+
+def test_normalize_time_range_error_names_accepted_forms() -> None:
+    with pytest.raises(ValueError, match="start/end.*start,end"):
+        normalize_time_range("2024-01-01")
 
 
 def test_transform_spec_and_plan_compose() -> None:

@@ -31,7 +31,13 @@ from earthdata_mcp.db import create_engine, create_session_factory
 from earthdata_mcp.jobs import crud
 from earthdata_mcp.jobs.state import TERMINAL_STATES, JobState
 from earthdata_mcp.providers.appeears import AppEEARSProvider
-from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, TransformSpec
+from earthdata_mcp.providers.base import (
+    AOI,
+    RetrievalPlan,
+    TimeRange,
+    TransformSpec,
+    normalize_time_range,
+)
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.providers.harmony import HarmonyProvider
 from earthdata_mcp.providers.opendap import (
@@ -128,6 +134,12 @@ async def retrieve_data(
     Mints a durable job and returns ``{job_handle, obs_handle, status, provider}``.
     Format defaults by the collection's shape (grid → Zarr) unless ``output_format``
     is given.
+
+    ``time_range`` accepts ``start/end`` or ``start,end`` with ISO-8601
+    endpoints (date-only or full timestamp) — the same grammar the coverage
+    tools accept, so a string copied from ``check_coverage`` always parses
+    here too. Both bounds are required (no open ranges) and empty input is
+    rejected before any handle, CMR, or DB call.
     """
     return await _submit_retrieval(
         dataset_handle=dataset_handle,
@@ -138,7 +150,7 @@ async def retrieve_data(
         output_format=output_format,
         needs_bbox=True,
         needs_variable=False,
-        needs_temporal=bool(time_range),
+        needs_temporal=True,
         needs_point_sample=False,
         cmr=cmr,
         store=store,
@@ -166,7 +178,13 @@ async def retrieve_subset(
 
     Harmony is tried first: a single service that does all three is pinned; if none
     does (the union-trap case), Harmony is submitted unpinned and the server picks
-    the chain. OPeNDAP is the worker's runtime fallback if that submit fails."""
+    the chain. OPeNDAP is the worker's runtime fallback if that submit fails.
+
+    ``time_range`` accepts ``start/end`` or ``start,end`` with ISO-8601
+    endpoints (date-only or full timestamp) — the same grammar the coverage
+    tools accept. Both bounds are required (no open ranges) and empty input is
+    rejected before any handle, CMR, or DB call.
+    """
     return await _submit_retrieval(
         dataset_handle=dataset_handle,
         aoi_handle=aoi_handle,
@@ -176,7 +194,7 @@ async def retrieve_subset(
         output_format=output_format,
         needs_bbox=True,
         needs_variable=True,
-        needs_temporal=bool(time_range),
+        needs_temporal=True,
         needs_point_sample=False,
         cmr=cmr,
         store=store,
@@ -211,6 +229,11 @@ async def retrieve_timeseries(
     tabular series — so the result defaults to Parquet, never a Zarr cube. The
     ``aoi_handle`` then carries the sample point (a degenerate point bbox is the
     common case).
+
+    ``time_range`` accepts ``start/end`` or ``start,end`` with ISO-8601
+    endpoints (date-only or full timestamp) — the same grammar the coverage
+    tools accept. Both bounds are required (no open ranges) and empty input is
+    rejected before any handle, CMR, or DB call.
     """
     return await _submit_retrieval(
         dataset_handle=dataset_handle,
@@ -221,7 +244,7 @@ async def retrieve_timeseries(
         output_format=output_format,
         needs_bbox=aoi_handle is not None and not point_sample,
         needs_variable=True,
-        needs_temporal=bool(time_range),
+        needs_temporal=True,
         needs_point_sample=point_sample,
         cmr=cmr,
         store=store,
@@ -327,6 +350,10 @@ async def _submit_retrieval(
     Order matters: routing happens **before** any handle or row is created, so an
     unserviceable request (``NotRetrievable``) leaves no orphan job behind.
     """
+    # allow_open=False: TimeRange.from_cmr below needs both bounds to build a
+    # closed range, unlike the coverage tools' open-range-friendly grammar.
+    time_range = normalize_time_range(time_range, allow_open=False)
+
     cmr = cmr or CMRProvider()
     store = store or _default_store()
     provenance = provenance or _default_provenance()
