@@ -355,6 +355,47 @@ def test_statistics_fused_matches_eager():
     assert fused["ndvi"]["count"] == eager["ndvi"]["count"]
 
 
+def _grid_with_fill_and_valid_range() -> xr.Dataset:
+    """A grid whose ``ndvi`` carries a fill value and out-of-range values.
+
+    Values are ``[-1e30 (fill), 1, 2, 3, 4, 999 (out of valid_range)]``; masking
+    should drop the fill and the out-of-range outlier, leaving ``[1, 2, 3, 4]``.
+    """
+    ds = xr.Dataset(
+        {
+            "ndvi": (
+                ("lat", "lon"),
+                np.array([[-1e30, 1.0, 2.0], [3.0, 4.0, 999.0]], dtype="float32"),
+            )
+        },
+        coords={"lat": [37.0, 38.0], "lon": [-105.0, -104.5, -104.0]},
+    )
+    ds["ndvi"].attrs["_FillValue"] = np.float32(-1e30)
+    ds["ndvi"].attrs["valid_range"] = [0.0, 10.0]
+    return ds
+
+
+def test_statistics_masks_fill_and_valid_range():
+    from earthdata_mcp.tools.preview import _statistics
+
+    stats = _statistics(_grid_with_fill_and_valid_range(), None)["ndvi"]
+    assert stats["min"] == 1.0
+    assert stats["max"] == 4.0
+    assert stats["mean"] == pytest.approx(2.5)
+    assert stats["count"] == 4
+
+
+def test_statistics_fused_masks_fill_and_valid_range():
+    from earthdata_mcp.tools.preview import _statistics_fused
+
+    ds = _grid_with_fill_and_valid_range().chunk({"lat": 1, "lon": 1})
+    stats = _statistics_fused(ds, None)["ndvi"]
+    assert stats["min"] == 1.0
+    assert stats["max"] == 4.0
+    assert stats["mean"] == pytest.approx(2.5)
+    assert stats["count"] == 4
+
+
 async def test_inspect_statistics_takes_fused_path(
     workspace_store, local_backend, workspace_id, monkeypatch
 ):
