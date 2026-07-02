@@ -269,6 +269,31 @@ async def test_summarize_materialized_cube(
     assert "ndvi" in out["summary"]["data_vars"]
 
 
+async def test_summarize_materialized_result_with_numpy_attrs_is_json_safe(
+    workspace_store, local_backend, workspace_id
+):
+    """Regression: summarize_dataset threw "Output validation error: outputSchema
+    defined but no structured output returned" on a real obs_ handle — the
+    underlying cause was numpy scalar attrs (np.int32/np.float64, as h5netcdf
+    reads netCDF global attributes) surviving into the returned dict, which
+    FastMCP's output-schema JSON serialization can't handle."""
+    import json
+
+    ds = _grid()
+    ds.attrs["scan_num"] = np.int32(17)
+    ds.attrs["version_id"] = np.int64(4)
+    ds.attrs["lon_min"] = np.float32(-105.0)
+    cube = await _seed_cube(workspace_store, local_backend, workspace_id, ds)
+
+    out = await summarize_dataset(
+        cube, workspace_id=workspace_id, store=workspace_store, storage=local_backend
+    )
+
+    json.dumps(out)  # must not raise TypeError
+    assert out["summary"]["attrs"]["scan_num"] == 17
+    assert isinstance(out["summary"]["attrs"]["scan_num"], int)
+
+
 async def test_summarize_unmaterialized_obs_returns_status(
     workspace_store, workspace_id
 ):

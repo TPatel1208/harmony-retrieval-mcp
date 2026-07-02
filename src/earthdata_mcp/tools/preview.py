@@ -333,7 +333,7 @@ def _summarize_obj(obj: xr.Dataset | pa.Table) -> dict:
             "dims": {str(k): int(v) for k, v in obj.sizes.items()},
             "data_vars": [str(v) for v in obj.data_vars],
             "coords": [str(c) for c in obj.coords],
-            "attrs": {str(k): obj.attrs[k] for k in obj.attrs},
+            "attrs": {str(k): _json_safe(v) for k, v in obj.attrs.items()},
         }
     return {
         "type": "table",
@@ -341,6 +341,22 @@ def _summarize_obj(obj: xr.Dataset | pa.Table) -> dict:
         "columns": list(obj.column_names),
         "schema": {f.name: str(f.type) for f in obj.schema},
     }
+
+
+def _json_safe(value):
+    """Coerce a netCDF global-attribute value to a JSON-serializable type.
+
+    netCDF attrs commonly come back as numpy scalars/arrays (``np.int32``,
+    ``np.float64``, ...) via h5netcdf. Those aren't JSON-serializable, so left
+    as-is they fail MCP output-schema serialization with a generic "Output
+    validation error" that hides the real ``TypeError`` — every other summary
+    field survives, only the attrs blob needs normalizing.
+    """
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
 
 
 # -- inspect_statistics ----------------------------------------------------

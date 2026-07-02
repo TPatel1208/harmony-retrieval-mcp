@@ -163,39 +163,43 @@ def open_result_lazy(
                 ds.close()
 
     elif media_type == NETCDF_BUNDLE_MEDIA_TYPE:
-        # Extract to temp, open with open_mfdataset — dask defers chunk reads
-        # until compute time, which happens before the temp dir is removed.
+        # Extract to temp; each member is opened group-flattened (chunks="auto"
+        # keeps it dask-backed) the same way the eager _open_netcdf_bundle path
+        # does — a plain open_dataset/open_mfdataset here would read only each
+        # member's root group and surface no data for grouped (TEMPO/OMI)
+        # products, since their science variables live under /product,
+        # /geolocation subgroups.
         with tempfile.TemporaryDirectory() as tmp:
             with zipfile.ZipFile(path) as zf:
                 zf.extractall(tmp)
             member_paths = sorted(p for p in Path(tmp).iterdir() if p.is_file())
             if not member_paths:
                 raise UnsupportedMediaType("netCDF bundle is empty")
-            if len(member_paths) == 1:
-                ds = xr.open_dataset(
-                    member_paths[0],
-                    engine=_NETCDF_ENGINE,
-                    chunks="auto",
-                    decode_times=False,
-                )
-                try:
-                    yield ds
-                finally:
-                    ds.close()
-            else:
-                ds = xr.open_mfdataset(
-                    member_paths,
-                    engine=_NETCDF_ENGINE,
-                    chunks="auto",
-                    concat_dim=_BUNDLE_CONCAT_DIM,
-                    combine="nested",
-                    preprocess=_strip_unsafe_coord_attrs,
-                    decode_times=False,
-                )
-                try:
-                    yield ds
-                finally:
-                    ds.close()
+            all_groups: list[dict[str, xr.Dataset]] = []
+            try:
+                members = []
+                for member_path in member_paths:
+                    groups = xr.open_groups(
+                        member_path,
+                        engine=_NETCDF_ENGINE,
+                        chunks="auto",
+                        decode_times=False,
+                    )
+                    all_groups.append(groups)
+                    members.append(
+                        _decode_member_time(
+                            _synthesize_bundle_time_coord(_merge_groups(groups))
+                        )
+                    )
+                if len(members) == 1:
+                    yield members[0]
+                else:
+                    normalized = [_strip_unsafe_coord_attrs(ds) for ds in members]
+                    yield xr.concat(normalized, dim=_BUNDLE_CONCAT_DIM)
+            finally:
+                for groups in all_groups:
+                    for ds in groups.values():
+                        ds.close()
 
     elif media_type == PARQUET_MEDIA_TYPE:
         yield pq.read_table(path, columns=variables)
