@@ -66,6 +66,16 @@ async def test_get_missing_handle_raises(
         await workspace_store.get_handle(workspace_id, "dataset_doesnotexist")
 
 
+def test_handle_not_found_error_str_is_not_a_bare_key_repr() -> None:
+    """``HandleNotFoundError`` subclasses ``KeyError`` for callers that match on
+    it, but left un-overridden ``KeyError.__str__`` renders as bare
+    ``repr(args[0])`` — indistinguishable from an unhandled ``KeyError`` once it
+    reaches the MCP client as a tool error string."""
+    err = HandleNotFoundError("dataset_doesnotexist")
+    assert str(err) != "'dataset_doesnotexist'"
+    assert "dataset_doesnotexist" in str(err)
+
+
 async def test_list_handles_filters_by_type(
     workspace_store: WorkspaceStore, workspace_id: str
 ) -> None:

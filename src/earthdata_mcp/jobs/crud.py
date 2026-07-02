@@ -27,7 +27,16 @@ from earthdata_mcp.jobs.state import (
 
 
 class JobNotFoundError(KeyError):
-    """No job with this id/handle exists."""
+    """No job with this id/handle exists.
+
+    Subclasses ``KeyError`` for callers that pattern-match on it, but
+    ``KeyError.__str__`` renders as ``repr(args[0])`` regardless of subclass —
+    left un-overridden, that bare ``'some_job'`` is what reaches the MCP
+    client as the tool error, indistinguishable from an unhandled ``KeyError``.
+    """
+
+    def __str__(self) -> str:
+        return f"unknown job: {self.args[0]!r}"
 
 
 async def create_job(

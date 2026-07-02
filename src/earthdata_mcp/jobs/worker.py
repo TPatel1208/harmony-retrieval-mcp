@@ -80,6 +80,22 @@ def _provenance(ctx: dict[str, Any]) -> ProvenanceStore:
     return store
 
 
+def _exc_message(exc: BaseException) -> str:
+    """A clean, human-readable message for an exception — never a raw args tuple.
+
+    harmony-py raises plain ``Exception(response.reason, message)`` on a failed
+    submit/poll (two positional args). Left to Python's default
+    ``BaseException.__str__``, a multi-arg exception renders as ``repr(args)`` —
+    e.g. ``('Unprocessable Entity', 'Error: the requested combination of
+    operations...')`` — a raw Python tuple leaking straight into a job's stored
+    ``error`` and from there to the MCP client. Joining the args reads as one
+    sentence instead.
+    """
+    if len(exc.args) > 1:
+        return ": ".join(str(a) for a in exc.args)
+    return str(exc) or type(exc).__name__
+
+
 # -- lifecycle tasks --------------------------------------------------------
 
 
@@ -121,7 +137,7 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
                 detail={
                     "from_provider": "harmony",
                     "to_provider": "opendap",
-                    "reason": {"error_type": type(exc).__name__, "message": str(exc)},
+                    "reason": {"error_type": type(exc).__name__, "message": _exc_message(exc)},
                 },
             )
             async with session_factory() as session:
@@ -142,7 +158,7 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
                 detail={
                     "harmony_error": {
                         "error_type": type(exc).__name__,
-                        "message": str(exc),
+                        "message": _exc_message(exc),
                     },
                     "reason": "no_opendap_endpoint_discovered",
                     "output_shape": spec.output_shape,
@@ -151,10 +167,10 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
             )
             error_message = (
                 f"Harmony failed and no OPeNDAP fallback is available for this "
-                f"collection: {exc}"
+                f"collection: {_exc_message(exc)}"
             )
         else:
-            error_message = str(exc)
+            error_message = _exc_message(exc)
         async with session_factory() as session:
             await crud.transition_state(
                 session, job_id, JobState.FAILED, error=error_message
@@ -201,7 +217,7 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
     except Exception as exc:
         async with session_factory() as session:
             await crud.transition_state(
-                session, job_id, JobState.FAILED, error=str(exc)
+                session, job_id, JobState.FAILED, error=_exc_message(exc)
             )
         raise
 
@@ -242,7 +258,7 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
         # inside asyncio.to_thread) which Exception alone does not.
         async with session_factory() as session:
             await crud.transition_state(
-                session, job_id, JobState.FAILED, error=str(exc) or type(exc).__name__
+                session, job_id, JobState.FAILED, error=_exc_message(exc)
             )
         raise
 
