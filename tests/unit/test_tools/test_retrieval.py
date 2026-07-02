@@ -445,6 +445,28 @@ async def test_retrieve_data_defaults_netcdf_for_grid(
     assert job.request_spec["output_shape"] == "grid"
 
 
+async def test_retrieve_data_records_routed_event_for_pinned_service(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """A pinned Harmony route records a ROUTED event naming the pinned service and
+    the plan needs it satisfied — the durable "why" behind the routing decision."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    events = await provenance_store.events(workspace_id, out["obs_handle"])
+    routed = [e for e in events if e.event_type == "routed"]
+    assert len(routed) == 1
+    assert routed[0].detail["path"] == "harmony"
+    assert routed[0].detail["pinned_service"] == "l3-subsetter"
+    assert "bbox" in routed[0].detail["satisfied_needs"]
+
+
 async def test_retrieve_data_routes_to_harmony_when_no_services(
     workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
 ) -> None:
@@ -464,6 +486,13 @@ async def test_retrieve_data_routes_to_harmony_when_no_services(
         job = await get_job_by_handle(session, out["job_handle"])
     assert job.request_spec["service_name"] is None  # unpinned — server picks
     mock_enqueue.assert_awaited_once()
+
+    events = await provenance_store.events(workspace_id, out["obs_handle"])
+    routed = [e for e in events if e.event_type == "routed"]
+    assert len(routed) == 1
+    assert routed[0].detail["pinned_service"] is None
+    assert routed[0].detail["reason"] == "no_registered_services"
+    assert routed[0].detail["services"] == []
 
 
 async def test_retrieve_data_routes_to_harmony_when_no_services_opendap_in_spec(

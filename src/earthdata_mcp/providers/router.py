@@ -25,7 +25,7 @@ enabled). Otherwise even a data-as-is plan goes to Harmony.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from earthdata_mcp.config import Settings, get_settings
@@ -55,11 +55,21 @@ class NotRetrievable(Exception):
 
 @dataclass(frozen=True)
 class RoutingDecision:
-    """The chosen retrieval path. ``service``/``provider`` set where they apply."""
+    """The chosen retrieval path. ``service``/``provider`` set where they apply.
+
+    ``trace`` explains *why* — computed from the capabilities already in hand, so
+    it costs zero extra network calls and never changes the decision itself. For a
+    pinned service it names the service and the plan needs it satisfied; when
+    Harmony is submitted unpinned it lists, per registered service, the first plan
+    need that service failed to satisfy, plus a reason category distinguishing
+    "no single service matched" from "no services are registered at all". For the
+    direct-S3 and AppEEARS shortcuts it records the gate facts that fired them.
+    """
 
     path: Literal["harmony", "direct", "opendap", "appeears"]
     service: ServiceCapability | None = None
     provider: RetrievalProvider | None = None
+    trace: dict = field(default_factory=dict)
 
 
 class Router:
@@ -86,7 +96,15 @@ class Router:
         #    not be forced through Harmony's gridded cube path. Gated on the plan's
         #    point-sample intent, so non-point plans skip it entirely.
         if self._appeears is not None and self._appeears.can_handle(plan):
-            return RoutingDecision("appeears", provider=self._appeears)
+            return RoutingDecision(
+                "appeears",
+                provider=self._appeears,
+                trace={
+                    "path": "appeears",
+                    "reason": "point_sample_intent",
+                    "needs_point_sample": plan.needs_point_sample,
+                },
+            )
 
         # 1. "Data as-is" (no transform) AND we are actually connected to the DAAC's
         #    S3 (in-region + enabled) → direct fetch, skip Harmony. When S3 is not
@@ -97,7 +115,15 @@ class Router:
             and self._caps.direct_s3 is not None
             and _s3_connected(self._caps.direct_s3, self._settings)
         ):
-            return RoutingDecision("direct")
+            return RoutingDecision(
+                "direct",
+                trace={
+                    "path": "direct",
+                    "reason": "data_as_is_in_region_s3",
+                    "region": self._caps.direct_s3.region,
+                    "s3_direct_enabled": self._settings.s3_direct_enabled,
+                },
+            )
 
         # 2. Harmony is always tried first for everything else. Pin the matched
         #    service when one satisfies the whole plan; otherwise submit unpinned and
@@ -106,18 +132,30 @@ class Router:
         #    runtime fallback if this real submit fails.
         if self._harmony is not None:
             svc = self._caps.find_service(plan)
-            return RoutingDecision("harmony", service=svc, provider=self._harmony)
+            trace = _service_trace(self._caps, plan, svc)
+            trace["path"] = "harmony"
+            return RoutingDecision("harmony", service=svc, provider=self._harmony, trace=trace)
 
         # --- Structural fallbacks below: only reachable when Harmony is NOT wired. ---
 
         # 3. A pinned single service still routes to Harmony's slot if one matches.
         svc = self._caps.find_service(plan)
         if svc is not None:
-            return RoutingDecision("harmony", service=svc, provider=self._harmony)
+            trace = _service_trace(self._caps, plan, svc)
+            trace["path"] = "harmony"
+            return RoutingDecision("harmony", service=svc, provider=self._harmony, trace=trace)
 
         # 4. An OPeNDAP provider that can handle the plan.
         if self._opendap is not None and self._opendap.can_handle(plan):
-            return RoutingDecision("opendap", provider=self._opendap)
+            return RoutingDecision(
+                "opendap",
+                provider=self._opendap,
+                trace={
+                    "path": "opendap",
+                    "reason": "harmony_not_wired",
+                    "harmony_unmatched": _service_trace(self._caps, plan, None),
+                },
+            )
 
         # 5. Nothing satisfies it → fail fast at planning time.
         raise NotRetrievable(
@@ -127,6 +165,77 @@ class Router:
             ),
             available=self._caps.services,
         )
+
+
+def _service_trace(
+    caps: CollectionCapabilities, plan: RetrievalPlan, svc: ServiceCapability | None
+) -> dict:
+    """Explain a Harmony service match/non-match, computed from data in hand.
+
+    A match names the pinned service and the plan needs it satisfied. A non-match
+    names, per registered service, the first plan need that service failed to
+    satisfy (mirroring ``find_service``'s own check order — this never
+    re-implements the gate, only narrates it), plus a reason distinguishing "no
+    single service matched" (the union-trap shape) from "no services are
+    registered at all". Never reads the rolled-up top-level union booleans.
+    """
+    if svc is not None:
+        return {
+            "pinned_service": svc.service_name,
+            "pinned_concept_id": svc.concept_id,
+            "satisfied_needs": _plan_need_names(plan),
+        }
+    reason = "no_registered_services" if not caps.services else "no_single_service_satisfies"
+    return {
+        "pinned_service": None,
+        "reason": reason,
+        "services": [
+            {"service_name": s.service_name, "first_unmet_need": _first_unmet_need(s, plan)}
+            for s in caps.services
+        ],
+    }
+
+
+def _plan_need_names(plan: RetrievalPlan) -> list[str]:
+    """The plan needs a matched service satisfied, in ``find_service``'s check order."""
+    needs = []
+    if plan.needs_bbox:
+        needs.append("bbox")
+    if plan.needs_variable:
+        needs.append("variable")
+    if plan.needs_temporal:
+        needs.append("temporal")
+    if plan.needs_shape:
+        needs.append("shape")
+    if plan.needs_dimension:
+        needs.append("dimension")
+    if plan.needs_reproject:
+        needs.append("reproject")
+    needs.append("output_format")
+    return needs
+
+
+def _first_unmet_need(service: ServiceCapability, plan: RetrievalPlan) -> str | None:
+    """The first plan need ``service`` fails to satisfy, or ``None`` if it matches.
+
+    Mirrors ``CollectionCapabilities.find_service``'s check order exactly — this
+    is a narration of that gate, not a second implementation of it.
+    """
+    if plan.needs_bbox and not service.subset_bbox:
+        return "bbox"
+    if plan.needs_variable and not service.subset_variable:
+        return "variable"
+    if plan.needs_temporal and not service.subset_temporal:
+        return "temporal"
+    if plan.needs_shape and not service.subset_shape:
+        return "shape"
+    if plan.needs_dimension and not service.subset_dimension:
+        return "dimension"
+    if plan.needs_reproject and not service.reproject:
+        return "reproject"
+    if plan.output_format not in service.output_formats:
+        return "output_format"
+    return None
 
 
 def _is_data_as_is(plan: RetrievalPlan) -> bool:
