@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import earthdata_mcp.tools.retrieval as _retrieval_module
 from earthdata_mcp.jobs.crud import get_job_by_handle
 from earthdata_mcp.jobs.state import JobState
 from earthdata_mcp.providers._capabilities import (
@@ -37,6 +38,28 @@ from earthdata_mcp.tools.retrieval import (
 )
 from earthdata_mcp.workspace.models import HandleType
 from earthdata_mcp.workspace.store import CrossWorkspaceError
+
+#: AppEEARS layer map for the point-sample tests' "NDVI" variable.
+_APPEEARS_LAYERS = {"NDVI": {"Description": "NDVI"}}
+
+
+@pytest.fixture(autouse=True)
+def _clear_appeears_catalog_cache():
+    """Reset the module-level AppEEARS catalog cache before and after each test."""
+    _retrieval_module._appeears_catalog_cache.clear()
+    yield
+    _retrieval_module._appeears_catalog_cache.clear()
+
+
+def _mock_appeears_catalog_hit(httpx_mock, layers: dict | None = None) -> None:
+    """Mock the AppEEARS login + product-catalog lookup the planning-time check hits."""
+    httpx_mock.add_response(json={"token": "session-tok"})  # POST /login
+    httpx_mock.add_response(json=layers or _APPEEARS_LAYERS)  # GET /product/{id}
+
+
+def _mock_appeears_catalog_miss(httpx_mock) -> None:
+    httpx_mock.add_response(json={"token": "session-tok"})  # POST /login
+    httpx_mock.add_response(status_code=404)  # GET /product/{id} -> not in catalog
 
 _CONCEPT_ID = "C1234567890-LPCLOUD"
 _BBOX = [-105.0, 37.0, -104.0, 38.0]
@@ -657,11 +680,12 @@ async def test_retrieve_timeseries_no_aoi_required(
 
 
 async def test_retrieve_timeseries_point_sample_routes_appeears(
-    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    httpx_mock, grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
     workspace_id,
 ) -> None:
     """point_sample=True is an intent the router honours by routing to AppEEARS
     (§4.4) — tabular, so the format defaults to Parquet, never the grid's Zarr."""
+    _mock_appeears_catalog_hit(httpx_mock)
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
 
@@ -684,6 +708,53 @@ async def test_retrieve_timeseries_point_sample_routes_appeears(
     assert spec["aoi_bbox"] == _BBOX
     assert spec["needs_bbox"] is False
     assert job.provider == "appeears"
+
+
+async def test_retrieve_timeseries_point_sample_catalog_miss_raises_no_job(
+    grid_cmr, httpx_mock, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """A product not in the AppEEARS catalog fails at planning time — before any
+    job row or ``obs_``/``job_`` handle is minted — instead of handing back a
+    handle for a job that can never succeed (WS4 triage item)."""
+    _mock_appeears_catalog_miss(httpx_mock)
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    with pytest.raises(ValueError, match="not in the AppEEARS product catalog"):
+        await retrieve_timeseries(
+            ds, _TIME, ["NDVI"], workspace_id=workspace_id, aoi_handle=aoi,
+            point_sample=True,
+            **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+        )
+
+    # No obs_/job_ handle was minted — assert absence at the store, not on mocks.
+    obs_handles = await workspace_store.list_handles(workspace_id, HandleType.OBS)
+    job_handles = await workspace_store.list_handles(workspace_id, HandleType.JOB)
+    assert obs_handles == []
+    assert job_handles == []
+    mock_enqueue.assert_not_awaited()
+
+
+async def test_retrieve_timeseries_point_sample_catalog_check_cached_per_product(
+    grid_cmr, httpx_mock, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """The catalog check is cached per product id for the process lifetime — a
+    second plan against the same collection costs no extra AppEEARS round-trip."""
+    _mock_appeears_catalog_hit(httpx_mock)  # exactly one login + one product lookup
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    for _ in range(2):
+        await retrieve_timeseries(
+            ds, _TIME, ["NDVI"], workspace_id=workspace_id, aoi_handle=aoi,
+            point_sample=True,
+            **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+        )
+
+    # Only the first call's login + product lookup ever went out.
+    assert len(httpx_mock.get_requests()) == 2
 
 
 # -- get_retrieval_status --------------------------------------------------

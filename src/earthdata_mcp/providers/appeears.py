@@ -103,6 +103,25 @@ class AppEEARSProvider:
 
     # -- lifecycle --------------------------------------------------------
 
+    def product_id(self) -> str:
+        """The AppEEARS product identifier: ``short_name`` plus version when present."""
+        product = self._caps.short_name
+        if self._caps.version:
+            product = f"{product}.{self._caps.version}"
+        return product
+
+    async def check_product_in_catalog(self) -> None:
+        """Raise if this collection's product isn't in the AppEEARS catalog.
+
+        Reuses the same ``GET /product/{id}`` lookup :meth:`submit` performs, so
+        a planning-time caller (the shared retrieval planning core, for a
+        point-sample plan routed here) can fail fast — before any job row or
+        handle is minted — with the identical clear message. ``submit``'s own
+        check stays, so a resumed job remains safe even if this planning-time
+        call was skipped or the catalog changed since.
+        """
+        await self._fetch_layer_map(self.product_id())
+
     async def submit(self, plan: RetrievalPlan) -> JobRef:
         """POST a point task; return its ``task_id`` as the durable coordinate."""
         if not self.can_handle(plan):
@@ -115,9 +134,7 @@ class AppEEARSProvider:
                 "AppEEARS submission requires EDL credentials; "
                 "set EDL_USERNAME and EDL_PASSWORD environment variables"
             )
-        product = self._caps.short_name
-        if self._caps.version:
-            product = f"{product}.{self._caps.version}"
+        product = self.product_id()
         layer_map = await self._fetch_layer_map(product)
         variables = plan.transform.variables if plan.transform else ()
         resolved = self._resolve_layers(product, layer_map, variables)

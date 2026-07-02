@@ -260,7 +260,8 @@ async def test_define_area_bbox_mints_aoi_handle(
     )
     assert out["source"] == "bbox"
     assert out["bbox"] == [-105.0, 37.0, -104.0, 38.0]
-    assert out["geojson"] is None
+    assert out["geometry_summary"] is None
+    assert "geojson" not in out
     assert out["handle"].startswith("aoi_")
     assert handle_type_of(out["handle"]) is HandleType.AOI
 
@@ -300,6 +301,9 @@ async def test_define_area_geojson_string_stores_geometry(
     )
     assert out["source"] == "geojson"
     assert out["bbox"] == [-105.0, 37.0, -104.0, 38.0]
+    # Response carries a geometry summary, not the full GeoJSON.
+    assert out["geometry_summary"] == {"type": "Polygon", "vertex_count": 5}
+    assert "geojson" not in out
 
     record = await workspace_store.get_handle(workspace_id, out["handle"])
     assert record.payload["source"] == "geojson"
@@ -318,7 +322,8 @@ async def test_define_area_nominatim(
     )
     assert out["source"] == "nominatim"
     assert out["bbox"] == _EXPECTED_NOMINATIM_BBOX
-    assert out["geojson"] == _NOMINATIM_POLYGON
+    assert out["geometry_summary"] == {"type": "Polygon", "vertex_count": 5}
+    assert "geojson" not in out
 
     record = await workspace_store.get_handle(workspace_id, out["handle"])
     assert record.payload["query"] == "Rocky Mountains"
@@ -355,7 +360,8 @@ async def test_define_area_nominatim_polygon_stored(
     out = await define_area_of_interest(
         "Amazon Rainforest", workspace_id=workspace_id, store=workspace_store
     )
-    assert out["geojson"] == multipolygon
+    assert out["geometry_summary"] == {"type": "MultiPolygon", "vertex_count": 8}
+    assert "geojson" not in out
     record = await workspace_store.get_handle(workspace_id, out["handle"])
     assert record.payload["geojson"] == multipolygon
 
@@ -378,7 +384,7 @@ async def test_define_area_nominatim_fallback_when_no_relation(
     assert out["source"] == "nominatim_point"
     assert out["bbox"] == _EXPECTED_FALLBACK_BBOX
     # Point geometry must not be stored as polygon.
-    assert out["geojson"] is None
+    assert out["geometry_summary"] is None
     # 2 Nominatim + 6 LIKE + 6 token = 14 HTTP requests.
     assert len(httpx_mock.get_requests()) == 14
 
@@ -396,7 +402,7 @@ async def test_define_area_basin_name_wbd_after_nominatim_point(
     )
     assert out["source"] == "usgs_wbd"
     assert out["bbox"] == _EXPECTED_WBD_BBOX
-    assert out["geojson"] == _WBD_POLYGON
+    assert out["geometry_summary"] == {"type": "Polygon", "vertex_count": 5}
 
     record = await workspace_store.get_handle(workspace_id, out["handle"])
     assert record.payload["source"] == "usgs_wbd"
@@ -415,7 +421,7 @@ async def test_define_area_nominatim_fallback_polygon_stored(
     out = await define_area_of_interest(
         "Denver", workspace_id=workspace_id, store=workspace_store
     )
-    assert out["geojson"] == _NOMINATIM_FALLBACK_POLYGON_GEO
+    assert out["geometry_summary"] == {"type": "Polygon", "vertex_count": 5}
     record = await workspace_store.get_handle(workspace_id, out["handle"])
     assert record.payload["geojson"] == _NOMINATIM_FALLBACK_POLYGON_GEO
 
@@ -447,7 +453,7 @@ async def test_define_area_bare_point_mints_point_aoi(
     )
     assert out["source"] == "point"
     assert out["bbox"] == [-93.6, 41.6, -93.6, 41.6]
-    assert out["geojson"] == {"type": "Point", "coordinates": [-93.6, 41.6]}
+    assert out["geometry_summary"] == {"type": "Point", "vertex_count": 1}
 
     record = await workspace_store.get_handle(workspace_id, out["handle"])
     assert record.payload["source"] == "point"
@@ -521,7 +527,7 @@ async def test_define_area_wbd_huc8(
     )
     assert out["source"] == "usgs_wbd"
     assert out["bbox"] == _EXPECTED_WBD_BBOX
-    assert out["geojson"] == _WBD_POLYGON
+    assert out["geometry_summary"] == {"type": "Polygon", "vertex_count": 5}
     assert out["handle"].startswith("aoi_")
     assert handle_type_of(out["handle"]) is HandleType.AOI
 
@@ -603,7 +609,7 @@ async def test_define_area_name_nominatim_empty_wbd_hit(
     )
     assert out["source"] == "usgs_wbd"
     assert out["bbox"] == _EXPECTED_WBD_BBOX
-    assert out["geojson"] == _WBD_POLYGON
+    assert out["geometry_summary"] == {"type": "Polygon", "vertex_count": 5}
 
     record = await workspace_store.get_handle(workspace_id, out["handle"])
     assert record.payload["source"] == "usgs_wbd"
@@ -740,7 +746,7 @@ async def test_define_area_like_multi_falls_to_token_single_hit(
     )
     assert out["source"] == "usgs_wbd"
     assert out["bbox"] == _EXPECTED_WBD_BBOX
-    assert out["geojson"] == _WBD_POLYGON
+    assert out["geometry_summary"] == {"type": "Polygon", "vertex_count": 5}
     # 2 Nominatim + 1 LIKE + 1 token = 4 requests.
     assert len(httpx_mock.get_requests()) == 4
 
@@ -932,7 +938,7 @@ async def test_region_geojson_is_none(workspace_store, workspace_id) -> None:
     out = await define_area_of_interest(
         "Africa", workspace_id=workspace_id, store=workspace_store
     )
-    assert out["geojson"] is None
+    assert out["geometry_summary"] is None
 
 
 async def test_region_payload_is_rematerializable(workspace_store, workspace_id) -> None:

@@ -464,6 +464,7 @@ def normalize_granule_item(item: dict) -> dict:
             size_mb += size / (1024**2)
         elif adi.get("Size") and adi.get("SizeUnit") == "MB":
             size_mb += float(adi["Size"])
+    time_start, time_end = _granule_temporal_extent(umm.get("TemporalExtent", {}))
     return {
         "concept_id": meta.get("concept-id"),
         "granule_ur": umm.get("GranuleUR"),
@@ -471,7 +472,22 @@ def normalize_granule_item(item: dict) -> dict:
         "cloud_cover": umm.get("CloudCover"),
         "day_night_flag": data_granule.get("DayNightFlag"),
         "size_mb": size_mb,
+        "time_start": time_start,
+        "time_end": time_end,
     }
+
+
+def _granule_temporal_extent(temporal_extent: dict) -> tuple[str | None, str | None]:
+    """A granule's ``(time_start, time_end)`` from UMM-G ``TemporalExtent``.
+
+    ``RangeDateTime`` (Beginning/EndingDateTime) is most common; a granule with
+    ``SingleDateTime`` instead reports the same instant for both ends.
+    """
+    range_dt = temporal_extent.get("RangeDateTime")
+    if range_dt:
+        return range_dt.get("BeginningDateTime"), range_dt.get("EndingDateTime")
+    single = temporal_extent.get("SingleDateTime")
+    return single, single
 
 
 def normalize_variable_item(item: dict) -> dict:

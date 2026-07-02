@@ -68,6 +68,11 @@ _session_factory = None
 _provenance: ProvenanceStore | None = None
 _pool = None
 
+#: AppEEARS product ids confirmed in-catalog, for the process lifetime — so the
+#: planning-time fail-fast (WS4) costs nothing on repeat plans against the same
+#: collection. Only successes are cached: a catalog miss is never assumed durable.
+_appeears_catalog_cache: set[str] = set()
+
 
 def _default_session_factory():
     """Process-wide jobs session factory, built on first use."""
@@ -412,6 +417,15 @@ async def _submit_retrieval(
         appeears=AppEEARSProvider(caps),
         opendap=opendap_provider,
     ).route(plan)
+
+    # Planning-time AppEEARS catalog fail-fast (WS4): a point-sample plan routed
+    # here would otherwise mint a job/handle for a product AppEEARS submit later
+    # rejects. Runs only on this path, before any handle exists, and reuses the
+    # provider's existing product lookup — the provider's own submit-time check
+    # stays, so a resumed job remains safe even past this cache's lifetime.
+    if decision.path == "appeears":
+        await _check_appeears_catalog(decision.provider)
+
     # Mint the two handles, then persist the durable spec that ties them together.
     obs_handle = await store.put_handle(
         workspace_id, HandleType.OBS, payload={"status": "pending"}
@@ -473,6 +487,25 @@ async def _submit_retrieval(
         "status": JobState.PENDING.value,
         "provider": decision.path,
     }
+
+
+async def _check_appeears_catalog(appeears: AppEEARSProvider) -> None:
+    """Fail fast if this collection's product isn't in the AppEEARS catalog.
+
+    Reuses :meth:`AppEEARSProvider.check_product_in_catalog` (the same lookup
+    ``submit`` performs) and re-raises its ``RuntimeError`` as a ``ValueError`` —
+    consistent with this module's other planning-time rejections (e.g. the
+    ambiguous-variable raise). Cached per product id for the process lifetime;
+    only successes are cached, since a miss may reflect a catalog that changes.
+    """
+    product = appeears.product_id()
+    if product in _appeears_catalog_cache:
+        return
+    try:
+        await appeears.check_product_in_catalog()
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    _appeears_catalog_cache.add(product)
 
 
 async def _resolve_handles(

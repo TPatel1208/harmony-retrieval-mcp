@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from earthdata_mcp.config import Settings
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.tools.coverage import (
     check_availability,
@@ -35,6 +36,8 @@ _GRANULE_1 = {
     "cloud_cover": None,
     "day_night_flag": "Day",
     "size_mb": 120.5,
+    "time_start": "2024-01-01T00:00:00.000Z",
+    "time_end": "2024-01-01T00:05:00.000Z",
 }
 _GRANULE_2 = {
     "concept_id": "G2-X",
@@ -43,6 +46,8 @@ _GRANULE_2 = {
     "cloud_cover": None,
     "day_night_flag": "Day",
     "size_mb": 118.2,
+    "time_start": "2024-01-09T00:00:00.000Z",
+    "time_end": "2024-01-09T00:05:00.000Z",
 }
 _AVAIL_RESULT = {
     "collection_concept_id": _CONCEPT_ID,
@@ -129,7 +134,15 @@ async def test_check_coverage_returns_sample_granules(
     assert out["granule_count"] == 12
     assert out["sampled_granules"] == 2
     assert len(out["sample_granules"]) == 2
-    assert out["sample_granules"][0]["concept_id"] == "G1-X"
+    # Slim eyeball projection: granule identifier + temporal extent only —
+    # never the full record (that's inspect_granules' job).
+    sample = out["sample_granules"][0]
+    assert sample == {
+        "concept_id": "G1-X",
+        "granule_ur": "MOD13Q1.A2024001.h09v04.061.nc",
+        "time_start": "2024-01-01T00:00:00.000Z",
+        "time_end": "2024-01-01T00:05:00.000Z",
+    }
     fake_cmr.check_availability.assert_awaited_once_with(
         _CONCEPT_ID, bounding_box=_BBOX_STR, temporal=_TIME
     )
@@ -230,6 +243,38 @@ async def test_estimate_retrieval_size_zero_sizes_warns(
     assert out["total_size_mb"] == 0.0
     assert out["warning"] is not None
     assert "size estimate unavailable" in out["warning"]
+
+
+async def test_estimate_retrieval_size_warns_over_threshold(
+    fake_cmr, workspace_store, workspace_id
+) -> None:
+    """A configurable size threshold (default ~10 GB) triggers an advisory warning
+    on the extrapolated total — the gate the tool's own docstring promises."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await estimate_retrieval_size(
+        ds, aoi, _TIME, workspace_id=workspace_id, cmr=fake_cmr, store=workspace_store,
+        settings=Settings(_env_file=None, size_warning_threshold_mb=1000.0),
+    )
+
+    assert out["total_size_mb"] == pytest.approx(119.35 * 12)
+    assert out["warning"] is not None
+    assert "narrow the AOI" in out["warning"]
+
+
+async def test_estimate_retrieval_size_under_threshold_no_warning(
+    fake_cmr, workspace_store, workspace_id
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await estimate_retrieval_size(
+        ds, aoi, _TIME, workspace_id=workspace_id, cmr=fake_cmr, store=workspace_store,
+        settings=Settings(_env_file=None, size_warning_threshold_mb=100_000.0),
+    )
+
+    assert out["warning"] is None
 
 
 async def test_estimate_retrieval_size_no_granules_warns(

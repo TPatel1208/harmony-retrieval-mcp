@@ -51,9 +51,15 @@ async def search_datasets(
 async def describe_dataset(
     dataset_handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    detail: bool = False,
 ) -> dict:
-    """Resolve a ``dataset_`` handle to its metadata, variables, and advisory notes."""
-    return await understanding.describe_dataset(dataset_handle, workspace_id)
+    """Resolve a ``dataset_`` handle to its metadata, variables, and advisory notes.
+
+    Compact by default (name/long_name/units/advisory_notes per variable; core
+    collection identification fields only). Pass ``detail=True`` for the full
+    per-variable UMM-Var enrichment and the complete collection metadata.
+    """
+    return await understanding.describe_dataset(dataset_handle, workspace_id, detail)
 
 
 @mcp.tool
@@ -66,7 +72,9 @@ async def define_area_of_interest(
     ``location`` may be a bbox string ``"-105,37,-104,38"`` (W,S,E,N decimal
     degrees), a GeoJSON geometry/Feature as a JSON string, or a place name / HUC
     watershed / FIPS code to geocode. Returns
-    ``{"handle", "bbox", "geojson", "source"}``.
+    ``{"handle", "bbox", "geometry_summary", "source"}`` — ``geometry_summary``
+    is ``{"type", "vertex_count"}`` (or ``None``); resolve the handle for the
+    full geometry.
     """
     return await area.define_area_of_interest(location, workspace_id)
 

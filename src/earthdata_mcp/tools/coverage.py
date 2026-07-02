@@ -19,6 +19,7 @@ payloads — never from anything ephemeral.
 
 from __future__ import annotations
 
+from earthdata_mcp.config import Settings, get_settings
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.handles import resolve_aoi, resolve_dataset
@@ -46,8 +47,11 @@ async def check_coverage(
     ``granule_count`` is the true total (CMR-Hits, via the same query
     ``check_availability`` uses) — never capped at the eyeball sample size, so
     it agrees with ``check_availability`` for the same dataset/AOI/time.
-    ``sample_granules`` is a separate, small eyeball list capped at
-    :data:`_COVERAGE_SAMPLE_LIMIT`; its size is reported as ``sampled_granules``.
+    ``sample_granules`` is a slim eyeball projection (granule identifier +
+    temporal extent only) capped at :data:`_COVERAGE_SAMPLE_LIMIT`; its size is
+    reported as ``sampled_granules``. Full granule records (URs, URLs, sizes)
+    are ``inspect_granules``'s job — this tool answers "is it there", not "what
+    is it".
     """
     cmr = cmr or CMRProvider()
     store = store or _default_store()
@@ -64,14 +68,23 @@ async def check_coverage(
         temporal=time_range,
         limit=_COVERAGE_SAMPLE_LIMIT,
     )
+    sample = [
+        {
+            "concept_id": g.get("concept_id"),
+            "granule_ur": g.get("granule_ur"),
+            "time_start": g.get("time_start"),
+            "time_end": g.get("time_end"),
+        }
+        for g in granules
+    ]
     return {
         "dataset_handle": dataset_handle,
         "aoi_handle": aoi_handle,
         "time_range": time_range,
         "granule_count": availability["granule_count"],
         "covered": availability["available"],
-        "sampled_granules": len(granules),
-        "sample_granules": granules,
+        "sampled_granules": len(sample),
+        "sample_granules": sample,
     }
 
 
@@ -143,6 +156,7 @@ async def estimate_retrieval_size(
     *,
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
+    settings: Settings | None = None,
 ) -> dict:
     """Estimate total retrieval size by extrapolating from a sample of granules.
 
@@ -153,10 +167,15 @@ async def estimate_retrieval_size(
     size since granule files are global and subsetting happens downstream.
     Granules that report no size (UMM-G may omit it) are excluded from the
     average; ``warning`` is set when no granules match or none report a size,
-    so a caller never mistakes a metadata gap for "0 MB to download".
+    so a caller never mistakes a metadata gap for "0 MB to download". When the
+    extrapolated total exceeds ``settings.size_warning_threshold_mb`` (default
+    ~10 GB), ``warning`` instead advises narrowing the AOI, time window, or
+    variables before any byte moves — the no-granules/no-sizes warnings above
+    take priority since they are mutually exclusive with a large estimate.
     """
     cmr = cmr or CMRProvider()
     store = store or _default_store()
+    settings = settings or get_settings()
 
     concept_id, bbox_str = await _resolve_handles(
         dataset_handle, aoi_handle, workspace_id, store
@@ -183,6 +202,11 @@ async def estimate_retrieval_size(
         warning = (
             f"None of the {len(granules)} sampled granules reported a size; "
             "size estimate unavailable."
+        )
+    elif total_size_mb > settings.size_warning_threshold_mb:
+        warning = (
+            f"Estimated total is ~{total_size_mb:,.0f} MB (~{total_size_mb / 1024:.1f} GB) — "
+            "narrow the AOI, time window, or variables before retrieving."
         )
 
     return {

@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     earthdata_data_dir: str = "./data"
     # Materialization cache eviction cap (bytes); default ~5 GiB
     earthdata_cache_max_bytes: int = 5 * 1024**3
+    # estimate_retrieval_size warns when the extrapolated total exceeds this
+    # (MB); default ~10 GB — the gate the tool's docstring promises.
+    size_warning_threshold_mb: float = 10 * 1024
 
     # Database -------------------------------------------------------------
     database_url: str = (

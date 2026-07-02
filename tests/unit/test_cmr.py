@@ -11,7 +11,12 @@ import pytest
 from earthdata_mcp import providers
 from earthdata_mcp.config import Settings
 from earthdata_mcp.providers import cmr as cmr_mod
-from earthdata_mcp.providers.cmr import CMRError, CMRProvider, normalize_collection_item
+from earthdata_mcp.providers.cmr import (
+    CMRError,
+    CMRProvider,
+    normalize_collection_item,
+    normalize_granule_item,
+)
 
 
 @pytest.fixture
@@ -49,6 +54,44 @@ def test_normalize_surfaces_the_three_omitted_umm_c_fields() -> None:
     assert out["standard_product"] is False
     assert out["purpose"] == "PROVISIONAL; see known issues"
     assert out["native_formats"] == [{"format": "netCDF-4", "media_type": ["HTTPS"]}]
+
+
+def test_normalize_granule_item_range_date_time() -> None:
+    item = {
+        "meta": {"concept-id": "G1-X"},
+        "umm": {
+            "GranuleUR": "MOD13Q1.A2024001.h09v04.061.nc",
+            "TemporalExtent": {
+                "RangeDateTime": {
+                    "BeginningDateTime": "2024-01-01T00:00:00.000Z",
+                    "EndingDateTime": "2024-01-01T00:05:00.000Z",
+                }
+            },
+        },
+    }
+    out = normalize_granule_item(item)
+    assert out["time_start"] == "2024-01-01T00:00:00.000Z"
+    assert out["time_end"] == "2024-01-01T00:05:00.000Z"
+
+
+def test_normalize_granule_item_single_date_time() -> None:
+    item = {
+        "meta": {"concept-id": "G2-X"},
+        "umm": {
+            "GranuleUR": "GPM.A2024001.nc",
+            "TemporalExtent": {"SingleDateTime": "2024-01-01T00:00:00.000Z"},
+        },
+    }
+    out = normalize_granule_item(item)
+    assert out["time_start"] == "2024-01-01T00:00:00.000Z"
+    assert out["time_end"] == "2024-01-01T00:00:00.000Z"
+
+
+def test_normalize_granule_item_no_temporal_extent() -> None:
+    item = {"meta": {"concept-id": "G3-X"}, "umm": {"GranuleUR": "X.nc"}}
+    out = normalize_granule_item(item)
+    assert out["time_start"] is None
+    assert out["time_end"] is None
 
 
 async def test_retries_5xx_then_succeeds(httpx_mock, provider: CMRProvider) -> None:

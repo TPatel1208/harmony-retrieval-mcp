@@ -72,11 +72,55 @@ async def test_describe_resolves_metadata_and_variables(
     assert out["handle"] == handle
     assert out["concept_id"] == "C1-X"
     assert out["metadata"]["short_name"] == "TEMPO_NO2_L3"
+    assert out["variable_count"] == 1
     assert len(out["variables"]) == 1
     var = out["variables"][0]
     assert var["name"] == "vertical_column_troposphere"
-    # QA fact is preserved from UMM-Var (authoritative).
+
+
+async def test_describe_compact_by_default_trims_variable_and_metadata_fields(
+    httpx_mock, provider, workspace_store, workspace_id
+) -> None:
+    """Compact response: name/long_name/units/advisory_notes per variable, core
+    identification fields only in the collection metadata echo — the shape a
+    400-variable collection needs to stay usable."""
+    handle = await _seed_dataset_handle(workspace_store, workspace_id)
+    _mock_get_variables(httpx_mock)
+
+    out = await describe_dataset(
+        handle, workspace_id=workspace_id, cmr=provider, store=workspace_store
+    )
+
+    var = out["variables"][0]
+    assert set(var) == {"name", "long_name", "units", "advisory_notes"}
+    assert out["metadata"] == {
+        "concept_id": "C1-X",
+        "short_name": "TEMPO_NO2_L3",
+        "version": "V03",
+        "entry_title": "TEMPO NO2 V03",
+        "processing_level": "3",
+    }
+    assert "abstract" not in out["metadata"]
+
+
+async def test_describe_detail_true_returns_full_shape(
+    httpx_mock, provider, workspace_store, workspace_id
+) -> None:
+    """``detail=True`` opts back into today's full shape: every enriched QA fact
+    per variable and the complete collection metadata blob."""
+    handle = await _seed_dataset_handle(workspace_store, workspace_id)
+    _mock_get_variables(httpx_mock)
+
+    out = await describe_dataset(
+        handle, workspace_id=workspace_id, detail=True,
+        cmr=provider, store=workspace_store,
+    )
+
+    var = out["variables"][0]
+    # QA fact is preserved from UMM-Var (authoritative) — full shape only.
     assert var["scale"] == 1
+    assert out["variable_count"] == 1
+    assert "entry_title" in out["metadata"]
 
 
 async def test_variable_advisory_notes_are_flagged(

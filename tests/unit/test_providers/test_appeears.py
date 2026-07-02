@@ -241,6 +241,30 @@ async def test_submit_task_rejection_surfaces_response_body(httpx_mock) -> None:
         await _provider().submit(_point_plan())
 
 
+# -- planning-time catalog check (reused by the shared retrieval planning core) --
+
+
+@pytest.mark.asyncio
+async def test_check_product_in_catalog_succeeds_when_product_listed(httpx_mock) -> None:
+    _mock_login(httpx_mock)
+    _mock_layer_list(httpx_mock)
+    await _provider().check_product_in_catalog()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_check_product_in_catalog_raises_on_404(httpx_mock) -> None:
+    _mock_login(httpx_mock)
+    httpx_mock.add_response(
+        url=f"{BASE}/product/{PRODUCT}", method="GET", status_code=404,
+    )
+    with pytest.raises(RuntimeError, match="not in the AppEEARS product catalog"):
+        await _provider().check_product_in_catalog()
+
+
+def test_product_id_appends_version() -> None:
+    assert _provider().product_id() == PRODUCT
+
+
 @pytest.mark.asyncio
 async def test_submit_raises_for_non_point_plan() -> None:
     with pytest.raises(ValueError):

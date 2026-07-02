@@ -67,7 +67,13 @@ async def define_area_of_interest(
 
     ``location`` is one of: a dict (GeoJSON), a GeoJSON string, a ``"W,S,E,N"``
     bbox string, or a place/HUC/FIPS name to geocode. Returns
-    ``{"handle", "bbox": [W,S,E,N], "geojson": dict|None, "source": str}``.
+    ``{"handle", "bbox": [W,S,E,N], "geometry_summary": dict|None, "source": str}``.
+
+    ``geometry_summary`` (``{"type", "vertex_count"}``) replaces the full
+    GeoJSON in the response — a Nominatim multipolygon can be enormous, and one
+    AOI definition should not flood an agent's context. The durable handle
+    payload still carries the full ``geojson`` for re-materialization; resolve
+    the handle to get it back.
     """
     store = store or _default_store()
 
@@ -84,9 +90,16 @@ async def define_area_of_interest(
     return {
         "handle": handle,
         "bbox": list(bbox),
-        "geojson": geojson,
+        "geometry_summary": _geometry_summary(geojson),
         "source": source,
     }
+
+
+def _geometry_summary(geojson: dict | None) -> dict | None:
+    """``{"type", "vertex_count"}`` for a geometry, or ``None`` when there is none."""
+    if geojson is None:
+        return None
+    return {"type": geojson.get("type"), "vertex_count": len(_flatten_coords(geojson))}
 
 
 def _load_region_table() -> dict[str, tuple[float, float, float, float]]:
