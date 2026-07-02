@@ -34,6 +34,7 @@ from earthdata_mcp.tools._dataio import (
     UnsupportedMediaType,
     normalize_output_format,
     open_result,
+    open_result_lazy,
     serialize_result,
 )
 
@@ -110,6 +111,42 @@ def test_open_netcdf_bundle_single_member_is_the_member() -> None:
 
     assert ds.sizes["time"] == 1
     assert ds["x"].values.tolist() == [5.0]
+
+
+def _grouped_bundle_zip_path(tmp_path, filenames_and_bytes: list[tuple[str, bytes]]):
+    """Write a netCDF-bundle zip (of grouped members) to a real path for open_result_lazy."""
+    path = tmp_path / "bundle.nc.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in filenames_and_bytes:
+            zf.writestr(name, data)
+    return path
+
+
+def test_open_result_lazy_flattens_groups_in_bundle_single_member(tmp_path) -> None:
+    """Regression: inspect_statistics returned ``{}`` on a materialized obs_ handle
+    whose netCDF-bundle member was a grouped (TEMPO/OMI-shaped) file, because
+    ``open_result_lazy``'s bundle branch opened each member's root group directly
+    (no data vars live there) instead of flattening groups like the eager
+    ``open_result``/``_open_netcdf_bundle`` path does."""
+    path = _grouped_bundle_zip_path(
+        tmp_path, [("only.nc", _grouped_netcdf_bytes())]
+    )
+
+    with open_result_lazy(path, NETCDF_BUNDLE_MEDIA_TYPE) as ds:
+        assert "product__vertical_column" in ds.data_vars
+        assert "geolocation__latitude" in ds.data_vars
+        assert ds["product__vertical_column"].values.tolist() == [1.0, 2.0]
+
+
+def test_open_result_lazy_flattens_groups_in_bundle_multi_member(tmp_path) -> None:
+    path = _grouped_bundle_zip_path(
+        tmp_path,
+        [("g0.nc", _grouped_netcdf_bytes()), ("g1.nc", _grouped_netcdf_bytes())],
+    )
+
+    with open_result_lazy(path, NETCDF_BUNDLE_MEDIA_TYPE) as ds:
+        assert "product__vertical_column" in ds.data_vars
+        assert ds.sizes["time"] == 4  # two members x two time steps each, concatenated
 
 
 def _cf_time_netcdf_bytes(
