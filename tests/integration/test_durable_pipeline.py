@@ -475,15 +475,42 @@ async def test_opendap_bundle_path_runs_to_ready_and_opens(
     workspace_store, provenance_store, session_factory, patch_worker_seam,
     local_backend, workspace_id,
 ) -> None:
-    """A no-Harmony-service grid collection routes to OPeNDAP, materialises a netCDF
-    bundle, and the obs handle opens back into one time-concatenated dataset."""
+    """A no-Harmony-service grid collection still routes to Harmony (unpinned) at
+    plan time — CLAUDE.md's hard rule: OPeNDAP is never a planning-time choice,
+    only the worker's runtime fallback when a real Harmony submit fails (router.py
+    step 2 always wires Harmony first; this collection's empty ``services`` only
+    means the match is unpinned, per the union-trap/no-registered-services case).
+    OPeNDAP URLs are still discovered and stored on the spec at plan time for any
+    gridded+bbox collection, so once Harmony's submit fails, the worker's fallback
+    re-routes to OPeNDAP, materialises a netCDF bundle, and the obs handle opens
+    back into one time-concatenated dataset."""
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
-    patch_worker_seam(
-        _FakeProvider(
-            "opendap", NETCDF_BUNDLE_MEDIA_TYPE, _netcdf_bundle_bytes(), local_backend
-        )
-    )
+
+    class _FailThenBundleProvider:
+        """Fails submit() once (as Harmony), then the worker's runtime fallback
+        re-routes to OPeNDAP and asks ``_load_provider`` again — hand back a
+        provider that materialises the multi-granule bundle from then on."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self._ok = _FakeProvider(
+                "opendap", NETCDF_BUNDLE_MEDIA_TYPE, _netcdf_bundle_bytes(), local_backend
+            )
+
+        async def submit(self, plan):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("harmony 503")
+            return await self._ok.submit(plan)
+
+        async def poll(self, job):
+            return await self._ok.poll(job)
+
+        async def materialize(self, job):
+            return await self._ok.materialize(job)
+
+    patch_worker_seam(_FailThenBundleProvider())
 
     out = await retrieve_data(
         ds, aoi, _TIME, workspace_id=workspace_id,
@@ -491,15 +518,22 @@ async def test_opendap_bundle_path_runs_to_ready_and_opens(
         provenance=provenance_store, session_factory=session_factory,
         enqueue_fn=AsyncMock(),
     )
-    # Routed to OPeNDAP at planning time, carrying every granule in the window.
-    assert out["provider"] == "opendap"
+    # Harmony first, unpinned (no service matched) — never OPeNDAP at plan time.
+    assert out["provider"] == "harmony"
     async with session_factory() as session:
         job = await crud.get_job_by_handle(session, out["job_handle"])
         job_id = job.job_id
+        # OPeNDAP URLs are discovered regardless of the routing decision, so the
+        # worker's runtime fallback has something to retry against.
         assert job.request_spec["opendap_urls"] == _OPENDAP_URLS
-    await _drive_to_ready(session_factory, job_id)
 
-    # Hold-firm: the durable row records OPeNDAP, not just READY.
+    ctx = {"session_factory": session_factory, "redis": AsyncMock()}
+    await worker_mod.submit_job(ctx, job_id)  # Harmony fails -> re-routes to OPeNDAP
+    await worker_mod.submit_job(ctx, job_id)  # retry succeeds via OPeNDAP
+    await worker_mod.poll_job(ctx, job_id)
+    await worker_mod.materialize_job(ctx, job_id)
+
+    # Hold-firm: the durable row records OPeNDAP (post-fallback), not just READY.
     async with session_factory() as session:
         job = await crud.get_job_by_handle(session, out["job_handle"])
     assert job.state == JobState.READY.value
