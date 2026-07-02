@@ -9,6 +9,7 @@ and result persistence through ``StorageBackend``. The real Hyrax fetch is the
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from urllib.parse import unquote
 
 import pytest
@@ -277,209 +278,233 @@ class _CmrStub:
 
 
 from earthdata_mcp.providers.opendap import (  # noqa: E402
-    _constraint_expression,
     _discover_grid_geometry,
     _resolve_from_cmr,
+    build_constraint_expression,
 )
 
 
-# -- _constraint_expression: DAP4 FQN serialization ------------------------
+# -- collection-archetype corpus: DAP4 constraint-expression serialization --
+#
+# Each row pins one reverse-engineered Hyrax/DAP4 quirk against the pure,
+# public build_constraint_expression() core — see docs/opendap_quirk_ledger.md
+# for the quirk each row id cross-references. Every assertion here previously
+# lived in its own per-bug test function; none was dropped, only tabulated.
 
 
-def test_constraint_expression_root_variable_gets_leading_slash() -> None:
-    """Root-level variable names are prefixed with '/' to form a DAP4 FQN."""
-    plan = _subset_plan()  # variables=("precipitation",)
-    ce = _constraint_expression(plan)
-    assert ce == "/precipitation"
+@dataclass(frozen=True)
+class _CEArchetypeCase:
+    """One collection-archetype row: inputs to build_constraint_expression()
+    plus how to check its output. ``expect_equals`` asserts the whole CE
+    string; ``expect_contains``/``expect_absent`` check individual ``;``-split
+    tokens (or, for ``expect_absent``, a raw substring) — whichever the
+    original per-bug test asserted."""
+
+    id: str
+    archetype: str
+    plan: RetrievalPlan
+    coord_lat: str = "lat"
+    coord_lon: str = "lon"
+    coord_time: str | None = None
+    lat_axis: AxisGeometry | None = None
+    lon_axis: AxisGeometry | None = None
+    var_dims: dict | None = None
+    expect_equals: str | None = None
+    expect_contains: tuple[str, ...] = ()
+    expect_absent: tuple[str, ...] = ()
 
 
-def test_constraint_expression_grouped_variable_preserves_existing_slash() -> None:
-    """A variable already carrying a group path (leading '/') is used as-is."""
-    plan = RetrievalPlan(
-        output_format=NETCDF,
-        needs_variable=True,
-        concept_id="C1-GES_DISC",
-        transform=TransformSpec(
-            output_format=NETCDF, variables=("/product/vertical_column_total",)
-        ),
-    )
-    ce = _constraint_expression(plan)
-    assert ce == "/product/vertical_column_total"
-
-
-def test_constraint_expression_bbox_emits_fqn_for_flat_coords() -> None:
-    """Flat collection coord names (bare 'lat'/'lon') get a leading slash."""
-    plan = RetrievalPlan(
-        output_format=NETCDF,
-        needs_variable=True,
-        needs_bbox=True,
-        concept_id="C1-GES_DISC",
-        aoi=AOI(bbox=(-105.0, 37.0, -104.0, 38.0)),
-        transform=TransformSpec(output_format=NETCDF, variables=("precipitation",)),
-    )
-    ce = _constraint_expression(plan, coord_lat="lat", coord_lon="lon")
-    parts = ce.split(";")
-    assert "/lat" in parts
-    assert "/lon" in parts
-    assert "/precipitation" in parts
-
-
-def test_constraint_expression_bbox_emits_fqn_for_grouped_coords() -> None:
-    """Grouped collection coord names already start with '/' and pass through."""
-    plan = RetrievalPlan(
+def _bbox_plan(
+    variables: tuple[str, ...], bbox: tuple[float, float, float, float], concept_id: str
+) -> RetrievalPlan:
+    return RetrievalPlan(
         output_format=NETCDF,
         needs_variable=True,
         needs_bbox=True,
-        concept_id="C1-TEMPO",
-        aoi=AOI(bbox=(-105.0, 37.0, -104.0, 38.0)),
-        transform=TransformSpec(
-            output_format=NETCDF, variables=("/product/vertical_column_total",)
-        ),
+        concept_id=concept_id,
+        aoi=AOI(bbox=bbox),
+        transform=TransformSpec(output_format=NETCDF, variables=variables),
     )
-    ce = _constraint_expression(
-        plan,
+
+
+_GRID_LAT_AXIS = AxisGeometry(name="lat", origin=-59.875, step=0.25, length=600)
+_GRID_LON_AXIS = AxisGeometry(name="lon", origin=-179.875, step=0.25, length=1440)
+_GROUPED_LAT_AXIS = AxisGeometry(name="/product/latitude", origin=-59.875, step=0.25, length=600)
+_GROUPED_LON_AXIS = AxisGeometry(name="/product/longitude", origin=-179.875, step=0.25, length=1440)
+
+_CE_ARCHETYPE_CORPUS: tuple[_CEArchetypeCase, ...] = (
+    # -- flat / root-level (GLDAS-style): no group path, no leading slash yet.
+    _CEArchetypeCase(
+        id="flat_root_variable_gets_leading_slash",
+        archetype="flat",
+        plan=_subset_plan(),  # variables=("precipitation",)
+        expect_equals="/precipitation",
+    ),
+    _CEArchetypeCase(
+        id="flat_bbox_emits_fqn_for_flat_coords_no_geometry",
+        archetype="flat",
+        plan=_bbox_plan(("precipitation",), (-105.0, 37.0, -104.0, 38.0), "C1-GES_DISC"),
+        expect_contains=("/lat", "/lon", "/precipitation"),
+    ),
+    _CEArchetypeCase(
+        id="flat_names_with_spaces_pass_through_verbatim",
+        archetype="names_with_spaces",
+        # MOD13Q1-style: real MODIS variable names carry embedded spaces
+        # (e.g. "250m 16 days NDVI"). Verbatim leading-slash FQN, no splitting
+        # or sanitizing of the space.
+        plan=_subset_plan(
+            transform=TransformSpec(output_format=NETCDF, variables=("250m 16 days NDVI",))
+        ),
+        expect_equals="/250m 16 days NDVI",
+    ),
+    # -- grouped (TEMPO-style): variables/coords already carry a group path.
+    _CEArchetypeCase(
+        id="grouped_variable_preserves_existing_slash",
+        archetype="grouped",
+        plan=_subset_plan(
+            transform=TransformSpec(
+                output_format=NETCDF, variables=("/product/vertical_column_total",)
+            )
+        ),
+        expect_equals="/product/vertical_column_total",
+    ),
+    _CEArchetypeCase(
+        id="grouped_bbox_emits_fqn_for_grouped_coords_no_geometry",
+        archetype="grouped",
+        plan=_bbox_plan(
+            ("/product/vertical_column_total",), (-105.0, 37.0, -104.0, 38.0), "C1-TEMPO"
+        ),
         coord_lat="/product/latitude",
         coord_lon="/product/longitude",
-    )
-    parts = ce.split(";")
-    assert "/product/latitude" in parts
-    assert "/product/longitude" in parts
-    assert "/product/vertical_column_total" in parts
-
-
-# -- _constraint_expression: DAP4 hyperslab (bbox spatial subsetting) ------
-
-
-def test_constraint_expression_bbox_with_geometry_emits_hyperslab() -> None:
-    """Ascending lat/lon grid + known box -> correct inclusive index ranges on
-    both the coordinate arrays and the projected data variable."""
-    lat_axis = AxisGeometry(name="lat", origin=-59.875, step=0.25, length=600)
-    lon_axis = AxisGeometry(name="lon", origin=-179.875, step=0.25, length=1440)
-    plan = RetrievalPlan(
-        output_format=NETCDF,
-        needs_variable=True,
-        needs_bbox=True,
-        concept_id="C1-GES_DISC",
-        aoi=AOI(bbox=(-95.0, 38.0, -90.0, 43.0)),
-        transform=TransformSpec(output_format=NETCDF, variables=("precipitation",)),
-    )
-    ce = _constraint_expression(
-        plan, coord_lat="lat", coord_lon="lon", lat_axis=lat_axis, lon_axis=lon_axis
-    )
-    parts = ce.split(";")
-    assert "/lat[391:412]" in parts
-    assert "/lon[339:360]" in parts
-    assert "/precipitation[391:412][339:360]" in parts
-
-
-def test_constraint_expression_descending_latitude_orders_indices_correctly() -> None:
-    """A north-to-south (descending) latitude axis still yields low <= high,
-    covering the requested window rather than being flipped or dropped."""
-    lat_axis = AxisGeometry(name="lat", origin=89.875, step=-0.25, length=600)
-    lon_axis = AxisGeometry(name="lon", origin=-179.875, step=0.25, length=1440)
-    plan = RetrievalPlan(
-        output_format=NETCDF,
-        needs_variable=True,
-        needs_bbox=True,
-        concept_id="C1-GES_DISC",
-        aoi=AOI(bbox=(-95.0, 38.0, -90.0, 43.0)),
-        transform=TransformSpec(output_format=NETCDF, variables=("precipitation",)),
-    )
-    ce = _constraint_expression(
-        plan, coord_lat="lat", coord_lon="lon", lat_axis=lat_axis, lon_axis=lon_axis
-    )
-    parts = ce.split(";")
-    assert "/lat[187:208]" in parts
-    assert "/precipitation[187:208][339:360]" in parts
-
-
-def test_constraint_expression_grouped_coords_compose_with_hyperslab() -> None:
-    """A grouped (TEMPO-style) collection's FQN coords/vars still get hyperslabs."""
-    lat_axis = AxisGeometry(name="/product/latitude", origin=-59.875, step=0.25, length=600)
-    lon_axis = AxisGeometry(name="/product/longitude", origin=-179.875, step=0.25, length=1440)
-    plan = RetrievalPlan(
-        output_format=NETCDF,
-        needs_variable=True,
-        needs_bbox=True,
-        concept_id="C1-TEMPO",
-        aoi=AOI(bbox=(-95.0, 38.0, -90.0, 43.0)),
-        transform=TransformSpec(
-            output_format=NETCDF, variables=("/product/vertical_column_total",)
+        expect_contains=(
+            "/product/latitude",
+            "/product/longitude",
+            "/product/vertical_column_total",
         ),
-    )
-    ce = _constraint_expression(
-        plan,
+    ),
+    _CEArchetypeCase(
+        id="grouped_coords_compose_with_hyperslab",
+        archetype="grouped",
+        plan=_bbox_plan(
+            ("/product/vertical_column_total",), (-95.0, 38.0, -90.0, 43.0), "C1-TEMPO"
+        ),
         coord_lat="/product/latitude",
         coord_lon="/product/longitude",
-        lat_axis=lat_axis,
-        lon_axis=lon_axis,
+        lat_axis=_GROUPED_LAT_AXIS,
+        lon_axis=_GROUPED_LON_AXIS,
+        expect_contains=(
+            "/product/latitude[391:412]",
+            "/product/longitude[339:360]",
+            "/product/vertical_column_total[391:412][339:360]",
+        ),
+    ),
+    # -- swath collection with a real per-scanline time coordinate (TROPOMI):
+    # projected whole-array (no axis geometry narrows a 2D swath's time either)
+    # so the response's time dimension keeps coordinate values downstream.
+    _CEArchetypeCase(
+        id="swath_time_coordinate_projected_when_resolved",
+        archetype="swath_time",
+        plan=_subset_plan(
+            transform=TransformSpec(
+                output_format=NETCDF, variables=("nitrogendioxide_tropospheric_column",)
+            )
+        ),
+        coord_time="/product/time",
+        expect_equals="/product/time;/nitrogendioxide_tropospheric_column",
+    ),
+    # -- grid-edge-bbox geometry (UMM-C convention): AxisGeometry.origin is
+    # already the half-cell-offset *value* derived from the grid's outer
+    # *edge* (see _discover_grid_geometry) — these rows pin the hyperslab
+    # index math a corpus of that geometry shape must produce.
+    _CEArchetypeCase(
+        id="grid_edge_bbox_ascending_axis_hyperslab",
+        archetype="grid_edge_bbox",
+        plan=_bbox_plan(("precipitation",), (-95.0, 38.0, -90.0, 43.0), "C1-GES_DISC"),
+        lat_axis=_GRID_LAT_AXIS,
+        lon_axis=_GRID_LON_AXIS,
+        expect_contains=(
+            "/lat[391:412]",
+            "/lon[339:360]",
+            "/precipitation[391:412][339:360]",
+        ),
+    ),
+    _CEArchetypeCase(
+        id="grid_edge_bbox_descending_latitude_orders_indices_correctly",
+        archetype="grid_edge_bbox",
+        plan=_bbox_plan(("precipitation",), (-95.0, 38.0, -90.0, 43.0), "C1-GES_DISC"),
+        lat_axis=AxisGeometry(name="lat", origin=89.875, step=-0.25, length=600),
+        lon_axis=_GRID_LON_AXIS,
+        expect_contains=("/lat[187:208]", "/precipitation[187:208][339:360]"),
+    ),
+    _CEArchetypeCase(
+        id="grid_edge_bbox_box_exceeding_extent_is_clamped",
+        archetype="grid_edge_bbox",
+        plan=_bbox_plan(("precipitation",), (-200.0, -90.0, 200.0, 100.0), "C1-GES_DISC"),
+        lat_axis=_GRID_LAT_AXIS,
+        lon_axis=_GRID_LON_AXIS,
+        expect_contains=("/lat[0:599]", "/lon[0:1439]"),
+    ),
+    _CEArchetypeCase(
+        id="grid_edge_bbox_degenerate_point_box_yields_one_cell",
+        archetype="grid_edge_bbox",
+        plan=_bbox_plan(
+            ("precipitation",), (-90.125, 40.125, -90.125, 40.125), "C1-GES_DISC"
+        ),
+        lat_axis=_GRID_LAT_AXIS,
+        lon_axis=_GRID_LON_AXIS,
+        expect_contains=("/lat[400:400]", "/lon[359:359]"),
+    ),
+    _CEArchetypeCase(
+        id="grid_edge_bbox_antimeridian_falls_back_to_whole_longitude",
+        archetype="grid_edge_bbox",
+        plan=_bbox_plan(("precipitation",), (170.0, 38.0, -170.0, 43.0), "C1-GES_DISC"),
+        lat_axis=_GRID_LAT_AXIS,
+        lon_axis=_GRID_LON_AXIS,
+        expect_contains=(
+            "/lat[391:412]",
+            "/lon",  # whole-longitude, no bracket
+            "/precipitation[391:412]",  # no lon bracket on the data var either
+        ),
+    ),
+    _CEArchetypeCase(
+        id="grid_edge_bbox_var_dims_full_ranges_non_spatial_dimension",
+        archetype="grid_edge_bbox",
+        plan=_bbox_plan(("precipitation",), (-95.0, 38.0, -90.0, 43.0), "C1-GES_DISC"),
+        lat_axis=_GRID_LAT_AXIS,
+        lon_axis=_GRID_LON_AXIS,
+        var_dims={"precipitation": (("time", 1), ("lat", None), ("lon", None))},
+        expect_contains=("/precipitation[0:0][391:412][339:360]",),
+    ),
+    _CEArchetypeCase(
+        id="grid_edge_bbox_var_dims_unresolved_variable_is_whole_array",
+        archetype="grid_edge_bbox",
+        plan=_bbox_plan(("mystery_var",), (-95.0, 38.0, -90.0, 43.0), "C1-GES_DISC"),
+        lat_axis=_GRID_LAT_AXIS,
+        lon_axis=_GRID_LON_AXIS,
+        var_dims={},  # discovery ran but could not resolve this variable
+        expect_contains=("/mystery_var", "/lat[391:412]"),
+    ),
+)
+
+
+@pytest.mark.parametrize("case", _CE_ARCHETYPE_CORPUS, ids=lambda c: c.id)
+def test_constraint_expression_archetype_corpus(case: _CEArchetypeCase) -> None:
+    ce = build_constraint_expression(
+        case.plan,
+        coord_lat=case.coord_lat,
+        coord_lon=case.coord_lon,
+        coord_time=case.coord_time,
+        lat_axis=case.lat_axis,
+        lon_axis=case.lon_axis,
+        var_dims=case.var_dims,
     )
+    if case.expect_equals is not None:
+        assert ce == case.expect_equals
     parts = ce.split(";")
-    assert "/product/latitude[391:412]" in parts
-    assert "/product/longitude[339:360]" in parts
-    assert "/product/vertical_column_total[391:412][339:360]" in parts
-
-
-def test_constraint_expression_box_exceeding_extent_is_clamped() -> None:
-    """A box wider than the grid's extent clamps to the axis's valid indices."""
-    lat_axis = AxisGeometry(name="lat", origin=-59.875, step=0.25, length=600)
-    lon_axis = AxisGeometry(name="lon", origin=-179.875, step=0.25, length=1440)
-    plan = RetrievalPlan(
-        output_format=NETCDF,
-        needs_variable=True,
-        needs_bbox=True,
-        concept_id="C1-GES_DISC",
-        aoi=AOI(bbox=(-200.0, -90.0, 200.0, 100.0)),
-        transform=TransformSpec(output_format=NETCDF, variables=("precipitation",)),
-    )
-    ce = _constraint_expression(
-        plan, coord_lat="lat", coord_lon="lon", lat_axis=lat_axis, lon_axis=lon_axis
-    )
-    parts = ce.split(";")
-    assert "/lat[0:599]" in parts
-    assert "/lon[0:1439]" in parts
-
-
-def test_constraint_expression_degenerate_point_box_yields_one_cell() -> None:
-    """A point box (west == east, south == north) still returns at least one cell."""
-    lat_axis = AxisGeometry(name="lat", origin=-59.875, step=0.25, length=600)
-    lon_axis = AxisGeometry(name="lon", origin=-179.875, step=0.25, length=1440)
-    plan = RetrievalPlan(
-        output_format=NETCDF,
-        needs_variable=True,
-        needs_bbox=True,
-        concept_id="C1-GES_DISC",
-        aoi=AOI(bbox=(-90.125, 40.125, -90.125, 40.125)),
-        transform=TransformSpec(output_format=NETCDF, variables=("precipitation",)),
-    )
-    ce = _constraint_expression(
-        plan, coord_lat="lat", coord_lon="lon", lat_axis=lat_axis, lon_axis=lon_axis
-    )
-    parts = ce.split(";")
-    assert "/lat[400:400]" in parts
-    assert "/lon[359:359]" in parts
-
-
-def test_constraint_expression_antimeridian_falls_back_to_whole_longitude() -> None:
-    """west > east (a ±180deg wrap) skips the longitude hyperslab (v1: correct, not
-    minimal) but still clips latitude."""
-    lat_axis = AxisGeometry(name="lat", origin=-59.875, step=0.25, length=600)
-    lon_axis = AxisGeometry(name="lon", origin=-179.875, step=0.25, length=1440)
-    plan = RetrievalPlan(
-        output_format=NETCDF,
-        needs_variable=True,
-        needs_bbox=True,
-        concept_id="C1-GES_DISC",
-        aoi=AOI(bbox=(170.0, 38.0, -170.0, 43.0)),
-        transform=TransformSpec(output_format=NETCDF, variables=("precipitation",)),
-    )
-    ce = _constraint_expression(
-        plan, coord_lat="lat", coord_lon="lon", lat_axis=lat_axis, lon_axis=lon_axis
-    )
-    parts = ce.split(";")
-    assert "/lat[391:412]" in parts
-    assert "/lon" in parts  # whole-longitude, no bracket
-    assert "/precipitation[391:412]" in parts  # no lon bracket on the data var either
+    for token in case.expect_contains:
+        assert token in parts
+    for absent in case.expect_absent:
+        assert absent not in ce
 
 
 @pytest.mark.asyncio
@@ -520,61 +545,6 @@ async def test_submit_swath_collection_ignores_geometry() -> None:
     ref = await provider.submit(plan)
     ce = unquote(ref.provider_job_url.split("dap4.ce=", 1)[1])
     assert "[" not in ce  # whole-array, no hyperslab brackets at all
-
-
-def test_constraint_expression_var_dims_full_ranges_non_spatial_dimension() -> None:
-    """A variable carrying a non-spatial dimension (e.g. GLDAS's per-granule
-    ``time``, size 1) gets a full-range bracket for it, in its own dimension
-    order, alongside the lat/lon hyperslab — this is what actually shrinks the
-    payload for the real target collection (verified against production Cloud
-    OPeNDAP: a bracket-count mismatch is a 400 from Hyrax, not a safe no-op)."""
-    lat_axis = AxisGeometry(name="lat", origin=-59.875, step=0.25, length=600)
-    lon_axis = AxisGeometry(name="lon", origin=-179.875, step=0.25, length=1440)
-    var_dims = {"precipitation": (("time", 1), ("lat", None), ("lon", None))}
-    plan = RetrievalPlan(
-        output_format=NETCDF,
-        needs_variable=True,
-        needs_bbox=True,
-        concept_id="C1-GES_DISC",
-        aoi=AOI(bbox=(-95.0, 38.0, -90.0, 43.0)),
-        transform=TransformSpec(output_format=NETCDF, variables=("precipitation",)),
-    )
-    ce = _constraint_expression(
-        plan,
-        coord_lat="lat",
-        coord_lon="lon",
-        lat_axis=lat_axis,
-        lon_axis=lon_axis,
-        var_dims=var_dims,
-    )
-    parts = ce.split(";")
-    assert "/precipitation[0:0][391:412][339:360]" in parts
-
-
-def test_constraint_expression_var_dims_unresolved_variable_is_whole_array() -> None:
-    """A variable absent from var_dims (its shape couldn't be verified) gets no
-    bracket at all, even though geometry is available for other variables."""
-    lat_axis = AxisGeometry(name="lat", origin=-59.875, step=0.25, length=600)
-    lon_axis = AxisGeometry(name="lon", origin=-179.875, step=0.25, length=1440)
-    plan = RetrievalPlan(
-        output_format=NETCDF,
-        needs_variable=True,
-        needs_bbox=True,
-        concept_id="C1-GES_DISC",
-        aoi=AOI(bbox=(-95.0, 38.0, -90.0, 43.0)),
-        transform=TransformSpec(output_format=NETCDF, variables=("mystery_var",)),
-    )
-    ce = _constraint_expression(
-        plan,
-        coord_lat="lat",
-        coord_lon="lon",
-        lat_axis=lat_axis,
-        lon_axis=lon_axis,
-        var_dims={},  # discovery ran but could not resolve this variable
-    )
-    parts = ce.split(";")
-    assert "/mystery_var" in parts
-    assert "/lat[391:412]" in parts  # coords still hyperslab regardless
 
 
 @pytest.mark.asyncio
