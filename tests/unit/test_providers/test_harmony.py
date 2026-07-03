@@ -278,6 +278,31 @@ async def test_materialize_persists_result_to_storage(
 
 
 @pytest.mark.asyncio
+async def test_materialize_single_hdf4_file_gets_native_media_type(
+    l2_caps, local_backend, tmp_path
+) -> None:
+    # MOD13Q1-style result: Harmony returns the granule as-is, no reformatting
+    # service ran. The filename extension guesses netCDF, but the bytes are
+    # HDF4 — the honest media type must never be a netCDF one (PRD 008).
+    payload = b"\x0e\x03\x13\x01" + b"hdf4-granule-bytes"
+    downloaded = tmp_path / "MOD13Q1.A2024001.h08v05.hdf"
+    downloaded.write_bytes(payload)
+
+    future = MagicMock()
+    future.result.return_value = str(downloaded)
+    client = MagicMock()
+    client.download_all.return_value = iter([future])
+
+    p = _provider(l2_caps, client=client, storage=local_backend)
+    result = await p.materialize(
+        JobRef(provider="harmony", provider_job_id=_VALID_UUID, job_handle="job_hdf4")
+    )
+
+    assert result.media_type == "application/x-hdf4"
+    assert await local_backend.get(result.storage_key) == payload
+
+
+@pytest.mark.asyncio
 async def test_materialize_bundles_multiple_granules(
     l2_caps, local_backend, tmp_path
 ) -> None:
@@ -287,10 +312,11 @@ async def test_materialize_bundles_multiple_granules(
     import io
     import zipfile
 
+    _HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
     members = {
-        "TEMPO_NO2_L3_S002.nc4": b"\x89granule-002",
-        "TEMPO_NO2_L3_S003.nc4": b"\x89granule-003",
-        "TEMPO_NO2_L3_S004.nc4": b"\x89granule-004",
+        "TEMPO_NO2_L3_S002.nc4": _HDF5_MAGIC + b"granule-002",
+        "TEMPO_NO2_L3_S003.nc4": _HDF5_MAGIC + b"granule-003",
+        "TEMPO_NO2_L3_S004.nc4": _HDF5_MAGIC + b"granule-004",
     }
     futures = []
     for name, data in members.items():
@@ -315,3 +341,67 @@ async def test_materialize_bundles_multiple_granules(
         assert sorted(zf.namelist()) == sorted(members)
         for name, data in members.items():
             assert zf.read(name) == data
+
+
+@pytest.mark.asyncio
+async def test_materialize_bundle_with_hdf4_member_gets_native_archive_type(
+    l2_caps, local_backend, tmp_path
+) -> None:
+    # MOD13Q1-style multi-granule result: every member is untouched native HDF4.
+    # The bundle must never be labeled netcdf-bundle+zip (PRD 008) — it's a
+    # native archive, and downstream tools must refuse to open it as netCDF.
+    import io
+    import zipfile
+
+    members = {
+        "MOD13Q1.A2024001.h08v05.hdf": b"\x0e\x03\x13\x01" + b"granule-1",
+        "MOD13Q1.A2024009.h08v05.hdf": b"\x0e\x03\x13\x01" + b"granule-2",
+    }
+    futures = []
+    for name, data in members.items():
+        path = tmp_path / name
+        path.write_bytes(data)
+        future = MagicMock()
+        future.result.return_value = str(path)
+        futures.append(future)
+    client = MagicMock()
+    client.download_all.return_value = iter(futures)
+
+    p = _provider(l2_caps, client=client, storage=local_backend)
+    result = await p.materialize(
+        JobRef(provider="harmony", provider_job_id=_VALID_UUID, job_handle="job_native")
+    )
+
+    assert result.media_type == "application/x-native-archive+zip"
+    bundle = await local_backend.get(result.storage_key)
+    with zipfile.ZipFile(io.BytesIO(bundle)) as zf:
+        assert sorted(zf.namelist()) == sorted(members)
+
+
+@pytest.mark.asyncio
+async def test_materialize_mixed_bundle_gets_native_archive_type(
+    l2_caps, local_backend, tmp_path
+) -> None:
+    # A mixed bundle (some netCDF, some unknown/HDF4 members) must be treated
+    # as native/unopenable, never half-opened as netCDF (PRD 008 story 7).
+    _HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+    members = {
+        "good.nc4": _HDF5_MAGIC + b"granule-good",
+        "bad.hdf": b"\x0e\x03\x13\x01" + b"granule-bad",
+    }
+    futures = []
+    for name, data in members.items():
+        path = tmp_path / name
+        path.write_bytes(data)
+        future = MagicMock()
+        future.result.return_value = str(path)
+        futures.append(future)
+    client = MagicMock()
+    client.download_all.return_value = iter(futures)
+
+    p = _provider(l2_caps, client=client, storage=local_backend)
+    result = await p.materialize(
+        JobRef(provider="harmony", provider_job_id=_VALID_UUID, job_handle="job_mixed")
+    )
+
+    assert result.media_type == "application/x-native-archive+zip"

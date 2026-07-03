@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from earthdata_mcp.config import Settings, get_settings
+from earthdata_mcp.formats import NETCDF_FAMILY_FORMATS, sniff_format
 from earthdata_mcp.jobs.state import JobState
 from earthdata_mcp.providers._capabilities import (
     CollectionCapabilities,
@@ -74,6 +75,13 @@ _UUID_RE = re.compile(
 # zip of netCDF members under this media type, identical to OPeNDAPProvider's output,
 # so tools/_dataio opens it and concatenates the granules on the time axis on read.
 _NETCDF_BUNDLE_MEDIA_TYPE = "application/netcdf-bundle+zip"
+
+# Honest media types for a materialize result whose bytes are NOT netCDF-family
+# (PRD 008): native HDF4/HDF-EOS2 granules Harmony returned as-is because no
+# reformatting service ran, or bytes we can't identify at all. Never a netCDF type.
+_HDF4_MEDIA_TYPE = "application/x-hdf4"
+_UNKNOWN_MEDIA_TYPE = "application/octet-stream"
+_NATIVE_ARCHIVE_MEDIA_TYPE = "application/x-native-archive+zip"
 
 # Harmony job status string -> our durable JobState (the durable state machine).
 _STATUS_MAP: dict[str, JobState] = {
@@ -199,25 +207,37 @@ class HarmonyProvider:
             await storage.put(key, data)
             return MaterializedResult(
                 storage_key=key,
-                media_type=self._media_type_for(name),
+                media_type=self._media_type_for(name, data),
                 size_bytes=len(data),
             )
 
         # Multiple granule outputs: bundle them so one obs handle maps to one key.
+        # Sniffed per-member: all netCDF-family -> today's bundle type; any
+        # HDF4/unknown member -> the whole bundle is a native archive (PRD 008 —
+        # a mixed bundle is never half-opened, so one bad member taints the lot).
         buf = io.BytesIO()
         total = 0
+        formats: dict[str, int] = {}
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for name, data in files:
                 total += len(data)
+                detected = sniff_format(data)
+                formats[detected] = formats.get(detected, 0) + 1
                 zf.writestr(name, data)
         bundle = buf.getvalue()
+        all_netcdf = all(fmt in NETCDF_FAMILY_FORMATS for fmt in formats)
+        media_type = _NETCDF_BUNDLE_MEDIA_TYPE if all_netcdf else _NATIVE_ARCHIVE_MEDIA_TYPE
         key = f"{PROVIDER}/{handle}/result.nc.zip"
         await storage.put(key, bundle)
         return MaterializedResult(
             storage_key=key,
-            media_type=_NETCDF_BUNDLE_MEDIA_TYPE,
+            media_type=media_type,
             size_bytes=len(bundle),
-            extra={"granule_count": len(files), "uncompressed_bytes": total},
+            extra={
+                "granule_count": len(files),
+                "uncompressed_bytes": total,
+                "detected_formats": formats,
+            },
         )
 
     # -- harmony-py request mapping (the only logic we own) ---------------
@@ -310,8 +330,20 @@ class HarmonyProvider:
         return None
 
     @staticmethod
-    def _media_type_for(name: str) -> str:
-        """Media type for a result filename, patching the netCDF/HDF5 MIME gap."""
+    def _media_type_for(name: str, data: bytes) -> str:
+        """Media type for a result file, sniffed by content first (PRD 008).
+
+        netCDF-family bytes (HDF5/netCDF-4, netCDF classic) keep today's
+        extension-based media type. HDF4 or unrecognized bytes get an honest
+        native media type instead — extension-based guessing never overrides
+        what the bytes actually are, so a mislabeled ``.nc4`` that is really
+        HDF4 (the MOD13Q1 failure mode) can never be stored as netCDF.
+        """
+        detected = sniff_format(data)
+        if detected == "hdf4":
+            return _HDF4_MEDIA_TYPE
+        if detected not in NETCDF_FAMILY_FORMATS:
+            return _UNKNOWN_MEDIA_TYPE
         guessed = mimetypes.guess_type(name)[0]
         if guessed is None:
             suffix = Path(name).suffix.lower()

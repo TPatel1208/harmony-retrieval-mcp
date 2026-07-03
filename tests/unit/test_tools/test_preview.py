@@ -21,7 +21,9 @@ import xarray as xr
 
 import earthdata_mcp.tools.preview as _preview_module
 from earthdata_mcp.tools._dataio import (
+    HDF4_MEDIA_TYPE,
     NETCDF_BUNDLE_MEDIA_TYPE,
+    UnsupportedMediaType,
     ZARR_MEDIA_TYPE,
     serialize_result,
 )
@@ -135,6 +137,19 @@ def _bundle_zip_bytes(members: list[tuple[str, bytes]]) -> bytes:
         for name, data in members:
             zf.writestr(name, data)
     return buf.getvalue()
+
+
+async def _seed_native_hdf4_obs(store, storage, workspace_id: str) -> str:
+    """A MOD13Q1-style materialized result: untouched native HDF4 bytes, honestly
+    labeled ``application/x-hdf4`` by the Harmony provider (PRD 008)."""
+    data = b"\x0e\x03\x13\x01" + b"native-hdf4-granule-bytes"
+    key = f"results/{uuid4().hex}/granule.hdf"
+    await storage.put(key, data)
+    return await store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "ready", "storage_key": key, "media_type": HDF4_MEDIA_TYPE},
+    )
 
 
 # -- preview_dataset -------------------------------------------------------
@@ -428,6 +443,33 @@ async def test_inspect_statistics_julian_calendar_does_not_crash(
     assert stats["min"] == 1.0
     assert stats["max"] == 2.0
     assert stats["count"] == 2
+
+
+async def test_inspect_statistics_native_hdf4_raises_actionable_error(
+    workspace_store, local_backend, workspace_id
+):
+    """PRD 008: the MOD13Q1 failure mode end-to-end. inspect_statistics on a
+    handle whose stored bytes are native HDF4 must surface the actionable
+    UnsupportedMediaType message, not a raw h5py parser-error traceback."""
+    obs = await _seed_native_hdf4_obs(workspace_store, local_backend, workspace_id)
+
+    with pytest.raises(UnsupportedMediaType, match="AppEEARS"):
+        await inspect_statistics(
+            obs, workspace_id=workspace_id, store=workspace_store, storage=local_backend
+        )
+
+
+async def test_summarize_dataset_native_hdf4_raises_actionable_error(
+    workspace_store, local_backend, workspace_id
+):
+    """Every tool sharing the read path is consistent about what it can't open
+    (PRD 008 story 4): summarize_dataset on the same handle gets the same error."""
+    obs = await _seed_native_hdf4_obs(workspace_store, local_backend, workspace_id)
+
+    with pytest.raises(UnsupportedMediaType, match="AppEEARS"):
+        await summarize_dataset(
+            obs, workspace_id=workspace_id, store=workspace_store, storage=local_backend
+        )
 
 
 async def test_inspect_statistics_cross_workspace_denied(

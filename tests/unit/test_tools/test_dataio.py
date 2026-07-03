@@ -28,10 +28,12 @@ import pytest
 
 from earthdata_mcp.tools._dataio import (
     CSV_MEDIA_TYPE,
+    NATIVE_ARCHIVE_MEDIA_TYPE,
     NETCDF_BUNDLE_MEDIA_TYPE,
     NETCDF_WRITE_MEDIA_TYPE,
     PARQUET_MEDIA_TYPE,
     UnsupportedMediaType,
+    HDF4_MEDIA_TYPE,
     normalize_output_format,
     open_result,
     open_result_lazy,
@@ -448,3 +450,55 @@ def test_normalize_output_format_accepts_aliases(alias: str, canonical: str) -> 
 def test_normalize_output_format_rejects_unknown() -> None:
     with pytest.raises(UnsupportedMediaType):
         normalize_output_format("geojson")
+
+
+# -- native-format honesty (PRD 008) ------------------------------------------
+
+
+def test_open_result_native_hdf4_raises_actionable_error() -> None:
+    """A materialized result honestly labeled x-hdf4 (PRD 008) must name every
+    alternative a researcher has, not just say "cannot open"."""
+    data = b"\x0e\x03\x13\x01" + b"native-hdf4-bytes"
+    with pytest.raises(UnsupportedMediaType) as exc_info:
+        open_result(data, HDF4_MEDIA_TYPE)
+    message = str(exc_info.value)
+    assert "HDF4" in message
+    assert "AppEEARS" in message
+    assert "output_format" in message
+    assert "download" in message.lower()
+
+
+def test_open_result_native_archive_bundle_raises_actionable_error() -> None:
+    data = b"PK\x03\x04fake-zip-bytes"
+    with pytest.raises(UnsupportedMediaType) as exc_info:
+        open_result(data, NATIVE_ARCHIVE_MEDIA_TYPE)
+    message = str(exc_info.value)
+    assert "AppEEARS" in message
+    assert "output_format" in message
+    assert "download" in message.lower()
+
+
+def test_open_result_lazy_native_hdf4_raises_actionable_error(tmp_path) -> None:
+    """inspect_statistics reads through open_result_lazy (the disk-path route),
+    so the same actionable message must fire there too (PRD 008 story 4)."""
+    path = tmp_path / "granule.hdf"
+    path.write_bytes(b"\x0e\x03\x13\x01" + b"native-hdf4-bytes")
+    with pytest.raises(UnsupportedMediaType) as exc_info:
+        with open_result_lazy(path, HDF4_MEDIA_TYPE):
+            pass
+    message = str(exc_info.value)
+    assert "AppEEARS" in message
+    assert "output_format" in message
+
+
+def test_open_result_mislabeled_hdf4_raises_actionable_error() -> None:
+    """PRD 008 story 8: a legacy row materialized *before* this fix shipped can
+    still carry a netCDF media type on HDF4 bytes. The magic-byte defense must
+    catch the mismatch and raise the same actionable message, not let h5netcdf
+    fail with a raw parser error."""
+    data = b"\x0e\x03\x13\x01" + b"actually-hdf4-bytes"
+    with pytest.raises(UnsupportedMediaType) as exc_info:
+        open_result(data, "application/netcdf4")
+    message = str(exc_info.value)
+    assert "AppEEARS" in message
+    assert "before content sniffing existed" in message

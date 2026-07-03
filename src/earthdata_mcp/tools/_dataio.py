@@ -41,6 +41,8 @@ import pyarrow.csv as pa_csv
 import pyarrow.parquet as pq
 import xarray as xr
 
+from earthdata_mcp.formats import NETCDF_FAMILY_FORMATS, sniff_format
+
 #: Media types this server can open and serialize in-process (§4.4 format-by-shape).
 ZARR_MEDIA_TYPE = "application/zarr"
 PARQUET_MEDIA_TYPE = "application/x-parquet"
@@ -91,6 +93,23 @@ def normalize_output_format(output_format: str) -> str:
 #: A multi-granule retrieval: a zip whose members are netCDF granule subsets, opened
 #: and concatenated on the time axis. Produced by ``OPeNDAPProvider`` (Part 3).
 NETCDF_BUNDLE_MEDIA_TYPE = "application/netcdf-bundle+zip"
+
+#: Honest media types for a materialized result that is NOT netCDF-family (PRD 008):
+#: untouched native HDF4/HDF-EOS2 (Harmony had no reformatting service and returned
+#: the granule as-is), and a bundle where at least one member is HDF4/unrecognized.
+#: The server cannot open either in-process — see ``_NATIVE_FORMAT_MESSAGE``.
+HDF4_MEDIA_TYPE = "application/x-hdf4"
+NATIVE_ARCHIVE_MEDIA_TYPE = "application/x-native-archive+zip"
+
+#: The actionable alternatives named in every native-format error (PRD 008 story 3):
+#: AppEEARS point-sample, an explicit output_format request (fails fast if
+#: unsupported), or direct download of the stored archive.
+_NATIVE_FORMAT_MESSAGE = (
+    "this result is untouched native HDF4/HDF-EOS2 — the server cannot open it "
+    "in-process. Alternatives: request an AppEEARS point-sample for MODIS "
+    "products, retry with an explicit output_format (which fails fast if "
+    "unsupported), or download the stored archive directly."
+)
 
 #: Dimension concatenated across bundle members. TEMPO/OMI L3 carry a length-1 ``time``
 #: per granule; stacking on it reconstructs the time series for the window.
@@ -149,7 +168,10 @@ def open_result(data: bytes, media_type: str) -> xr.Dataset | pa.Table:
         return pq.read_table(io.BytesIO(data))
     if media_type == CSV_MEDIA_TYPE:
         return pa_csv.read_csv(io.BytesIO(data))
+    if media_type in (HDF4_MEDIA_TYPE, NATIVE_ARCHIVE_MEDIA_TYPE):
+        raise UnsupportedMediaType(_NATIVE_FORMAT_MESSAGE)
     if media_type in NETCDF_MEDIA_TYPES:
+        _check_netcdf_magic(data)
         return _open_netcdf_flattened(data)
     if media_type == NETCDF_BUNDLE_MEDIA_TYPE:
         return _open_netcdf_bundle(data)
@@ -158,6 +180,18 @@ def open_result(data: bytes, media_type: str) -> xr.Dataset | pa.Table:
         f"{ZARR_MEDIA_TYPE!r}, {PARQUET_MEDIA_TYPE!r}, {CSV_MEDIA_TYPE!r}, "
         f"{NETCDF_BUNDLE_MEDIA_TYPE!r}, and netCDF-4)"
     )
+
+
+def _check_netcdf_magic(data: bytes) -> None:
+    """Defense-in-depth for legacy rows (PRD 008 story 8): a blob whose stored
+    media type *claims* netCDF but whose bytes say HDF4 (materialized before
+    content sniffing existed) must raise the same actionable message instead of
+    a raw h5py parser error."""
+    if sniff_format(data) not in NETCDF_FAMILY_FORMATS:
+        raise UnsupportedMediaType(
+            f"{_NATIVE_FORMAT_MESSAGE} (this result was materialized before "
+            "content sniffing existed and is mislabeled as netCDF)"
+        )
 
 
 @contextlib.contextmanager
@@ -173,6 +207,9 @@ def open_result_lazy(
 
     Raises :class:`UnsupportedMediaType` for unrecognised ``media_type``.
     """
+    if media_type in (HDF4_MEDIA_TYPE, NATIVE_ARCHIVE_MEDIA_TYPE):
+        raise UnsupportedMediaType(_NATIVE_FORMAT_MESSAGE)
+
     if media_type == ZARR_MEDIA_TYPE:
         # ZipStore in read mode: zarr reads individual chunk blobs on demand —
         # no full extraction to a temp dir.  The write path still avoids ZipStore
@@ -184,6 +221,7 @@ def open_result_lazy(
             store.close()
 
     elif media_type in NETCDF_MEDIA_TYPES:
+        _check_netcdf_magic(path.read_bytes()[:16])
         # xr.open_groups propagates chunks= to each internal open_dataset call,
         # so both plain and grouped (TEMPO/OMI) netCDF come back dask-backed.
         groups = xr.open_groups(
