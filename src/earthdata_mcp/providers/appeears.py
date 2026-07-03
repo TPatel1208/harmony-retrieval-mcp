@@ -370,11 +370,15 @@ class AppEEARSProvider:
 def _normalize_layer(name: str) -> str:
     """Canonical form for fuzzy-matching UMM-V names against AppEEARS layer keys.
 
-    Rules: strip a leading underscore (MOD13Q1 style), lowercase, replace spaces
-    with underscores. Applying the same rule to both sides handles products that
-    use a leading underscore (MOD13Q1) and those that don't (MOD11A1) uniformly.
+    Rules: strip one leading ``/`` or ``_`` (MOD13Q1's leading-underscore style,
+    or a UMM-V group path's leading slash), lowercase, then map both spaces and
+    ``/`` to ``_``. UMM-Var group/leaf names, OPeNDAP paths, and AppEEARS layer
+    keys are three spellings of the same variable (e.g.
+    ``Soil_Moisture_Retrieval_Data_AM/soil_moisture`` vs.
+    ``Soil_Moisture_Retrieval_Data_AM_soil_moisture``); applying the same rule to
+    both sides collapses all three onto one canonical form.
     """
-    return name.lstrip("_").lower().replace(" ", "_")
+    return name.lstrip("/_").lower().replace(" ", "_").replace("/", "_")
 
 
 def _point_from_aoi(aoi: AOI | None) -> tuple[float, float]:

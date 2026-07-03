@@ -156,6 +156,42 @@ async def test_submit_posts_point_task_and_returns_task_id(httpx_mock) -> None:
 
 
 @pytest.mark.asyncio
+async def test_submit_resolves_slash_joined_group_variable(httpx_mock) -> None:
+    """A slash-joined UMM-V group/leaf name (what describe_dataset hands back for a
+    grouped product like SMAP SPL3SMP) must resolve to the underscore-joined
+    AppEEARS layer key in the POSTed task body — the researcher-facing bug this
+    PRD fixes."""
+    smap_caps = _caps(short_name="SPL3SMP", version="008")
+    provider = AppEEARSProvider(smap_caps, settings=_settings())
+    plan = RetrievalPlan(
+        output_format=PARQUET_MEDIA_TYPE,
+        needs_point_sample=True,
+        concept_id="C3-NSIDC",
+        short_name="SPL3SMP",
+        aoi=AOI(bbox=(-105.0, 37.0, -103.0, 39.0)),
+        time_range=TimeRange(
+            start=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+            end=dt.datetime(2024, 3, 1, tzinfo=dt.timezone.utc),
+        ),
+        transform=TransformSpec(
+            output_format=PARQUET_MEDIA_TYPE,
+            variables=("Soil_Moisture_Retrieval_Data_AM/soil_moisture",),
+        ),
+    )
+    _mock_login(httpx_mock)
+    _mock_layer_list(httpx_mock, product="SPL3SMP.008", layers=GROUPED_LAYER_MAP)
+    httpx_mock.add_response(url=f"{BASE}/task", method="POST", json={"task_id": "smap1"})
+
+    await provider.submit(plan)
+
+    task_req = httpx_mock.get_requests()[2]
+    body = json.loads(task_req.content)
+    assert body["params"]["layers"] == [
+        {"product": "SPL3SMP.008", "layer": "Soil_Moisture_Retrieval_Data_AM_soil_moisture"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_submit_resolves_layer_with_no_leading_underscore(httpx_mock) -> None:
     """MOD11A1 layers don't use a leading underscore; normalization must handle both styles."""
     mod11_caps = _caps(short_name="MOD11A1", version="061")
@@ -239,6 +275,53 @@ async def test_submit_task_rejection_surfaces_response_body(httpx_mock) -> None:
 
     with pytest.raises(httpx.HTTPStatusError, match="startDate must precede endDate"):
         await _provider().submit(_point_plan())
+
+
+# -- layer matching: UMM-V slash-joined group names resolve to AppEEARS keys --
+
+GROUPED_PRODUCT = "SPL3SMP.008"
+GROUPED_LAYER_MAP = {
+    "Soil_Moisture_Retrieval_Data_AM_soil_moisture": {"Description": "AM soil moisture"},
+    "Soil_Moisture_Retrieval_Data_PM_soil_moisture": {"Description": "PM soil moisture"},
+}
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "Soil_Moisture_Retrieval_Data_AM/soil_moisture",  # slash-joined UMM-V name
+        "/Soil_Moisture_Retrieval_Data_AM/soil_moisture",  # leading-slash path
+        "Soil_Moisture_Retrieval_Data_AM_soil_moisture",  # underscore-joined exact key (regression)
+    ],
+)
+def test_resolve_layers_matches_slash_joined_umm_v_name(variable: str) -> None:
+    resolved = _provider()._resolve_layers(GROUPED_PRODUCT, GROUPED_LAYER_MAP, (variable,))
+    assert resolved == [
+        {"product": GROUPED_PRODUCT, "layer": "Soil_Moisture_Retrieval_Data_AM_soil_moisture"}
+    ]
+
+
+def test_resolve_layers_matches_leading_underscore_style_regression() -> None:
+    """MOD13Q1-style leading-underscore keys must keep matching (regression)."""
+    resolved = _provider()._resolve_layers(
+        PRODUCT, {APPEEARS_LAYER: {}}, (UMM_V_LAYER,)
+    )
+    assert resolved == [{"product": PRODUCT, "layer": APPEEARS_LAYER}]
+
+
+def test_resolve_layers_raises_on_unknown_name_listing_layers() -> None:
+    with pytest.raises(RuntimeError, match="Soil_Moisture_Retrieval_Data_XX/bogus"):
+        _provider()._resolve_layers(
+            GROUPED_PRODUCT, GROUPED_LAYER_MAP, ("Soil_Moisture_Retrieval_Data_XX/bogus",)
+        )
+
+
+def test_resolve_layers_rejects_bare_ambiguous_leaf() -> None:
+    """A bare leaf name (``soil_moisture``) matches neither the AM nor PM group
+    key once normalized, so it is rejected rather than silently guessing the
+    overpass — the researcher must spell the group explicitly."""
+    with pytest.raises(RuntimeError, match="soil_moisture"):
+        _provider()._resolve_layers(GROUPED_PRODUCT, GROUPED_LAYER_MAP, ("soil_moisture",))
 
 
 # -- planning-time catalog check (reused by the shared retrieval planning core) --
