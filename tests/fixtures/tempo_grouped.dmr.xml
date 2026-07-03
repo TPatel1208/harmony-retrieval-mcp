@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<Dataset xmlns="http://xml.opendap.org/ns/DAP/4.0#" dapVersion="4.0" dmrVersion="1.0"
+         name="TEMPO_HCHO_L3_V03_20240601T102914Z_S001.nc">
+    <Dimension name="mirror_step" size="600"/>
+    <Dimension name="xtrack" size="1440"/>
+    <Group name="product">
+        <Float32 name="vertical_column_total">
+            <Dim name="/mirror_step"/>
+            <Dim name="/xtrack"/>
+        </Float32>
+        <Float32 name="latitude">
+            <Dim name="/mirror_step"/>
+            <Dim name="/xtrack"/>
+            <Attribute name="standard_name" type="String"><Value>latitude</Value></Attribute>
+        </Float32>
+        <Float32 name="longitude">
+            <Dim name="/mirror_step"/>
+            <Dim name="/xtrack"/>
+            <Attribute name="standard_name" type="String"><Value>longitude</Value></Attribute>
+        </Float32>
+    </Group>
+</Dataset>

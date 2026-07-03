@@ -17,6 +17,7 @@ Two assertions are load-bearing (per the design review):
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -318,6 +319,32 @@ def _make_cmr_with_grid_geometry(caps: CollectionCapabilities) -> CMRProvider:
         ]
     )
     cmr.get_variables = AsyncMock(return_value=_GRID_GEOMETRY_VARS)
+    return cmr
+
+
+_ATL08_DMR_XML = (
+    Path(__file__).resolve().parents[2] / "fixtures" / "atl08_grouped.dmr.xml"
+).read_text()
+
+
+def _make_cmr_atl08_style(caps: CollectionCapabilities) -> CMRProvider:
+    """CMR mock for a collection with no UMM-Var catalog at all (ATL08): one
+    OPeNDAP granule, empty ``get_variables``, and ``get_dmr`` serving the
+    trimmed ATL08 fixture — exercises the DMR structure-discovery fallback
+    (PRD 009) end-to-end through the retrieval tool."""
+    cmr = CMRProvider.__new__(CMRProvider)
+    cmr.collection_capabilities = AsyncMock(return_value=caps)
+    cmr.search_granules = AsyncMock(
+        return_value=[
+            {
+                "related_urls": [
+                    {"URL": _OPENDAP_URL, "Type": "USE SERVICE API", "Subtype": "OPENDAP DATA"}
+                ]
+            }
+        ]
+    )
+    cmr.get_variables = AsyncMock(return_value=[])
+    cmr.get_dmr = AsyncMock(return_value=_ATL08_DMR_XML)
     return cmr
 
 
@@ -1229,6 +1256,45 @@ async def test_retrieve_subset_no_extent_omits_geometry_from_spec(
     assert spec["var_dims"] == {}
 
 
+async def test_retrieve_subset_dmr_expansion_and_var_coords_thread_into_spec(
+    workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
+) -> None:
+    """ATL08 end-to-end: no UMM-Var catalog, so the granule's own DMR resolves
+    a bare leaf name across every parallel beam group, and each resolved
+    variable's own group-local lat/lon plus the expansion record land on the
+    durable spec (PRD 009) — the same pass-through seam axis geometry already
+    uses (retrieval.py's ``_submit_retrieval``)."""
+    cmr = _make_cmr_atl08_style(_no_service_caps())
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await retrieve_subset(
+        ds, aoi, _TIME, ["h_te_best_fit"], workspace_id=workspace_id,
+        cmr=cmr, store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=mock_enqueue,
+    )
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    spec = job.request_spec
+    assert set(spec["variables"]) == {
+        "/gt1l/land_segments/terrain/h_te_best_fit",
+        "/gt1r/land_segments/terrain/h_te_best_fit",
+        "/gt2l/land_segments/terrain/h_te_best_fit",
+    }
+    assert spec["coord_lat"] is None
+    assert spec["coord_lon"] is None
+    assert spec["var_coords"]["/gt1l/land_segments/terrain/h_te_best_fit"] == [
+        "/gt1l/land_segments/latitude", "/gt1l/land_segments/longitude",
+    ]
+    assert sorted(spec["variable_expansions"]["h_te_best_fit"]) == sorted(spec["variables"])
+    # Harmony is tried first (unpinned — no registered services); the OPeNDAP
+    # URL and its DMR-resolved structure are still carried in the spec for the
+    # worker's Harmony -> OPeNDAP fallback.
+    assert out["provider"] == "harmony"
+    assert spec["opendap_url"] == _OPENDAP_URL
+
+
 async def test_retrieve_subset_cmr_error_falls_back_gracefully(
     workspace_store, provenance_store, session_factory, mock_enqueue, workspace_id,
 ) -> None:
@@ -1248,6 +1314,7 @@ async def test_retrieve_subset_cmr_error_falls_back_gracefully(
     spec = job.request_spec
     # Falls back to the bare name — degrade, not fail.
     assert spec["variables"] == ["vertical_column_total"]
-    # Coordinate defaults are used on CMR failure.
-    assert spec["coord_lat"] == "lat"
-    assert spec["coord_lon"] == "lon"
+    # Coordinates stay unconfirmed on CMR failure — never a guessed "lat"/"lon"
+    # (PRD 009's never-guess rule).
+    assert spec["coord_lat"] is None
+    assert spec["coord_lon"] is None

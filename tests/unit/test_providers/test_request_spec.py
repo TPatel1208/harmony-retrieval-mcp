@@ -188,6 +188,91 @@ def test_opendap_spec_round_trips_axis_geometry_var_dims_and_urls() -> None:
     assert reconstructed.var_dims == var_dims
 
 
+def test_var_coords_and_expansions_round_trip_and_default_empty() -> None:
+    """PRD 009: the DMR-resolved per-variable coordinate paths and the bare-name
+    expansion record (ATL08's parallel beams) are additive, optional fields —
+    a spec without them (legacy, or a UMM-V-resolved collection) defaults to
+    empty on both write and read."""
+    plan = RetrievalPlan(
+        output_format="application/netcdf4",
+        needs_bbox=True,
+        needs_variable=True,
+        needs_temporal=True,
+        concept_id=_CONCEPT_ID,
+        short_name="ATL08",
+        aoi=AOI(bbox=_BBOX),
+        time_range=TimeRange.from_cmr(_TIME),
+    )
+    var_coords = {
+        "/gt1l/land_segments/terrain/h_te_best_fit": (
+            "/gt1l/land_segments/latitude",
+            "/gt1l/land_segments/longitude",
+        ),
+        "/gt1r/land_segments/terrain/h_te_best_fit": (
+            "/gt1r/land_segments/latitude",
+            "/gt1r/land_segments/longitude",
+        ),
+    }
+    variable_expansions = {
+        "h_te_best_fit": (
+            "/gt1l/land_segments/terrain/h_te_best_fit",
+            "/gt1r/land_segments/terrain/h_te_best_fit",
+        )
+    }
+    spec = RequestSpec.from_plan(
+        plan,
+        decision=RoutingDecision(path="opendap"),
+        caps=_grid_no_service_caps(),
+        workspace_id="ws-1",
+        job_handle="job_abc",
+        obs_handle="obs_abc",
+        time_range=_TIME,
+        variables=tuple(variable_expansions["h_te_best_fit"]),
+        opendap_urls=["https://opendap.example/atl08"],
+        var_coords=var_coords,
+        variable_expansions=variable_expansions,
+    )
+    data = spec.to_jsonb()
+    assert data["var_coords"] == {
+        "/gt1l/land_segments/terrain/h_te_best_fit": [
+            "/gt1l/land_segments/latitude", "/gt1l/land_segments/longitude",
+        ],
+        "/gt1r/land_segments/terrain/h_te_best_fit": [
+            "/gt1r/land_segments/latitude", "/gt1r/land_segments/longitude",
+        ],
+    }
+    assert data["variable_expansions"] == {
+        "h_te_best_fit": [
+            "/gt1l/land_segments/terrain/h_te_best_fit",
+            "/gt1r/land_segments/terrain/h_te_best_fit",
+        ]
+    }
+
+    reconstructed = RequestSpec.from_jsonb(data)
+    assert reconstructed == spec
+    assert reconstructed.var_coords == var_coords
+    assert reconstructed.variable_expansions == variable_expansions
+
+
+def test_var_coords_and_expansions_default_empty_when_absent() -> None:
+    spec = RequestSpec.from_jsonb({"concept_id": _CONCEPT_ID, "provider": "opendap"})
+    assert spec.var_coords == {}
+    assert spec.variable_expansions == {}
+    assert spec.to_jsonb()["var_coords"] == {}
+    assert spec.to_jsonb()["variable_expansions"] == {}
+
+
+def test_from_jsonb_malformed_var_coords_raises_invalid_spec_error() -> None:
+    with pytest.raises(InvalidSpecError):
+        RequestSpec.from_jsonb(
+            {
+                "concept_id": _CONCEPT_ID,
+                "provider": "opendap",
+                "var_coords": {"/product/x": ["only_lat"]},
+            }
+        )
+
+
 # -- to_plan(): the worker's RetrievalPlan reconstruction --------------------
 
 

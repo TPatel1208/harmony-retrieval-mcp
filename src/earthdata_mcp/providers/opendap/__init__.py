@@ -1,11 +1,14 @@
 """OPeNDAPProvider — Hyrax/DAP4 subset for gridded collections (PLAN.md §4.2 step 3).
 
-This package is split along its three responsibilities:
+This package is split along its four responsibilities:
 
 * :mod:`._serialization` — pure DAP4 serialization (fully-qualified names,
   hyperslab index math, the constraint-expression builder). No I/O.
 * :mod:`._planning` — CMR-facing planning (:func:`plan_subset` and its
   discovery/resolution helpers).
+* :mod:`._dmr` — pure DAP4 DMR (Dataset Metadata Response) XML parsing and
+  resolution (PRD 009): the granule-structure fallback :mod:`._planning`
+  consults when UMM-Var is empty or insufficient. No I/O.
 * :mod:`._runtime` — Hyrax-facing runtime (:class:`OPeNDAPProvider`'s
   submit/poll/materialize).
 

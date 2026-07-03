@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<Dataset xmlns="http://xml.opendap.org/ns/DAP/4.0#" dapVersion="4.0" dmrVersion="1.0"
+         name="ATL08_20200101000000_00490601_006_01.h5">
+    <Dimension name="gt1l_land_segments" size="100"/>
+    <Dimension name="gt1r_land_segments" size="100"/>
+    <Dimension name="gt2l_land_segments" size="100"/>
+    <Group name="gt1l">
+        <Group name="land_segments">
+            <Float32 name="latitude">
+                <Dim name="/gt1l_land_segments"/>
+                <Attribute name="standard_name" type="String"><Value>latitude</Value></Attribute>
+            </Float32>
+            <Float32 name="longitude">
+                <Dim name="/gt1l_land_segments"/>
+                <Attribute name="standard_name" type="String"><Value>longitude</Value></Attribute>
+            </Float32>
+            <Group name="terrain">
+                <Float32 name="h_te_best_fit">
+                    <Dim name="/gt1l_land_segments"/>
+                </Float32>
+            </Group>
+        </Group>
+    </Group>
+    <Group name="gt1r">
+        <Group name="land_segments">
+            <Float32 name="latitude">
+                <Dim name="/gt1r_land_segments"/>
+                <Attribute name="standard_name" type="String"><Value>latitude</Value></Attribute>
+            </Float32>
+            <Float32 name="longitude">
+                <Dim name="/gt1r_land_segments"/>
+                <Attribute name="standard_name" type="String"><Value>longitude</Value></Attribute>
+            </Float32>
+            <Group name="terrain">
+                <Float32 name="h_te_best_fit">
+                    <Dim name="/gt1r_land_segments"/>
+                </Float32>
+            </Group>
+        </Group>
+    </Group>
+    <Group name="gt2l">
+        <Group name="land_segments">
+            <Float32 name="latitude">
+                <Dim name="/gt2l_land_segments"/>
+                <Attribute name="standard_name" type="String"><Value>latitude</Value></Attribute>
+            </Float32>
+            <Float32 name="longitude">
+                <Dim name="/gt2l_land_segments"/>
+                <Attribute name="standard_name" type="String"><Value>longitude</Value></Attribute>
+            </Float32>
+            <Group name="terrain">
+                <Float32 name="h_te_best_fit">
+                    <Dim name="/gt2l_land_segments"/>
+                </Float32>
+            </Group>
+        </Group>
+    </Group>
+</Dataset>

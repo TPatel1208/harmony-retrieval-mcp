@@ -453,12 +453,16 @@ async def _submit_retrieval(
     lat_axis: AxisGeometry | None = None
     lon_axis: AxisGeometry | None = None
     var_dims: dict[str, VarDimPlan] = {}
+    var_coords: dict[str, tuple[str, str]] = {}
+    variable_expansions: dict[str, tuple[str, ...]] = {}
     if opendap_plan is not None:
         coord_lat, coord_lon = opendap_plan.coord_lat, opendap_plan.coord_lon
         coord_time = opendap_plan.coord_time
         lat_axis, lon_axis, var_dims = (
             opendap_plan.lat_axis, opendap_plan.lon_axis, opendap_plan.var_dims
         )
+        var_coords = opendap_plan.var_coords
+        variable_expansions = opendap_plan.variable_expansions
         variables = opendap_plan.variables
     harmony_provider = HarmonyProvider(caps)
     opendap_provider = (
@@ -471,6 +475,7 @@ async def _submit_retrieval(
             lat_axis=lat_axis,
             lon_axis=lon_axis,
             var_dims=var_dims,
+            var_coords=var_coords,
         )
         if opendap_urls
         else None
@@ -522,6 +527,8 @@ async def _submit_retrieval(
         lat_axis=lat_axis,
         lon_axis=lon_axis,
         var_dims=var_dims,
+        var_coords=var_coords,
+        variable_expansions=variable_expansions,
     ).to_jsonb()
 
     job_id = uuid4().hex

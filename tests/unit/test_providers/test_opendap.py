@@ -10,6 +10,7 @@ and result persistence through ``StorageBackend``. The real Hyrax fetch is the
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import unquote
 
 import pytest
@@ -303,12 +304,13 @@ class _CEArchetypeCase:
     id: str
     archetype: str
     plan: RetrievalPlan
-    coord_lat: str = "lat"
-    coord_lon: str = "lon"
+    coord_lat: str | None = "lat"
+    coord_lon: str | None = "lon"
     coord_time: str | None = None
     lat_axis: AxisGeometry | None = None
     lon_axis: AxisGeometry | None = None
     var_dims: dict | None = None
+    var_coords: dict[str, tuple[str, str]] | None = None
     expect_equals: str | None = None
     expect_contains: tuple[str, ...] = ()
     expect_absent: tuple[str, ...] = ()
@@ -484,6 +486,75 @@ _CE_ARCHETYPE_CORPUS: tuple[_CEArchetypeCase, ...] = (
         var_dims={},  # discovery ran but could not resolve this variable
         expect_contains=("/mystery_var", "/lat[391:412]"),
     ),
+    # -- DMR-resolved grouped/swath (ATL08-style): no UMM-V, no global coord —
+    # never-guess rule (PRD 009): an unconfirmed coordinate is omitted, not
+    # projected as a guessed "lat"/"lon". See docs/opendap_quirk_ledger.md.
+    _CEArchetypeCase(
+        id="dmr_unconfirmed_global_coords_are_omitted_not_guessed",
+        archetype="dmr_grouped_swath",
+        plan=_bbox_plan(
+            ("/gt1l/land_segments/terrain/h_te_best_fit",),
+            (-105.0, 37.0, -104.0, 38.0),
+            "C1-ATL08",
+        ),
+        coord_lat=None,
+        coord_lon=None,
+        expect_equals="/gt1l/land_segments/terrain/h_te_best_fit",
+    ),
+    _CEArchetypeCase(
+        id="dmr_per_variable_coords_project_group_local_lat_lon",
+        archetype="dmr_grouped_swath",
+        plan=_bbox_plan(
+            ("/gt1l/land_segments/terrain/h_te_best_fit",),
+            (-105.0, 37.0, -104.0, 38.0),
+            "C1-ATL08",
+        ),
+        coord_lat=None,
+        coord_lon=None,
+        var_coords={
+            "/gt1l/land_segments/terrain/h_te_best_fit": (
+                "/gt1l/land_segments/latitude",
+                "/gt1l/land_segments/longitude",
+            )
+        },
+        expect_contains=(
+            "/gt1l/land_segments/terrain/h_te_best_fit",
+            "/gt1l/land_segments/latitude",
+            "/gt1l/land_segments/longitude",
+        ),
+    ),
+    _CEArchetypeCase(
+        id="dmr_expanded_beams_each_keep_their_own_groups_coords",
+        archetype="dmr_grouped_swath",
+        plan=_bbox_plan(
+            (
+                "/gt1l/land_segments/terrain/h_te_best_fit",
+                "/gt1r/land_segments/terrain/h_te_best_fit",
+            ),
+            (-105.0, 37.0, -104.0, 38.0),
+            "C1-ATL08",
+        ),
+        coord_lat=None,
+        coord_lon=None,
+        var_coords={
+            "/gt1l/land_segments/terrain/h_te_best_fit": (
+                "/gt1l/land_segments/latitude",
+                "/gt1l/land_segments/longitude",
+            ),
+            "/gt1r/land_segments/terrain/h_te_best_fit": (
+                "/gt1r/land_segments/latitude",
+                "/gt1r/land_segments/longitude",
+            ),
+        },
+        expect_contains=(
+            "/gt1l/land_segments/terrain/h_te_best_fit",
+            "/gt1l/land_segments/latitude",
+            "/gt1l/land_segments/longitude",
+            "/gt1r/land_segments/terrain/h_te_best_fit",
+            "/gt1r/land_segments/latitude",
+            "/gt1r/land_segments/longitude",
+        ),
+    ),
 )
 
 
@@ -497,6 +568,7 @@ def test_constraint_expression_archetype_corpus(case: _CEArchetypeCase) -> None:
         lat_axis=case.lat_axis,
         lon_axis=case.lon_axis,
         var_dims=case.var_dims,
+        var_coords=case.var_coords,
     )
     if case.expect_equals is not None:
         assert ce == case.expect_equals
@@ -548,6 +620,41 @@ async def test_submit_swath_collection_ignores_geometry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_submit_projects_dmr_resolved_per_variable_coords() -> None:
+    """ATL08-shaped: no global coord_lat/coord_lon (never confirmed), but each
+    variable carries its own DMR-resolved group-local lat/lon via var_coords."""
+    provider = OPeNDAPProvider(
+        _swath_caps(),
+        opendap_urls=[OPENDAP_URL],
+        storage=None,
+        settings=_settings(),
+        coord_lat=None,
+        coord_lon=None,
+        var_coords={
+            "/gt1l/land_segments/terrain/h_te_best_fit": (
+                "/gt1l/land_segments/latitude",
+                "/gt1l/land_segments/longitude",
+            )
+        },
+    )
+    plan = _subset_plan(
+        needs_bbox=True,
+        aoi=AOI(bbox=(-95.0, 38.0, -90.0, 43.0)),
+        transform=TransformSpec(
+            output_format=NETCDF,
+            variables=("/gt1l/land_segments/terrain/h_te_best_fit",),
+        ),
+    )
+    ref = await provider.submit(plan)
+    ce = unquote(ref.provider_job_url.split("dap4.ce=", 1)[1])
+    assert ce == (
+        "/gt1l/land_segments/terrain/h_te_best_fit"
+        ";/gt1l/land_segments/latitude"
+        ";/gt1l/land_segments/longitude"
+    )
+
+
+@pytest.mark.asyncio
 async def test_resolve_from_cmr_grouped_file() -> None:
     """A bare leaf name is resolved to its full grouped CMR path (case-insensitive)."""
     cmr = _CmrStub([{"name": "/product/ScienceData", "standard_name": None}])
@@ -578,11 +685,14 @@ async def test_resolve_from_cmr_ambiguity_raises() -> None:
 
 @pytest.mark.asyncio
 async def test_resolve_from_cmr_cmr_failure_fallback() -> None:
-    """On any CMR exception the bare name flows through and no exception propagates."""
+    """On any CMR exception the bare name flows through and no exception propagates.
+
+    Coordinate names come back unconfirmed (``None``), never a guessed "lat"/"lon"
+    (PRD 009's never-guess rule) — nothing has said those names exist."""
     cmr = _CmrStub(RuntimeError("network down"))
     lat, lon, time, resolved = await _resolve_from_cmr(cmr, "C1", ("precipitation",))
     assert resolved == ("precipitation",)
-    assert lat == "lat" and lon == "lon"
+    assert lat is None and lon is None
     assert time is None
 
 
@@ -781,18 +891,21 @@ def _granule_with_opendap_url(url: str) -> dict:
 
 
 class _PlanCmrStub:
-    """A CMR stub whose ``search_granules`` and ``get_variables`` are both
-    independently configurable — ``plan_subset`` calls both."""
+    """A CMR stub whose ``search_granules``, ``get_variables``, and ``get_dmr``
+    are all independently configurable — ``plan_subset`` calls all three."""
 
     def __init__(
         self,
         *,
         granules: list[dict] | None = None,
         variables: list[dict] | BaseException | None = None,
+        dmr_xml: str | BaseException | None = None,
     ) -> None:
         self._granules = granules if granules is not None else []
         self._variables = variables
+        self._dmr_xml = dmr_xml
         self.get_variables_called = False
+        self.get_dmr_called = False
 
     async def search_granules(
         self, concept_id: str, *, bounding_box=None, temporal=None, limit=None
@@ -804,6 +917,12 @@ class _PlanCmrStub:
         if isinstance(self._variables, BaseException):
             raise self._variables
         return list(self._variables or [])
+
+    async def get_dmr(self, opendap_url: str) -> str | None:
+        self.get_dmr_called = True
+        if isinstance(self._dmr_xml, BaseException):
+            raise self._dmr_xml
+        return self._dmr_xml
 
 
 @pytest.mark.asyncio
@@ -894,16 +1013,17 @@ async def test_plan_subset_no_granules_skips_resolution() -> None:
 @pytest.mark.asyncio
 async def test_plan_subset_cmr_error_falls_back_gracefully() -> None:
     """A CMR/network error resolving variables still yields the discovered
-    granule URLs, with coordinate names and variables at their fail-soft
-    defaults — never raises."""
+    granule URLs, with variables at their fail-soft passthrough and coordinate
+    names left unconfirmed (``None``, never a guessed "lat"/"lon" — PRD 009's
+    never-guess rule) — never raises."""
     cmr = _PlanCmrStub(
         granules=[_granule_with_opendap_url(OPENDAP_URL)],
         variables=RuntimeError("network error"),
     )
     plan = await plan_subset(cmr, _grid_caps(), "C1-GES_DISC", _PLAN_BBOX, "", ("precipitation",))
     assert plan.opendap_urls == [OPENDAP_URL]
-    assert plan.coord_lat == "lat"
-    assert plan.coord_lon == "lon"
+    assert plan.coord_lat is None
+    assert plan.coord_lon is None
     assert plan.variables == ("precipitation",)
 
 
@@ -937,4 +1057,115 @@ async def test_plan_subset_swath_shape_never_discovers_grid_geometry() -> None:
     )
     assert plan.lat_axis is None
     assert plan.lon_axis is None
-    assert plan.var_dims == {}
+
+
+# -- plan_subset: DMR structure-discovery fallback (PRD 009, ATL08) ---------
+#
+# Consulted only when UMM-Var is empty (cmr_vars == []) — the ATL08 case: no
+# UMM-Var records at all, so _resolve_from_cmr's own resolution is a no-op and
+# the granule's own DMR is the only authority left.
+
+_FIXTURES_DIR = Path(__file__).resolve().parents[2] / "fixtures"
+
+
+def _dmr_fixture(name: str) -> str:
+    return (_FIXTURES_DIR / name).read_text()
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_dmr_expands_bare_leaf_across_parallel_beams() -> None:
+    """No UMM-Var at all (ATL08): a bare leaf name is resolved via the granule's
+    DMR and expands to every parallel beam group's copy, with each variable's
+    own group-local coordinates carried on the plan."""
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)],
+        variables=[],
+        dmr_xml=_dmr_fixture("atl08_grouped.dmr.xml"),
+    )
+    plan = await plan_subset(
+        cmr, _swath_caps(), "C1-ATL08", _PLAN_BBOX, "", ("h_te_best_fit",)
+    )
+    assert set(plan.variables) == {
+        "/gt1l/land_segments/terrain/h_te_best_fit",
+        "/gt1r/land_segments/terrain/h_te_best_fit",
+        "/gt2l/land_segments/terrain/h_te_best_fit",
+    }
+    assert plan.variable_expansions["h_te_best_fit"] == tuple(sorted(plan.variables))
+    assert plan.var_coords["/gt1l/land_segments/terrain/h_te_best_fit"] == (
+        "/gt1l/land_segments/latitude",
+        "/gt1l/land_segments/longitude",
+    )
+    assert plan.var_coords["/gt1r/land_segments/terrain/h_te_best_fit"] == (
+        "/gt1r/land_segments/latitude",
+        "/gt1r/land_segments/longitude",
+    )
+    # Never-guess: no single global coordinate pair exists for this collection.
+    assert plan.coord_lat is None
+    assert plan.coord_lon is None
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_dmr_resolves_full_group_path_verbatim() -> None:
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)],
+        variables=[],
+        dmr_xml=_dmr_fixture("atl08_grouped.dmr.xml"),
+    )
+    plan = await plan_subset(
+        cmr,
+        _swath_caps(),
+        "C1-ATL08",
+        _PLAN_BBOX,
+        "",
+        ("/gt1l/land_segments/terrain/h_te_best_fit",),
+    )
+    assert plan.variables == ("/gt1l/land_segments/terrain/h_te_best_fit",)
+    assert plan.variable_expansions == {}
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_dmr_unknown_variable_raises_before_any_job() -> None:
+    """A variable the DMR does not confirm exists is rejected at plan time —
+    it must never reach OPeNDAP and produce a 400 (PRD 009 user story 6)."""
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)],
+        variables=[],
+        dmr_xml=_dmr_fixture("atl08_grouped.dmr.xml"),
+    )
+    with pytest.raises(ValueError, match="not found"):
+        await plan_subset(
+            cmr, _swath_caps(), "C1-ATL08", _PLAN_BBOX, "", ("totally_made_up",)
+        )
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_dmr_fetch_failure_degrades_to_variables_only() -> None:
+    """A DMR fetch failure (network hiccup) never guesses a coordinate — the
+    bare name passes through unresolved and coords stay unconfirmed (PRD 009
+    user story 9), it does not raise."""
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)],
+        variables=[],
+        dmr_xml=None,  # simulates a fetch that failed and returned nothing
+    )
+    plan = await plan_subset(
+        cmr, _swath_caps(), "C1-ATL08", _PLAN_BBOX, "", ("h_te_best_fit",)
+    )
+    assert plan.variables == ("h_te_best_fit",)
+    assert plan.var_coords == {}
+    assert plan.variable_expansions == {}
+    assert plan.coord_lat is None
+    assert plan.coord_lon is None
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_umm_v_present_never_consults_dmr() -> None:
+    """When UMM-Var actually has entries, the DMR is never fetched — UMM-V
+    remains the first source (PRD 009: "one round-trip we already make")."""
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)], variables=_GROUPED_VARS
+    )
+    await plan_subset(
+        cmr, _grid_caps(), "C1-GES_DISC", _PLAN_BBOX, "", ("vertical_column_total",)
+    )
+    assert cmr.get_dmr_called is False

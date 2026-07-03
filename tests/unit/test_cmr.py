@@ -6,6 +6,7 @@ public API + UMM (docs/cmr_patterns.md).
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from earthdata_mcp import providers
@@ -116,6 +117,38 @@ async def test_sends_our_client_id_header(httpx_mock, provider: CMRProvider) -> 
     await provider.search_collections(keyword="rain")
     req = httpx_mock.get_requests()[0]
     assert req.headers["Client-Id"] == "earthdata-retrieval-mcp"
+
+
+async def test_get_dmr_fetches_dmr_xml_from_granule_url(
+    httpx_mock, provider: CMRProvider
+) -> None:
+    httpx_mock.add_response(text="<Dataset/>")
+    xml = await provider.get_dmr("https://opendap.earthdata.nasa.gov/granules/ATL08.h5")
+    assert xml == "<Dataset/>"
+    req = httpx_mock.get_requests()[0]
+    assert str(req.url) == "https://opendap.earthdata.nasa.gov/granules/ATL08.h5.dmr.xml"
+
+
+async def test_get_dmr_sends_bearer_token_when_configured(httpx_mock) -> None:
+    provider = CMRProvider(Settings(_env_file=None, earthdata_token="tok"))
+    httpx_mock.add_response(text="<Dataset/>")
+    await provider.get_dmr("https://opendap.earthdata.nasa.gov/granules/ATL08.h5")
+    req = httpx_mock.get_requests()[0]
+    assert req.headers["Authorization"] == "Bearer tok"
+
+
+async def test_get_dmr_returns_none_on_4xx(httpx_mock, provider: CMRProvider) -> None:
+    httpx_mock.add_response(status_code=404, text="not found")
+    xml = await provider.get_dmr("https://opendap.earthdata.nasa.gov/granules/ATL08.h5")
+    assert xml is None
+
+
+async def test_get_dmr_returns_none_on_network_error(
+    httpx_mock, provider: CMRProvider
+) -> None:
+    httpx_mock.add_exception(httpx.ConnectError("connection refused"))
+    xml = await provider.get_dmr("https://opendap.earthdata.nasa.gov/granules/ATL08.h5")
+    assert xml is None
 
 
 async def test_two_phase_variable_lookup(httpx_mock, provider: CMRProvider) -> None:

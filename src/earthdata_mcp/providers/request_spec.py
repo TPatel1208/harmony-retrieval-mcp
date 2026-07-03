@@ -70,6 +70,14 @@ class RequestSpec:
     lat_axis: AxisGeometry | None
     lon_axis: AxisGeometry | None
     var_dims: dict[str, VarDimPlan]
+    #: Each DMR-resolved variable's own group-local ``(lat_path, lon_path)``
+    #: (PRD 009) — additive, optional; empty for a UMM-V-resolved collection
+    #: (the single ``coord_lat``/``coord_lon`` pair applies to every variable)
+    #: or a spec persisted before this field existed.
+    var_coords: dict[str, tuple[str, str]]
+    #: Bare names the DMR expanded to multiple parallel-sibling-group paths,
+    #: keyed by the original requested name — additive, optional (PRD 009).
+    variable_expansions: dict[str, tuple[str, ...]]
     workspace_id: str
     job_handle: str
     obs_handle: str
@@ -96,6 +104,8 @@ class RequestSpec:
         lat_axis: AxisGeometry | None = None,
         lon_axis: AxisGeometry | None = None,
         var_dims: dict[str, VarDimPlan] | None = None,
+        var_coords: dict[str, tuple[str, str]] | None = None,
+        variable_expansions: dict[str, tuple[str, ...]] | None = None,
     ) -> RequestSpec:
         """Assemble from a routed plan plus the routing decision and OPeNDAP
         discovery outputs. ``time_range``/``variables`` override the plan's own
@@ -137,6 +147,8 @@ class RequestSpec:
             lat_axis=lat_axis,
             lon_axis=lon_axis,
             var_dims=dict(var_dims or {}),
+            var_coords=dict(var_coords or {}),
+            variable_expansions=dict(variable_expansions or {}),
             workspace_id=workspace_id,
             job_handle=job_handle,
             obs_handle=obs_handle,
@@ -169,6 +181,8 @@ class RequestSpec:
             "lat_axis": _serialize_axis(self.lat_axis),
             "lon_axis": _serialize_axis(self.lon_axis),
             "var_dims": _serialize_var_dims(self.var_dims),
+            "var_coords": _serialize_var_coords(self.var_coords),
+            "variable_expansions": _serialize_expansions(self.variable_expansions),
             "workspace_id": self.workspace_id,
             "job_handle": self.job_handle,
             "obs_handle": self.obs_handle,
@@ -210,12 +224,14 @@ class RequestSpec:
                 lat_axis=_axis_from_jsonb(data.get("lat_axis")),
                 lon_axis=_axis_from_jsonb(data.get("lon_axis")),
                 var_dims=_var_dims_from_jsonb(data.get("var_dims")),
+                var_coords=_var_coords_from_jsonb(data.get("var_coords")),
+                variable_expansions=_expansions_from_jsonb(data.get("variable_expansions")),
                 workspace_id=data.get("workspace_id"),
                 job_handle=data.get("job_handle"),
                 obs_handle=data.get("obs_handle"),
                 cache_key_value=data.get("cache_key") or "",
             )
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
             raise InvalidSpecError(f"malformed request spec: {exc}") from exc
 
     # -- worker-side reconstruction -------------------------------------------
@@ -269,6 +285,30 @@ def _var_dims_from_jsonb(data: dict | None) -> dict[str, VarDimPlan]:
     if not data:
         return {}
     return {var: tuple(tuple(pair) for pair in dims) for var, dims in data.items()}
+
+
+def _serialize_var_coords(var_coords: dict[str, tuple[str, str]]) -> dict:
+    if not var_coords:
+        return {}
+    return {var: list(pair) for var, pair in var_coords.items()}
+
+
+def _var_coords_from_jsonb(data: dict | None) -> dict[str, tuple[str, str]]:
+    if not data:
+        return {}
+    return {var: (pair[0], pair[1]) for var, pair in data.items()}
+
+
+def _serialize_expansions(expansions: dict[str, tuple[str, ...]]) -> dict:
+    if not expansions:
+        return {}
+    return {name: list(paths) for name, paths in expansions.items()}
+
+
+def _expansions_from_jsonb(data: dict | None) -> dict[str, tuple[str, ...]]:
+    if not data:
+        return {}
+    return {name: tuple(paths) for name, paths in data.items()}
 
 
 # -- cache key -----------------------------------------------------------

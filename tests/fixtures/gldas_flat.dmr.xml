@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<Dataset xmlns="http://xml.opendap.org/ns/DAP/4.0#" dapVersion="4.0" dmrVersion="1.0"
+         name="GLDAS_NOAH025_3H.A20240101.0000.021.nc4">
+    <Dimension name="lat" size="600"/>
+    <Dimension name="lon" size="1440"/>
+    <Dimension name="time" size="1"/>
+    <Float32 name="lat">
+        <Dim name="/lat"/>
+        <Attribute name="standard_name" type="String"><Value>latitude</Value></Attribute>
+        <Attribute name="units" type="String"><Value>degrees_north</Value></Attribute>
+    </Float32>
+    <Float32 name="lon">
+        <Dim name="/lon"/>
+        <Attribute name="standard_name" type="String"><Value>longitude</Value></Attribute>
+        <Attribute name="units" type="String"><Value>degrees_east</Value></Attribute>
+    </Float32>
+    <Float64 name="time">
+        <Dim name="/time"/>
+    </Float64>
+    <Float32 name="precipitation">
+        <Dim name="/time"/>
+        <Dim name="/lat"/>
+        <Dim name="/lon"/>
+    </Float32>
+</Dataset>

@@ -79,12 +79,13 @@ class OPeNDAPProvider:
         capabilities: CollectionCapabilities,
         *,
         opendap_urls: list[str] | None = None,
-        coord_lat: str = "lat",
-        coord_lon: str = "lon",
+        coord_lat: str | None = "lat",
+        coord_lon: str | None = "lon",
         coord_time: str | None = None,
         lat_axis: AxisGeometry | None = None,
         lon_axis: AxisGeometry | None = None,
         var_dims: dict[str, VarDimPlan] | None = None,
+        var_coords: dict[str, tuple[str, str]] | None = None,
         storage: StorageBackend | None = None,
         settings: Settings | None = None,
         timeout: float = 300.0,
@@ -111,6 +112,11 @@ class OPeNDAPProvider:
         # still be hyperslabbed correctly. A variable absent from the map falls
         # back to whole-array (see build_constraint_expression).
         self._var_dims = var_dims
+        # Per-variable, DMR-resolved group-local geolocation (ATL08's per-beam
+        # lat/lon; PRD 009) — projected alongside its variable regardless of
+        # collection shape, unlike lat_axis/lon_axis/var_dims which only apply
+        # to a "grid" collection's index hyperslab.
+        self._var_coords = var_coords
         self._storage = storage
         self._settings = settings or get_settings()
         self._timeout = timeout
@@ -216,6 +222,7 @@ class OPeNDAPProvider:
             lat_axis=self._lat_axis if is_grid else None,
             lon_axis=self._lon_axis if is_grid else None,
             var_dims=self._var_dims if is_grid else None,
+            var_coords=self._var_coords,
         )
         url = f"{base_url}{_DAP4_SUFFIX}"
         if ce:

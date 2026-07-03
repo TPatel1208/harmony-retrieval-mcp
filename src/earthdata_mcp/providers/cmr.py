@@ -411,6 +411,27 @@ class CMRProvider:
         except ValueError:
             return {}
 
+    async def get_dmr(self, opendap_url: str) -> str | None:
+        """Fetch a granule's DAP4 DMR (Dataset Metadata Response) XML, or ``None``.
+
+        The one non-CMR fetch this provider makes: OPeNDAP planning's structure-
+        discovery fallback (PRD 009) when a collection's UMM-Var catalog is empty
+        or insufficient. Bearer-authenticated the same way as the Harmony
+        capabilities fetch; fail-soft on any error (network, timeout, 4xx/5xx) —
+        the caller degrades to variables-only planning rather than raising, the
+        same posture as every other CMR-facing planning call.
+        """
+        url = f"{opendap_url.rstrip('/')}.dmr.xml"
+        headers: dict[str, str] = {}
+        token = self._settings.earthdata_token
+        if token:
+            headers["Authorization"] = f"Bearer {token.strip()}"
+        try:
+            response = await self._request("GET", url, headers=headers, timeout=30.0)
+        except (CMRError, RetryableError, httpx.TimeoutException, httpx.HTTPError):
+            return None
+        return response.text
+
 
 # -- UMM-JSON normalization -----------------------------------------------
 

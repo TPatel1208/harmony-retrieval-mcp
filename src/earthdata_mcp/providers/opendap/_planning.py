@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import difflib
 from dataclasses import dataclass
+from xml.etree import ElementTree as ET
 
 from earthdata_mcp.providers._capabilities import CollectionCapabilities
+from earthdata_mcp.providers.opendap._dmr import group_geolocation, parse_dmr, resolve_variables
 from earthdata_mcp.providers.opendap._serialization import AxisGeometry, VarDimPlan, _leaf
 
 
@@ -24,7 +26,7 @@ async def _resolve_from_cmr(
     variables: tuple[str, ...],
     *,
     cmr_vars: list[dict] | None = None,
-) -> tuple[str, str, str | None, tuple[str, ...]]:
+) -> tuple[str | None, str | None, str | None, tuple[str, ...]]:
     """Resolve variable names and discover coordinate names from CMR UMM-V.
 
     Makes exactly one ``get_variables()`` call for the collection, unless the
@@ -44,20 +46,24 @@ async def _resolve_from_cmr(
       Exactly one match → substitute the full CMR path.
       More than one match → raise ``ValueError`` naming all conflicting paths.
 
-    Falls back to ``("lat", "lon", None, variables_as_passed)`` on any network
-    or CMR error. The ambiguity ``ValueError`` is raised *after* the try block
-    so it is never swallowed by the network-error handler.
+    ``lat_name``/``lon_name`` are ``None`` — never a guessed ``"lat"``/``"lon"``
+    (PRD 009's never-guess rule) — unless UMM-V actually confirms a coordinate
+    variable by standard_name or canonical leaf name. Falls back to
+    ``(None, None, None, variables_as_passed)`` on any network or CMR error.
+    The ambiguity ``ValueError`` is raised *after* the try block so it is never
+    swallowed by the network-error handler.
     """
     if cmr_vars is None:
         try:
             cmr_vars = await cmr.get_variables(concept_id)  # type: ignore[attr-defined]
         except Exception:
-            return ("lat", "lon", None, variables)
+            return (None, None, None, variables)
 
     # Discover coordinate variable names from CMR UMM-V standard_name or
-    # canonical leaf name.
-    lat_name = "lat"
-    lon_name = "lon"
+    # canonical leaf name. Stay None (never a guessed default) until UMM-V
+    # actually confirms one.
+    lat_name: str | None = None
+    lon_name: str | None = None
     time_name: str | None = None
     for var in cmr_vars:
         name: str = var.get("name") or ""
@@ -157,8 +163,8 @@ async def _discover_grid_geometry(
     concept_id: str,
     spatial_extent: tuple[float, float, float, float] | None,
     variables: tuple[str, ...],
-    coord_lat: str,
-    coord_lon: str,
+    coord_lat: str | None,
+    coord_lon: str | None,
     *,
     cmr_vars: list[dict] | None = None,
 ) -> tuple[AxisGeometry | None, AxisGeometry | None, dict[str, VarDimPlan]]:
@@ -168,8 +174,9 @@ async def _discover_grid_geometry(
     already-fetched ``cmr_vars`` when given (:func:`plan_subset` shares its one
     fetch across coordinate resolution, grid geometry, and plan-time variable
     validation); otherwise makes its own ``get_variables()`` call. Any error,
-    missing extent, or unresolvable axis length yields ``(None, None, {})`` —
-    the caller's whole-array fallback. Never raises into the retrieval path.
+    missing extent, an unconfirmed coordinate name, or unresolvable axis length
+    yields ``(None, None, {})`` — the caller's whole-array fallback. Never
+    raises into the retrieval path.
 
     Each requested variable is independently resolved to a :data:`VarDimPlan`
     (see :func:`_variable_dim_plan`); a variable that fails resolution is
@@ -183,7 +190,7 @@ async def _discover_grid_geometry(
     divided by ``length`` (not ``length - 1``), and ``origin`` (a *value*, not
     an edge) is the edge offset by half a step.
     """
-    if spatial_extent is None:
+    if spatial_extent is None or coord_lat is None or coord_lon is None:
         return (None, None, {})
     if cmr_vars is None:
         try:
@@ -219,6 +226,47 @@ async def _discover_grid_geometry(
     return (lat_axis, lon_axis, var_dims)
 
 
+async def _resolve_from_dmr(
+    cmr: object,
+    opendap_url: str,
+    variables: tuple[str, ...],
+) -> tuple[tuple[str, ...], dict[str, tuple[str, str]], dict[str, tuple[str, ...]]] | None:
+    """DMR-backed structure discovery — the fallback when UMM-Var is empty (PRD 009).
+
+    Fetches the first window granule's DMR and resolves each requested name
+    against its real variable tree (:func:`~earthdata_mcp.providers.opendap._dmr.resolve_variables`):
+    a bare leaf under multiple parallel sibling groups (ICESat-2's six beams)
+    expands to all of them. Each resolved variable's own group-local lat/lon
+    is looked up via :func:`~earthdata_mcp.providers.opendap._dmr.group_geolocation`.
+
+    Returns ``None`` — never raises — only when the DMR itself could not be
+    fetched or parsed (network hiccup, malformed XML): the caller degrades to
+    variables-only planning rather than guessing a coordinate. An unresolvable
+    *variable name* is a different failure — the DMR was fetched fine and is
+    authoritative ground truth for this granule, so :func:`resolve_variables`'s
+    ``ValueError`` propagates uncaught, rejecting the plan before any job or
+    handle is created (PRD 009 user story 6).
+    """
+    try:
+        xml_text = await cmr.get_dmr(opendap_url)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    if not xml_text:
+        return None
+    try:
+        tree = parse_dmr(xml_text)
+    except ET.ParseError:
+        return None
+
+    resolved, expansions = resolve_variables(tree, variables)
+    var_coords: dict[str, tuple[str, str]] = {}
+    for var in resolved:
+        lat, lon = group_geolocation(tree, var)
+        if lat is not None and lon is not None:
+            var_coords[var] = (lat, lon)
+    return (resolved, var_coords, expansions)
+
+
 #: Cap on granules pulled into a single OPeNDAP bundle (one DAP4 bbox subset each).
 #: Matches CMR's per-request granule limit; a wider window is truncated to this.
 _OPENDAP_GRANULE_LIMIT = 50
@@ -242,8 +290,8 @@ class OpendapPlan:
     """
 
     opendap_urls: list[str]
-    coord_lat: str
-    coord_lon: str
+    coord_lat: str | None
+    coord_lon: str | None
     coord_time: str | None
     lat_axis: AxisGeometry | None
     lon_axis: AxisGeometry | None
@@ -254,6 +302,17 @@ class OpendapPlan:
     #: run plan-time variable validation (:func:`validate_variables`) without a
     #: second ``get_variables`` round trip (PRD 002).
     cmr_vars: list[dict]
+    #: Each DMR-resolved variable's own group-local ``(lat_path, lon_path)`` —
+    #: populated only via the DMR fallback (PRD 009), since a grouped/swath
+    #: product with no UMM-Var catalog has no single global coordinate pair.
+    #: Empty when UMM-Var resolved (the single ``coord_lat``/``coord_lon`` pair
+    #: applies to every variable) or the DMR could not be consulted.
+    var_coords: dict[str, tuple[str, str]]
+    #: Bare names the DMR expanded to multiple parallel-sibling-group paths
+    #: (ICESat-2's six beams), keyed by the original requested name — carried
+    #: through to the durable spec/provenance so the expansion is never a
+    #: surprise (PRD 009 user story 3).
+    variable_expansions: dict[str, tuple[str, ...]]
 
 
 async def plan_subset(
@@ -292,6 +351,8 @@ async def plan_subset(
             var_dims={},
             variables=tuple(variables),
             cmr_vars=[],
+            var_coords={},
+            variable_expansions={},
         )
 
     try:
@@ -302,6 +363,17 @@ async def plan_subset(
     coord_lat, coord_lon, coord_time, resolved_variables = await _resolve_from_cmr(
         cmr, concept_id, variables, cmr_vars=cmr_vars
     )
+
+    # UMM-Var is the first source (one round-trip we already make); the DMR is
+    # only consulted when it came back empty — the ATL08 case, where plan-time
+    # variable/coordinate resolution would otherwise silently no-op (PRD 009).
+    var_coords: dict[str, tuple[str, str]] = {}
+    variable_expansions: dict[str, tuple[str, ...]] = {}
+    if not cmr_vars:
+        dmr_result = await _resolve_from_dmr(cmr, urls[0], resolved_variables)
+        if dmr_result is not None:
+            resolved_variables, var_coords, variable_expansions = dmr_result
+
     lat_axis: AxisGeometry | None = None
     lon_axis: AxisGeometry | None = None
     var_dims: dict[str, VarDimPlan] = {}
@@ -325,6 +397,8 @@ async def plan_subset(
         var_dims=var_dims,
         variables=resolved_variables,
         cmr_vars=cmr_vars,
+        var_coords=var_coords,
+        variable_expansions=variable_expansions,
     )
 
 

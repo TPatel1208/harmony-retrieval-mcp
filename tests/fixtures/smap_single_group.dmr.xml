@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<Dataset xmlns="http://xml.opendap.org/ns/DAP/4.0#" dapVersion="4.0" dmrVersion="1.0"
+         name="SMAP_L3_SM_P_20240101_R19240_001.h5">
+    <Dimension name="y" size="406"/>
+    <Dimension name="x" size="964"/>
+    <Float32 name="latitude">
+        <Dim name="/y"/>
+        <Dim name="/x"/>
+        <Attribute name="standard_name" type="String"><Value>latitude</Value></Attribute>
+    </Float32>
+    <Float32 name="longitude">
+        <Dim name="/y"/>
+        <Dim name="/x"/>
+        <Attribute name="standard_name" type="String"><Value>longitude</Value></Attribute>
+    </Float32>
+    <Group name="Geophysical_Data">
+        <Float32 name="sm_surface">
+            <Dim name="/y"/>
+            <Dim name="/x"/>
+        </Float32>
+    </Group>
+</Dataset>

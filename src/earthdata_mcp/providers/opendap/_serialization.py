@@ -110,12 +110,13 @@ def _var_bracket_ranges(
 def build_constraint_expression(
     plan: RetrievalPlan,
     *,
-    coord_lat: str = "lat",
-    coord_lon: str = "lon",
+    coord_lat: str | None = "lat",
+    coord_lon: str | None = "lon",
     coord_time: str | None = None,
     lat_axis: AxisGeometry | None = None,
     lon_axis: AxisGeometry | None = None,
     var_dims: dict[str, VarDimPlan] | None = None,
+    var_coords: dict[str, tuple[str, str]] | None = None,
 ) -> str:
     """Build a DAP4 projection CE from the plan's variables + coordinate variables.
 
@@ -126,6 +127,10 @@ def build_constraint_expression(
     ``coord_lat`` and ``coord_lon`` are the actual variable names in this
     collection's netCDF files — they vary (``lat``/``lon`` for GLDAS;
     ``/product/latitude``/``/product/longitude`` for TEMPO L2 grouped).
+    Either may be ``None`` when no authority (UMM-V or a granule DMR) has
+    confirmed a coordinate variable exists — the never-guess rule (PRD 009):
+    an unconfirmed coordinate is omitted from the CE entirely rather than
+    projecting a name nothing has verified.
 
     ``lat_axis``/``lon_axis`` are optional regular-grid descriptors. When both
     are given and the plan needs a bbox, the coordinate arrays *and* every
@@ -146,6 +151,13 @@ def build_constraint_expression(
     When ``var_dims`` is not given at all, every variable is bracketed as a
     plain ``[lat][lon]`` pair (the caller is asserting it already knows the
     variable is exactly 2-D over these two axes).
+
+    ``var_coords`` maps a variable name to its own ``(lat_path, lon_path)`` —
+    the DMR-resolved, group-local geolocation for a grouped/swath collection
+    with no single global coordinate pair (ATL08's per-beam lat/lon; PRD 009).
+    Projected whole-array alongside every variable it covers, in addition to
+    (never instead of) ``coord_lat``/``coord_lon``, so a request that mixes a
+    resolved global pair with per-variable overrides still gets both.
 
     Temporal *filtering* (which granules to fetch) happens at the CMR
     granule-search level, not within a file via DAP4 CE. Many L3 monthly
@@ -178,8 +190,8 @@ def build_constraint_expression(
             lon_range = _index_range(lon_axis, west, east)
         # else: antimeridian wrap (v1) — leave lon_range None, whole-longitude.
 
-    lat_leaf = _leaf(coord_lat) if lat_axis is not None else ""
-    lon_leaf = _leaf(coord_lon) if lon_axis is not None else ""
+    lat_leaf = _leaf(coord_lat) if lat_axis is not None and coord_lat is not None else ""
+    lon_leaf = _leaf(coord_lon) if lon_axis is not None and coord_lon is not None else ""
 
     projected: list[str] = []
     seen: set[str] = set()
@@ -191,8 +203,10 @@ def build_constraint_expression(
         projected.append(_fqn_sliced(name, *ranges))
 
     if plan.needs_bbox:
-        _add(coord_lat, lat_range)
-        _add(coord_lon, lon_range)
+        if coord_lat is not None:
+            _add(coord_lat, lat_range)
+        if coord_lon is not None:
+            _add(coord_lon, lon_range)
     if coord_time:
         _add(coord_time)
     for var in plan.transform.variables:
@@ -206,4 +220,8 @@ def build_constraint_expression(
                 _add(var, *_var_bracket_ranges(dims, lat_leaf, lon_leaf, lat_range, lon_range))
         else:
             _add(var, lat_range, lon_range)
+        if var_coords is not None and var in var_coords:
+            var_lat, var_lon = var_coords[var]
+            _add(var_lat)
+            _add(var_lon)
     return ";".join(projected)
