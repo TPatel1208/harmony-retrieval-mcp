@@ -7,6 +7,8 @@ fixture. A ``dataset_`` handle is seeded directly via the store, mirroring what
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from earthdata_mcp.catalog.enrichment import ADVISORY_FLAG, enrich_collection
@@ -15,6 +17,8 @@ from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.tools.understanding import describe_dataset
 from earthdata_mcp.workspace.models import HandleType
 from earthdata_mcp.workspace.store import CrossWorkspaceError
+
+_FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
 
 
 @pytest.fixture
@@ -35,6 +39,47 @@ async def _seed_dataset_handle(store, workspace_id: str) -> str:
     )
     payload = {"concept_id": "C1-X", "collection": collection, "search": {}}
     return await store.put_handle(workspace_id, HandleType.DATASET, payload=payload)
+
+
+# Collection with no UMM-Var associations at all — get_variables short-circuits
+# after phase 1 (no second HTTP call is made).
+def _mock_no_variable_associations(httpx_mock) -> None:
+    httpx_mock.add_response(json={"items": [{"meta": {"associations": {}}}]})
+
+
+_OPENDAP_GRANULE_URL = "https://opendap.example/data/GLDAS_NOAH025_3H.A20240101.0000.021"
+
+
+def _mock_granule_search_with_opendap_url(httpx_mock, url: str = _OPENDAP_GRANULE_URL) -> None:
+    httpx_mock.add_response(
+        json={
+            "items": [
+                {
+                    "meta": {"concept-id": "G1-X"},
+                    "umm": {
+                        "GranuleUR": "GLDAS_NOAH025_3H.A20240101.0000.021",
+                        "RelatedUrls": [
+                            {
+                                "URL": f"{url}.html",
+                                "Type": "USE SERVICE API",
+                                "Subtype": "OPENDAP DATA",
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+    )
+
+
+def _mock_dmr_fetch(httpx_mock, fixture_name: str = "gldas_flat.dmr.xml") -> None:
+    httpx_mock.add_response(text=(_FIXTURES / fixture_name).read_text())
+
+
+# No granules at all in this window — the DMR fallback degrades to Task 1's
+# "none" behavior without a second (get_dmr) HTTP call.
+def _mock_no_granules(httpx_mock) -> None:
+    httpx_mock.add_response(json={"items": []})
 
 
 # get_variables is two-phase: collection fetch (associations) then variables fetch.
@@ -155,6 +200,113 @@ async def test_collection_advisory_notes_are_flagged(
     for note in notes:
         assert note["advisory"] == ADVISORY_FLAG
         assert note["authoritative"] is False
+
+
+async def test_describe_states_variable_source_umm_var_when_populated(
+    httpx_mock, provider, workspace_store, workspace_id
+) -> None:
+    handle = await _seed_dataset_handle(workspace_store, workspace_id)
+    _mock_get_variables(httpx_mock)
+
+    out = await describe_dataset(
+        handle, workspace_id=workspace_id, cmr=provider, store=workspace_store
+    )
+
+    assert out["variable_source"] == "umm-var"
+    assert "variables_note" not in out
+
+
+async def test_describe_empty_catalog_states_source_none_with_note(
+    httpx_mock, provider, workspace_store, workspace_id
+) -> None:
+    """No UMM-Var *and* no granules to fall back to (DMR fail-soft: no granules
+    found) — degrades all the way to the plain "none" honesty behavior."""
+    handle = await _seed_dataset_handle(workspace_store, workspace_id)
+    _mock_no_variable_associations(httpx_mock)
+    _mock_no_granules(httpx_mock)
+
+    out = await describe_dataset(
+        handle, workspace_id=workspace_id, cmr=provider, store=workspace_store
+    )
+
+    assert out["variable_source"] == "none"
+    assert out["variable_count"] == 0
+    assert out["variables"] == []
+    assert "UMM-Var" in out["variables_note"]
+
+
+async def test_describe_empty_catalog_honesty_fields_survive_detail_mode(
+    httpx_mock, provider, workspace_store, workspace_id
+) -> None:
+    handle = await _seed_dataset_handle(workspace_store, workspace_id)
+    _mock_no_variable_associations(httpx_mock)
+    _mock_no_granules(httpx_mock)
+
+    out = await describe_dataset(
+        handle, workspace_id=workspace_id, detail=True,
+        cmr=provider, store=workspace_store,
+    )
+
+    assert out["variable_source"] == "none"
+    assert "UMM-Var" in out["variables_note"]
+
+
+async def test_describe_falls_back_to_dmr_variable_listing_when_umm_var_empty(
+    httpx_mock, provider, workspace_store, workspace_id
+) -> None:
+    handle = await _seed_dataset_handle(workspace_store, workspace_id)
+    _mock_no_variable_associations(httpx_mock)
+    _mock_granule_search_with_opendap_url(httpx_mock)
+    _mock_dmr_fetch(httpx_mock)
+
+    out = await describe_dataset(
+        handle, workspace_id=workspace_id, cmr=provider, store=workspace_store
+    )
+
+    assert out["variable_source"] == "opendap-dmr"
+    assert out["variable_count"] == 4
+    names = {v["name"] for v in out["variables"]}
+    assert names == {"/lat", "/lon", "/time", "/precipitation"}
+    assert set(out["variables"][0]) == {"name"}
+    assert "one recent granule" in out["variables_note"] or "DMR" in out["variables_note"]
+
+
+async def test_describe_dmr_fallback_degrades_on_fetch_error(
+    httpx_mock, provider, workspace_store, workspace_id
+) -> None:
+    """A granule with an OPeNDAP URL is found, but the DMR fetch itself fails
+    (a 404) — degrades to Task 1's plain "none" behavior, never raises."""
+    handle = await _seed_dataset_handle(workspace_store, workspace_id)
+    _mock_no_variable_associations(httpx_mock)
+    _mock_granule_search_with_opendap_url(httpx_mock)
+    httpx_mock.add_response(status_code=404, text="Not Found")
+
+    out = await describe_dataset(
+        handle, workspace_id=workspace_id, cmr=provider, store=workspace_store
+    )
+
+    assert out["variable_source"] == "none"
+    assert out["variable_count"] == 0
+    assert "UMM-Var" in out["variables_note"]
+
+
+async def test_describe_dmr_fallback_degrades_on_parse_error(
+    httpx_mock, provider, workspace_store, workspace_id
+) -> None:
+    """The DMR fetch succeeds but returns malformed XML — degrades to Task 1's
+    plain "none" behavior, never raises."""
+    handle = await _seed_dataset_handle(workspace_store, workspace_id)
+    _mock_no_variable_associations(httpx_mock)
+    _mock_granule_search_with_opendap_url(httpx_mock)
+    httpx_mock.add_response(text="<not valid xml")
+
+    out = await describe_dataset(
+        handle, workspace_id=workspace_id, cmr=provider, store=workspace_store
+    )
+
+    assert out["variable_source"] == "none"
+    assert out["variable_count"] == 0
+    assert "UMM-Var" in out["variables_note"]
 
 
 async def test_rejects_non_dataset_handle(workspace_store, workspace_id) -> None:
