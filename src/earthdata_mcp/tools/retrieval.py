@@ -29,7 +29,7 @@ from uuid import uuid4
 from earthdata_mcp.config import get_settings
 from earthdata_mcp.db import create_engine, create_session_factory
 from earthdata_mcp.jobs import crud
-from earthdata_mcp.jobs.state import TERMINAL_STATES, JobState
+from earthdata_mcp.jobs.state import LEGAL_TRANSITIONS, TERMINAL_STATES, JobState
 from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import (
     AOI,
@@ -308,9 +308,22 @@ async def get_retrieval_status(
             "message": job.message,
             "error": job.error,
             "submitted_at": job.created_at.isoformat(),
-            "last_polled_at": job.updated_at.isoformat(),
+            "last_polled_at": (job.last_polled_at or job.updated_at).isoformat(),
             "provider_job_url": job.provider_job_url,
         }
+
+
+#: A job whose current state has no legal edge to CANCELLED but also isn't
+#: terminal is a friendly refusal, not an illegal-transition error. Derived
+#: from the state machine's own transition map (never hardcoded), so a future
+#: change to ``LEGAL_TRANSITIONS`` can't silently drift out of sync with this
+#: message. Today ``materializing`` is the only such state: the result is
+#: already downloaded and being persisted, so it can't be cancelled and will
+#: complete shortly.
+_NON_CANCELLABLE_NOTE = (
+    "job is {state}: the result is already downloaded and being persisted, "
+    "so it cannot be cancelled — it will complete shortly"
+)
 
 
 async def cancel_retrieval(
@@ -320,13 +333,23 @@ async def cancel_retrieval(
     store: WorkspaceStore | None = None,
     session_factory=None,
 ) -> dict:
-    """Cancel a non-terminal job; a no-op on one that is already terminal.
+    """Cancel a cancellable job; a friendly non-cancelling response otherwise.
 
-    A job's state can change between when a caller decides to cancel and when
-    the call lands (e.g. it finishes or fails first), so cancelling an
-    already-terminal job (ready/failed/expired/cancelled) returns that state
-    as-is rather than raising — the caller's intent ("stop this job") is
-    already satisfied, and this is not an illegal request.
+    Three outcomes, all returning ``{job_handle, status, cancelled, ...}``:
+
+    * A cancellable state (pending/submitted/running) is cancelled and
+      ``cancelled`` is ``True``.
+    * A non-terminal state with no legal edge to ``cancelled`` in the state
+      machine — today only ``materializing`` (the result is already
+      downloaded and being persisted) — is left untouched, and the response
+      carries ``cancelled: False`` plus a plain-language ``note`` instead of
+      the raw ``illegal job state transition`` error the state machine would
+      otherwise raise.
+    * A terminal state (ready/failed/expired/cancelled) echoes as-is with
+      ``cancelled: False``: a job's state can change between when a caller
+      decides to cancel and when the call lands (e.g. it finishes or fails
+      first), so this is not an illegal request — the caller's intent
+      ("stop this job") is already satisfied.
     """
     store = store or _default_store()
     session_factory = session_factory or _default_session_factory()
@@ -339,12 +362,20 @@ async def cancel_retrieval(
         job = await crud.get_job_by_handle(session, job_handle)
         if job is None:
             raise crud.JobNotFoundError(job_handle)
-        if JobState(job.state) in TERMINAL_STATES:
-            return {"job_handle": job_handle, "status": job.state}
+        current = JobState(job.state)
+        if current in TERMINAL_STATES:
+            return {"job_handle": job_handle, "status": job.state, "cancelled": False}
+        if JobState.CANCELLED not in LEGAL_TRANSITIONS[current]:
+            return {
+                "job_handle": job_handle,
+                "status": job.state,
+                "cancelled": False,
+                "note": _NON_CANCELLABLE_NOTE.format(state=current.value),
+            }
         crud.set_state(job, JobState.CANCELLED)
         await session.commit()
 
-    return {"job_handle": job_handle, "status": JobState.CANCELLED.value}
+    return {"job_handle": job_handle, "status": JobState.CANCELLED.value, "cancelled": True}
 
 
 # -- shared planning + persistence ----------------------------------------

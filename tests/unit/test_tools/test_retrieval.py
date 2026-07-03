@@ -17,6 +17,7 @@ Two assertions are load-bearing (per the design review):
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -973,6 +974,64 @@ async def test_get_status_includes_phase_message_and_timestamps(
     assert status["last_polled_at"] == updated_at.isoformat()
 
 
+async def test_get_status_reports_last_polled_at_column_when_present(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """PRD 012: once a poll has stamped ``last_polled_at``, the status tool
+    reports that column — not ``updated_at`` — so a queued-but-alive job
+    (no other column changing) still shows a moving timestamp."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    job_handle = out["job_handle"]
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, job_handle)
+        job.state = JobState.SUBMITTED.value
+        job.last_polled_at = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        await session.commit()
+        await session.refresh(job)
+        updated_at = job.updated_at
+
+    status = await get_retrieval_status(
+        job_handle, workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+    assert status["last_polled_at"] == "2024-06-01T12:00:00+00:00"
+    assert status["last_polled_at"] != updated_at.isoformat()
+
+
+async def test_get_status_falls_back_to_updated_at_for_legacy_rows(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """A row predating the ``last_polled_at`` column (still ``NULL``) must not
+    break the status tool — it falls back to ``updated_at``."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    job_handle = out["job_handle"]
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, job_handle)
+        assert job.last_polled_at is None
+        await session.refresh(job)
+        updated_at = job.updated_at
+
+    status = await get_retrieval_status(
+        job_handle, workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+    assert status["last_polled_at"] == updated_at.isoformat()
+
+
 async def test_get_status_wrong_handle_type_raises(
     workspace_store, session_factory, workspace_id,
 ) -> None:
@@ -1021,10 +1080,45 @@ async def test_cancel_pending_job(
         store=workspace_store, session_factory=session_factory,
     )
     assert res["status"] == JobState.CANCELLED.value
+    assert res["cancelled"] is True
 
     async with session_factory() as session:
         job = await get_job_by_handle(session, out["job_handle"])
     assert job.state == JobState.CANCELLED.value
+
+
+async def test_cancel_materializing_job_returns_friendly_non_cancelled_response(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """PRD 012: ``materializing`` has no legal edge to ``cancelled`` in the state
+    machine — the tool must not ask it to do something illegal (which used to
+    raise a raw ``illegal job state transition`` error). It instead returns a
+    friendly, machine-readable refusal, and the job's state is untouched."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+        job.state = JobState.MATERIALIZING.value
+        await session.commit()
+
+    res = await cancel_retrieval(
+        out["job_handle"], workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+    assert res["job_handle"] == out["job_handle"]
+    assert res["status"] == JobState.MATERIALIZING.value
+    assert res["cancelled"] is False
+    assert "note" in res and res["note"]
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    assert job.state == JobState.MATERIALIZING.value
 
 
 @pytest.mark.parametrize(
@@ -1056,7 +1150,11 @@ async def test_cancel_terminal_job_is_noop(
         out["job_handle"], workspace_id=workspace_id,
         store=workspace_store, session_factory=session_factory,
     )
-    assert res == {"job_handle": out["job_handle"], "status": terminal_state.value}
+    assert res == {
+        "job_handle": out["job_handle"],
+        "status": terminal_state.value,
+        "cancelled": False,
+    }
 
     # The job's actual state is untouched — cancelling "ready" must not flip it
     # to "cancelled".

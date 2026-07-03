@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, func
+from sqlalchemy import DateTime, Integer, String, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -46,6 +46,14 @@ class Job(Base):
         DateTime(timezone=True), default=None
     )
     error: Mapped[str | None] = mapped_column(String, default=None)
+    # Stamped unconditionally after every successful provider poll, independent
+    # of whether the poll changed anything else — the durable proof-of-life a
+    # row-diffed `updated_at` can't provide when a provider reports the same
+    # queued state poll after poll (PRD 012). Nullable so pre-existing rows
+    # (from before this column existed) fall back to `updated_at`.
+    last_polled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -58,10 +66,17 @@ async def create_jobs_schema(engine: AsyncEngine) -> None:
     """Create the durable ``jobs`` table (idempotent).
 
     Phase 6 owns the jobs table's creation, separate from the workspace schema so
-    each is created from its own ``metadata``.
+    each is created from its own ``metadata``. ``create_all`` only creates a
+    missing table — it never alters an existing one — so a column added to the
+    model after a table already exists (``last_polled_at``, PRD 012) needs its
+    own idempotent ``ADD COLUMN IF NOT EXISTS`` alongside it. One column doesn't
+    warrant a migration framework.
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ")
+        )
 
 
 async def drop_jobs_schema(engine: AsyncEngine) -> None:

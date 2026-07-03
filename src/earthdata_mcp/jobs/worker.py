@@ -385,6 +385,10 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
         job = await crud.get_job(session, job_id)
         if job is None or JobState(job.state) in TERMINAL_STATES:
             return  # cancelled out from under us, or already done
+        # Stamped unconditionally — the poll succeeded and this durable proof-of-life
+        # must move even when the status is byte-identical to the last one and no
+        # other column changes (PRD 012: this is the fix for the frozen-timestamp bug).
+        job.last_polled_at = datetime.now(timezone.utc)
         next_task = _apply_poll(job, status)
         await session.commit()
 
@@ -551,7 +555,17 @@ def _apply_poll(job: Job, status: object) -> str | None:
         crud.set_state(job, JobState.MATERIALIZING, progress=status.progress, message=status.message)  # type: ignore[attr-defined]
         return "materialize_job"
 
-    # Still running: move SUBMITTED -> RUNNING on first signal, update progress.
+    if target is JobState.SUBMITTED:
+        # Still queued at the provider (AppEEARS pending/queued) — the state
+        # machine has no finer edge than SUBMITTED, and a poll happening is not
+        # itself grounds to promote to RUNNING; only a running-class status is
+        # (PRD 012). Progress/message can still move even though the state doesn't.
+        job.progress = status.progress  # type: ignore[attr-defined]
+        job.message = status.message  # type: ignore[attr-defined]
+        return "poll_job"
+
+    # Still running: move SUBMITTED -> RUNNING only once the provider itself
+    # reports a running-class status, update progress.
     if current is JobState.SUBMITTED:
         crud.set_state(job, JobState.RUNNING, progress=status.progress, message=status.message)  # type: ignore[attr-defined]
     else:

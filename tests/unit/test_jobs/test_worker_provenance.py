@@ -11,6 +11,7 @@ and assert the event trail each lifecycle transition leaves behind.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -518,6 +519,173 @@ async def test_poll_job_persists_progress_and_message(
     assert job.progress == 42
     assert job.message == "Downloading"
     ctx["redis"].enqueue_job.assert_any_await("poll_job", job_id, _defer_by=5)
+
+
+# -- last_polled_at is a durable proof-of-life, independent of row diffs ----
+#
+# PRD 012: an AppEEARS task queued at the provider reports the same
+# state/progress/message every poll, so no column changes and a row-diffed
+# `updated_at` (onupdate-triggered) freezes — the liveness signal must never be
+# an artifact of whether the poll changed anything else.
+
+
+async def _seed_running_job(
+    session_factory, workspace_id: str, *, provider: str = "harmony"
+) -> tuple[str, str]:
+    """Insert a RUNNING job with a durable spec, ready for ``poll_job``."""
+    job_id = uuid4().hex
+    obs_handle = f"obs_{uuid4().hex[:16]}"
+    request_spec = {
+        "concept_id": "C1-X",
+        "provider": provider,
+        "workspace_id": workspace_id,
+        "obs_handle": obs_handle,
+        "job_handle": f"job_{uuid4().hex[:16]}",
+    }
+    async with session_factory() as session:
+        session.add(
+            Job(
+                job_id=job_id,
+                job_handle=request_spec["job_handle"],
+                obs_handle=obs_handle,
+                provider=provider,
+                request_spec=request_spec,
+                state=JobState.RUNNING.value,
+                progress=10,
+                message="processing",
+                provider_job_url="https://example/jobs/j1",
+            )
+        )
+        await session.commit()
+    return job_id, obs_handle
+
+
+class _UnchangedPollProvider:
+    """Reports the exact same status on every poll — the AppEEARS
+    still-queued-at-the-provider case that issues no UPDATE at all."""
+
+    async def poll(self, job: JobRef) -> JobStatus:
+        return JobStatus(state=JobState.RUNNING, progress=10, message="processing")
+
+
+async def test_poll_job_stamps_last_polled_at_even_when_status_unchanged(
+    session_factory, workspace_id, monkeypatch
+) -> None:
+    job_id, _obs_handle = await _seed_running_job(
+        session_factory, workspace_id, provider="appeears"
+    )
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_UnchangedPollProvider())
+    )
+    ctx = _ctx(session_factory)
+
+    await worker_mod.poll_job(ctx, job_id)
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    first_stamp = job.last_polled_at
+    assert first_stamp is not None
+    # The status is byte-identical to what's already stored — no other column
+    # actually changes on this poll.
+    assert job.state == JobState.RUNNING.value
+    assert job.progress == 10
+    assert job.message == "processing"
+
+    await asyncio.sleep(0.01)
+    await worker_mod.poll_job(ctx, job_id)  # identical status again
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.last_polled_at > first_stamp
+
+
+class _QueuedPollProvider:
+    """Reports AppEEARS' 'still queued' status: our state machine has no finer
+    edge than SUBMITTED for pending/queued, so this is what a real
+    AppEEARSProvider.poll() returns while a task waits in AppEEARS' own queue."""
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    async def poll(self, job: JobRef) -> JobStatus:
+        return JobStatus(state=JobState.SUBMITTED, progress=0, message=self._message)
+
+
+class _ReadyPollProvider:
+    """Reports success in one hop — the OPeNDAP/Harmony 'done' case the durable
+    machine must still walk through the legal SUBMITTED -> RUNNING ->
+    MATERIALIZING edges for."""
+
+    async def poll(self, job: JobRef) -> JobStatus:
+        return JobStatus(state=JobState.READY, progress=100, message="done")
+
+
+async def test_poll_job_keeps_submitted_while_provider_reports_queued(
+    session_factory, workspace_id, monkeypatch
+) -> None:
+    """AppEEARS 'pending'/'queued' both map onto JobState.SUBMITTED — a poll
+    happening is not itself grounds to promote to RUNNING; only a
+    running-class provider status may (PRD 012)."""
+    job_id, _obs_handle = await _seed_submitted_job(
+        session_factory, workspace_id, provider="appeears"
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_load_provider",
+        AsyncMock(return_value=_QueuedPollProvider("queued at AppEEARS")),
+    )
+    ctx = _ctx(session_factory)
+
+    await worker_mod.poll_job(ctx, job_id)
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.SUBMITTED.value
+    assert job.message == "queued at AppEEARS"
+    ctx["redis"].enqueue_job.assert_any_await("poll_job", job_id, _defer_by=5)
+
+
+async def test_poll_job_submitted_directly_to_ready_walks_legal_edges(
+    session_factory, workspace_id, monkeypatch
+) -> None:
+    """A provider reporting success in one hop from SUBMITTED must still walk
+    SUBMITTED -> RUNNING -> MATERIALIZING — never a direct jump the state
+    machine forbids."""
+    job_id, _obs_handle = await _seed_submitted_job(
+        session_factory, workspace_id, provider="opendap"
+    )
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_ReadyPollProvider())
+    )
+    ctx = _ctx(session_factory)
+
+    await worker_mod.poll_job(ctx, job_id)
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.MATERIALIZING.value
+    ctx["redis"].enqueue_job.assert_any_await("materialize_job", job_id)
+
+
+async def test_poll_job_failure_leaves_last_polled_at_unchanged(
+    session_factory, workspace_id, monkeypatch
+) -> None:
+    """A failed poll records why through `_fail_job` (the one failure choke
+    point) — it must not also stamp a successful-poll timestamp."""
+    job_id, _obs_handle = await _seed_submitted_job(
+        session_factory, workspace_id, provider="harmony"
+    )
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_FailingPollProvider())
+    )
+    ctx = _ctx(session_factory)
+
+    try:
+        await worker_mod.poll_job(ctx, job_id)
+    except RuntimeError:
+        pass
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.last_polled_at is None
 
 
 # -- JOB_FAILED on poll/materialize stage failures (WS3 failure envelope) ---
