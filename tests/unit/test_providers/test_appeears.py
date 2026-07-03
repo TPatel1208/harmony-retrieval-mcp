@@ -309,6 +309,69 @@ async def test_poll_maps_status(httpx_mock, status, expected) -> None:
 
 
 @pytest.mark.asyncio
+async def test_poll_pending_reports_zero_progress_with_queued_message(httpx_mock) -> None:
+    """A real pending-task payload carries no ``progress`` key at all (confirmed
+    against the AppEEARS API docs) — 0 is the honest value, not a mapping bug
+    (PRD 007 diagnosis). AppEEARS' own pending/queued distinction, which our
+    ``JobState.SUBMITTED`` collapses, is preserved in the message instead."""
+    _mock_login(httpx_mock)
+    httpx_mock.add_response(
+        url=f"{BASE}/task/t1",
+        json={"task_id": "t1", "status": "pending", "task_type": "point"},
+    )
+    s = await _provider().poll(JobRef(provider="appeears", provider_job_id="t1"))
+    assert s.progress == 0
+    assert s.message == "pending at AppEEARS"
+
+
+@pytest.mark.asyncio
+async def test_poll_queued_reports_queued_message(httpx_mock) -> None:
+    _mock_login(httpx_mock)
+    httpx_mock.add_response(
+        url=f"{BASE}/task/t1", json={"status": "queued"},
+    )
+    s = await _provider().poll(JobRef(provider="appeears", provider_job_id="t1"))
+    assert s.message == "queued at AppEEARS"
+
+
+@pytest.mark.asyncio
+async def test_poll_processing_extracts_summary_and_current_step_message(httpx_mock) -> None:
+    """A real mid-run processing payload: ``progress.summary`` is the overall
+    percentage, and ``progress.details`` names the step currently in flight —
+    the first entry not yet at 100%."""
+    _mock_login(httpx_mock)
+    httpx_mock.add_response(
+        url=f"{BASE}/task/t1",
+        json={
+            "status": "processing",
+            "progress": {
+                "summary": 15,
+                "details": [
+                    {"step": 1, "desc": "Initializing", "pct_complete": 100},
+                    {"step": 2, "desc": "Downloading", "pct_complete": 31},
+                ],
+            },
+        },
+    )
+    s = await _provider().poll(JobRef(provider="appeears", provider_job_id="t1"))
+    assert s.progress == 15
+    assert s.message == "Downloading"
+
+
+@pytest.mark.asyncio
+async def test_poll_done_has_no_progress_or_message(httpx_mock) -> None:
+    """A completed task carries no ``progress`` key (AppEEARS API docs)."""
+    _mock_login(httpx_mock)
+    httpx_mock.add_response(
+        url=f"{BASE}/task/t1",
+        json={"status": "done", "updated": "2026-07-02T10:00:00Z"},
+    )
+    s = await _provider().poll(JobRef(provider="appeears", provider_job_id="t1"))
+    assert s.progress == 0
+    assert s.message is None
+
+
+@pytest.mark.asyncio
 async def test_poll_failed_surfaces_error_and_fires_on_progress(httpx_mock) -> None:
     seen: list[JobStatus] = []
     _mock_login(httpx_mock)

@@ -69,6 +69,16 @@ _STATUS_MAP: dict[str, JobState] = {
     "deleted": JobState.CANCELLED,
 }
 
+# "pending" and "queued" both collapse onto JobState.SUBMITTED (our state machine
+# has no finer edge); AppEEARS' own distinction between them is preserved here
+# instead, since it's the only queue-side signal available before "processing"
+# starts reporting a real `progress` object (PRD 007 diagnosis — confirmed
+# against the AppEEARS API docs: no `progress` field exists before processing).
+_QUEUE_STATUS_MESSAGE: dict[str, str] = {
+    "pending": "pending at AppEEARS",
+    "queued": "queued at AppEEARS",
+}
+
 
 class AppEEARSProvider:
     """A ``RetrievalProvider`` for AppEEARS point/area sample tasks → Parquet."""
@@ -272,16 +282,20 @@ class AppEEARSProvider:
     # -- status mapping ---------------------------------------------------
 
     def _to_job_status(self, raw: dict) -> JobStatus:
-        state = _STATUS_MAP.get(str(raw.get("status", "")).lower(), JobState.RUNNING)
+        status_key = str(raw.get("status", "")).lower()
+        state = _STATUS_MAP.get(status_key, JobState.RUNNING)
         progress = raw.get("progress")
         pct = int(progress.get("summary", 0)) if isinstance(progress, dict) else 0
+        message = _current_step_message(progress) if isinstance(progress, dict) else None
+        if message is None:
+            message = _QUEUE_STATUS_MESSAGE.get(status_key)
         error = (
             raw.get("error") or raw.get("message") if state is JobState.FAILED else None
         )
         return JobStatus(
             state=state,
             progress=pct,
-            message=raw.get("message"),
+            message=message,
             error=error,
         )
 
@@ -380,6 +394,26 @@ def _point_from_aoi(aoi: AOI | None) -> tuple[float, float]:
         west, south, east, north = aoi.bbox
         return (south + north) / 2.0, (west + east) / 2.0
     raise ValueError("AOI has neither a Point geometry nor a bbox")
+
+
+def _current_step_message(progress: dict) -> str | None:
+    """The description of the step currently in flight, from a ``processing``
+    task's ``progress.details`` array (``[{"step", "desc", "pct_complete"}, ...]``).
+
+    Picks the first step not yet at 100% — the one actually running — falling
+    back to the last step's description if every listed step is complete
+    (a task about to transition to ``done``). Returns ``None`` for a payload
+    with no ``details`` (AppEEARS may report only ``summary``).
+    """
+    details = progress.get("details")
+    if not isinstance(details, list) or not details:
+        return None
+    for step in details:
+        if isinstance(step, dict) and step.get("pct_complete", 100) < 100:
+            desc = step.get("desc")
+            return str(desc) if desc is not None else None
+    desc = details[-1].get("desc") if isinstance(details[-1], dict) else None
+    return str(desc) if desc is not None else None
 
 
 def _appeears_date(dt) -> str:

@@ -911,6 +911,41 @@ async def test_get_status_reads_from_postgres(
     assert status["obs_handle"] == out["obs_handle"]
 
 
+async def test_get_status_includes_phase_message_and_timestamps(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """PRD 007: a non-terminal job's status must carry a qualitative phase (so
+    "no news" from the provider is never confused with "stalled"), the
+    provider's own message when present, and the submitted/last-polled
+    timestamps the jobs table already tracks."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    job_handle = out["job_handle"]
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, job_handle)
+        job.state = JobState.RUNNING.value
+        job.progress = 42
+        job.message = "Downloading"
+        await session.commit()
+        await session.refresh(job)
+        created_at, updated_at = job.created_at, job.updated_at
+
+    status = await get_retrieval_status(
+        job_handle, workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+    assert status["phase"] == "processing"
+    assert status["message"] == "Downloading"
+    assert status["submitted_at"] == created_at.isoformat()
+    assert status["last_polled_at"] == updated_at.isoformat()
+
+
 async def test_get_status_wrong_handle_type_raises(
     workspace_store, session_factory, workspace_id,
 ) -> None:

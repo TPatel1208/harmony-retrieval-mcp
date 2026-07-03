@@ -537,7 +537,9 @@ def _apply_poll(job: Job, status: object) -> str | None:
     current = JobState(job.state)
 
     if target is JobState.FAILED:
-        crud.set_state(job, JobState.FAILED, error=status.error, progress=job.progress)  # type: ignore[attr-defined]
+        crud.set_state(
+            job, JobState.FAILED, error=status.error, progress=job.progress, message=status.message  # type: ignore[attr-defined]
+        )
         return None
     if target is JobState.CANCELLED:
         crud.set_state(job, JobState.CANCELLED)
@@ -545,15 +547,16 @@ def _apply_poll(job: Job, status: object) -> str | None:
 
     if target is JobState.READY:
         if current is JobState.SUBMITTED:
-            crud.set_state(job, JobState.RUNNING)
-        crud.set_state(job, JobState.MATERIALIZING, progress=status.progress)  # type: ignore[attr-defined]
+            crud.set_state(job, JobState.RUNNING, message=status.message)  # type: ignore[attr-defined]
+        crud.set_state(job, JobState.MATERIALIZING, progress=status.progress, message=status.message)  # type: ignore[attr-defined]
         return "materialize_job"
 
     # Still running: move SUBMITTED -> RUNNING on first signal, update progress.
     if current is JobState.SUBMITTED:
-        crud.set_state(job, JobState.RUNNING, progress=status.progress)  # type: ignore[attr-defined]
+        crud.set_state(job, JobState.RUNNING, progress=status.progress, message=status.message)  # type: ignore[attr-defined]
     else:
         job.progress = status.progress  # type: ignore[attr-defined]
+        job.message = status.message  # type: ignore[attr-defined]
     return "poll_job"
 
 

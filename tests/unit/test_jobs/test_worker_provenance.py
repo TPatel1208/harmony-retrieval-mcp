@@ -134,6 +134,15 @@ class _MaterializingProvider:
         )
 
 
+class _RunningPollProvider:
+    """Reports a still-running status with progress and a provider message
+    (PRD 007) — the poll_job success path a real Harmony/AppEEARS mid-run
+    poll takes."""
+
+    async def poll(self, job: JobRef) -> JobStatus:
+        return JobStatus(state=JobState.RUNNING, progress=42, message="Downloading")
+
+
 class _FailingPollProvider:
     """Fails every poll — a mid-flight Harmony poll error."""
 
@@ -485,6 +494,30 @@ async def test_materialize_job_records_materialized_with_detail_fields(
     assert detail["storage_key"] == "harmony/result/g1.nc"
     assert detail["media_type"] == "application/netcdf4"
     assert detail["size_bytes"] == 1234
+
+
+# -- poll_job persists progress and message from the provider (PRD 007) ----
+
+
+async def test_poll_job_persists_progress_and_message(
+    session_factory, workspace_id, monkeypatch
+) -> None:
+    job_id, _obs_handle = await _seed_submitted_job(
+        session_factory, workspace_id, provider="harmony"
+    )
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_RunningPollProvider())
+    )
+    ctx = _ctx(session_factory)
+
+    await worker_mod.poll_job(ctx, job_id)
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.RUNNING.value
+    assert job.progress == 42
+    assert job.message == "Downloading"
+    ctx["redis"].enqueue_job.assert_any_await("poll_job", job_id, _defer_by=5)
 
 
 # -- JOB_FAILED on poll/materialize stage failures (WS3 failure envelope) ---

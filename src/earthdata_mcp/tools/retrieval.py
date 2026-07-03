@@ -74,6 +74,20 @@ _FORMAT_BY_SHAPE = {
 }
 _DEFAULT_FORMAT = "application/netcdf4"
 
+#: A qualitative, provider-agnostic label per durable state (PRD 007) — the
+#: signal a caller falls back to when no numeric ``progress`` exists, so a
+#: long-queued job never looks indistinguishable from a stalled one.
+_PHASE_BY_STATE: dict[str, str] = {
+    JobState.PENDING.value: "queued",
+    JobState.SUBMITTED.value: "queued at provider",
+    JobState.RUNNING.value: "processing",
+    JobState.MATERIALIZING.value: "materializing",
+    JobState.READY.value: "ready",
+    JobState.FAILED.value: "failed",
+    JobState.EXPIRED.value: "expired",
+    JobState.CANCELLED.value: "cancelled",
+}
+
 # Lazily-built process defaults. Stay ``None`` until the first un-injected call so
 # importing this module (and server.py) builds no engine and opens no connection.
 _session_factory = None
@@ -265,7 +279,13 @@ async def get_retrieval_status(
 
     Resolves the ``job_`` handle within the workspace first (cross-workspace
     access is denied), then reads the durable row. Returns
-    ``{job_handle, obs_handle, status, progress, error, provider_job_url}``.
+    ``{job_handle, obs_handle, status, progress, phase, message, error,
+    submitted_at, last_polled_at, provider_job_url}``. ``phase`` is a
+    qualitative, provider-agnostic label derived from the durable state (PRD
+    007) — the signal a caller falls back to when ``progress`` is 0 but the job
+    is not actually stalled (e.g. an AppEEARS job still queued at the
+    provider). ``message`` is whatever status text the provider reported on
+    the last poll, when any.
     """
     store = store or _default_store()
     session_factory = session_factory or _default_session_factory()
@@ -284,7 +304,11 @@ async def get_retrieval_status(
             "obs_handle": job.obs_handle,
             "status": job.state,
             "progress": job.progress,
+            "phase": _PHASE_BY_STATE.get(job.state, job.state),
+            "message": job.message,
             "error": job.error,
+            "submitted_at": job.created_at.isoformat(),
+            "last_polled_at": job.updated_at.isoformat(),
             "provider_job_url": job.provider_job_url,
         }
 

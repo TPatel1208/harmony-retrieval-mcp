@@ -38,6 +38,10 @@ class Job(Base):
     state: Mapped[str] = mapped_column(String, index=True)
     provider_job_url: Mapped[str | None] = mapped_column(String, default=None)
     progress: Mapped[int] = mapped_column(Integer, default=0)
+    # The provider's own status text for the current poll (e.g. Harmony's message
+    # field, or AppEEARS' pending/queued/processing-step wording) — distinct from
+    # `error`, which is terminal-failure-only (PRD 007).
+    message: Mapped[str | None] = mapped_column(String, default=None)
     output_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
