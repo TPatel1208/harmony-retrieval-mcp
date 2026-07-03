@@ -8,10 +8,20 @@ Accepts the forms an agent naturally has on hand and resolves each to a bbox
   degenerate point AOI (Point geojson + zero-area bbox), the point/station case
   ``retrieve_timeseries(point_sample=True)`` expects,
 * a GeoJSON geometry/Feature (string or dict),
-* a HUC watershed code (all-digit string, even length 2–12) — resolved via
-  the **USGS Watershed Boundary Dataset (WBD) REST API** (auth-free).
+* a HUC watershed code (all-digit string, even length 2–12, or explicit
+  ``"HUC <digits>"``) — resolved via the **USGS Watershed Boundary Dataset
+  (WBD) REST API** (auth-free).
+* a US FIPS state/county code (all-digit string, length 2 or 5, or explicit
+  ``"FIPS <digits>"``) — resolved via the **US Census TIGERweb
+  ``State_County`` REST API** (auth-free). A bare 2-digit code collides with
+  HUC2 and raises a disambiguation error instead of guessing; use the
+  explicit ``HUC``/``FIPS`` prefix to be unambiguous. Tract/block-group/place
+  FIPS geographies are out of scope.
 * a place/watershed/basin name — tried first against **Nominatim** (OSM), then
   against the USGS WBD name search (HUC2 → HUC12); raises if both fail.
+
+A blank or whitespace-only ``location`` raises immediately, before any
+network call.
 
 The handle ``payload`` is the **re-materializable spec** (CLAUDE.md hard rule):
 the resolved ``bbox``, the source kind, the original ``geojson`` when supplied,
@@ -52,6 +62,17 @@ _HUC_LENGTHS: frozenset[int] = frozenset({2, 4, 6, 8, 10, 12})
 #: Matches "HUC-2 10", "HUC2 14", "HUC 01010001", "huc-8 14080101", etc.
 #: Stated level digits are advisory only; code length determines the WBD layer.
 _HUC_PREFIX_RE = re.compile(r"(?i)^huc[-]?\d*\s+(\d+)$")
+
+#: US Census TIGERweb State_County MapServer — auth-free, no key.
+#: Layer 0 = States (2-digit GEOID), layer 1 = Counties (5-digit GEOID).
+_TIGERWEB_BASE_URL = "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/State_County/MapServer"
+#: Valid FIPS code lengths in scope — 2 (state) and 5 (county). Tract/block
+#: geographies are out of scope (PRD 006).
+_FIPS_LENGTHS: frozenset[int] = frozenset({2, 5})
+_FIPS_LAYER_BY_LENGTH: dict[int, int] = {2: 0, 5: 1}
+
+#: Matches "FIPS 06001", "FIPS-2 06", "fips 06", etc. — mirrors ``_HUC_PREFIX_RE``.
+_FIPS_PREFIX_RE = re.compile(r"(?i)^fips[-]?\d*\s+(\d+)$")
 
 #: Stopwords stripped before AND-token WBD search.
 _WBD_STOPWORDS: frozenset[str] = frozenset({"river", "basin", "watershed", "region"})
@@ -147,12 +168,66 @@ def _normalize_huc_prefix(s: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _is_fips_code(s: str) -> bool:
+    """Return True iff ``s`` is an all-digit string whose length is in {2, 5}."""
+    return s.isdigit() and len(s) in _FIPS_LENGTHS
+
+
+def _normalize_fips_prefix(s: str) -> str | None:
+    """Strip a FIPS prefix from ``s`` and return the trailing digit string, or None.
+
+    Accepts forms like ``"FIPS 06001"``, ``"FIPS-2 06"``, ``"fips 06"``
+    (case-insensitive), mirroring ``_normalize_huc_prefix``. Leading zeros are
+    preserved verbatim. Returns ``None`` when no prefix pattern matches.
+    """
+    m = _FIPS_PREFIX_RE.match(s.strip())
+    return m.group(1) if m else None
+
+
+def _classify_digit_code(location: str) -> tuple[str, str] | None:
+    """Classify a digit-string ``location`` as a HUC or FIPS code request.
+
+    Single auditable decision table (PRD 006):
+    1. explicit ``HUC <digits>`` prefix with a valid HUC length -> ``("huc", digits)``.
+    2. explicit ``FIPS <digits>`` prefix with a valid FIPS length -> ``("fips", digits)``.
+    3. bare digits valid in both systems (length 2) -> raises a disambiguation
+       ``ValueError`` naming both prefixed forms.
+    4. bare digits valid only as FIPS (length 5) -> ``("fips", location)``.
+    5. bare digits valid only as HUC (length 4, 6, 8, 10, 12) -> ``("huc", location)``.
+    6. anything else (including a prefix whose digits don't match that system's
+       valid lengths) -> ``None``, falls through to name resolution.
+    """
+    huc_digits = _normalize_huc_prefix(location)
+    if huc_digits is not None and _is_huc_code(huc_digits):
+        return "huc", huc_digits
+
+    fips_digits = _normalize_fips_prefix(location)
+    if fips_digits is not None and _is_fips_code(fips_digits):
+        return "fips", fips_digits
+
+    is_huc = _is_huc_code(location)
+    is_fips = _is_fips_code(location)
+    if is_huc and is_fips:
+        raise ValueError(
+            f"Ambiguous location {location!r}: valid as both a HUC watershed code "
+            f"and a US FIPS code. Use {'HUC ' + location!r} for the watershed or "
+            f"{'FIPS ' + location!r} for the FIPS boundary to disambiguate."
+        )
+    if is_fips:
+        return "fips", location
+    if is_huc:
+        return "huc", location
+    return None
+
+
 async def _resolve_location(
     location: str | dict,
 ) -> tuple[tuple[float, float, float, float], dict | None, str, str | None]:
     """Dispatch on input shape → ``(bbox, geojson, source, query)``.
 
     Resolution order:
+    0. Blank/whitespace-only string → raises ``ValueError`` immediately, before
+       any parsing or network call.
     1. dict / GeoJSON string → geojson branch.
     2. Four-comma string → bbox branch (raises on bad values; never geocodes).
     3. One-comma numeric string ``"lon,lat"`` → a degenerate point AOI (a Point
@@ -160,8 +235,13 @@ async def _resolve_location(
        ``retrieve_timeseries(point_sample=True)`` expects. A one-comma string
        that doesn't parse as two in-range floats (e.g. ``"Denver, CO"``) falls
        through to geocoding instead.
-    4. All-digit even-length string (2–12 chars) → USGS WBD by HUC code; raises
-       immediately if WBD returns nothing (no Nominatim fallback for HUC inputs).
+    4. Digit-string dispatch (see ``_classify_digit_code`` for the full decision
+       table): explicit ``HUC``/``FIPS`` prefixes route deterministically; bare
+       digits route by length when unambiguous (HUC: 4/6/8/10/12, FIPS: 5) and
+       raise a disambiguation ``ValueError`` for the one colliding length (2,
+       valid as both HUC2 and FIPS state). HUC resolves via USGS WBD, FIPS via
+       Census TIGERweb; both raise immediately on a not-found code (no
+       Nominatim fallback for digit-code inputs).
     5. Curated region table (``tools/data/regions.json``) — continents and
        informal regions that Nominatim mishandles; matched case-insensitively
        including aliases.  Returns immediately; Nominatim is never called.
@@ -175,6 +255,9 @@ async def _resolve_location(
     """
     if isinstance(location, dict):
         return _bbox_from_geojson(location), location, "geojson", None
+
+    if not location.strip():
+        raise ValueError("location must be provided")
 
     parsed = _try_parse_json(location)
     if isinstance(parsed, dict):
@@ -197,14 +280,14 @@ async def _resolve_location(
             geometry = {"type": "Point", "coordinates": [lon, lat]}
             return (lon, lat, lon, lat), geometry, "point", None
 
-    huc_digits = _normalize_huc_prefix(location)
-    if huc_digits is not None and _is_huc_code(huc_digits):
-        bbox, geometry = await _query_wbd_by_huc(huc_digits)
-        return bbox, geometry, "usgs_wbd", huc_digits
-
-    if _is_huc_code(location):
-        bbox, geometry = await _query_wbd_by_huc(location)
-        return bbox, geometry, "usgs_wbd", location
+    digit_code = _classify_digit_code(location)
+    if digit_code is not None:
+        system, digits = digit_code
+        if system == "huc":
+            bbox, geometry = await _query_wbd_by_huc(digits)
+            return bbox, geometry, "usgs_wbd", digits
+        bbox, geometry = await _query_fips(digits)
+        return bbox, geometry, "census_fips", digits
 
     region_bbox = _lookup_region(location)
     if region_bbox is not None:
@@ -349,6 +432,21 @@ def _extract_pairs(coords: Any) -> list[list[float]]:
     return pairs
 
 
+def _check_remote_response(response: httpx.Response, service: str, query: str) -> None:
+    """Raise a clean ``ValueError`` naming ``service`` and ``query`` on HTTP failure.
+
+    Keeps backend URLs (which may embed internal hostnames/params) out of
+    user-facing messages; the original ``httpx.HTTPStatusError`` (which does
+    carry the URL) is chained via ``from exc`` for logs/debugging.
+    """
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise ValueError(
+            f"{service} request failed for {query!r} (HTTP {response.status_code})"
+        ) from exc
+
+
 # -- USGS WBD REST API --------------------------------------------------------
 
 
@@ -371,7 +469,7 @@ async def _query_wbd_by_huc(
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.get(url, params=params)
-        response.raise_for_status()
+        _check_remote_response(response, "USGS WBD", huc_code)
         fc = response.json()
     features = fc.get("features", [])
     if not features:
@@ -390,6 +488,8 @@ async def _query_wbd_by_name(
     an AND WHERE clause, and raises ``ValueError`` for multiple candidates.
     Returns ``None`` when both phases find nothing.
     """
+    if not query.strip():
+        raise ValueError("cannot search USGS WBD with an empty query")
     async with httpx.AsyncClient(timeout=15.0) as client:
         result = await _query_wbd_by_like(query, client)
         if result is not None:
@@ -417,7 +517,7 @@ async def _query_wbd_by_like(
             "returnGeometry": "true",
         }
         response = await client.get(url, params=params)
-        response.raise_for_status()
+        _check_remote_response(response, "USGS WBD", query)
         features = response.json().get("features", [])
         if features:
             if len(features) == 1:
@@ -456,7 +556,7 @@ async def _query_wbd_by_tokens(
             "returnGeometry": "true",
         }
         response = await client.get(url, params=params)
-        response.raise_for_status()
+        _check_remote_response(response, "USGS WBD", query)
         features = response.json().get("features", [])
         if not features:
             continue
@@ -474,6 +574,36 @@ async def _query_wbd_by_tokens(
             f" Provide a HUC code directly (e.g. {first_code!r}) to be precise."
         )
     return None
+
+
+# -- US Census TIGERweb (FIPS) ----------------------------------------------
+
+
+async def _query_fips(
+    fips_code: str,
+) -> tuple[tuple[float, float, float, float], dict]:
+    """Query Census TIGERweb by exact FIPS GEOID. Raises ``ValueError`` if not found.
+
+    Layer is chosen by code length: 2 digits -> States (layer 0), 5 digits ->
+    Counties (layer 1). Leading zeros are preserved verbatim.
+    """
+    layer = _FIPS_LAYER_BY_LENGTH[len(fips_code)]
+    url = f"{_TIGERWEB_BASE_URL}/{layer}/query"
+    params = {
+        "f": "geojson",
+        "where": f"GEOID='{fips_code}'",
+        "outFields": "*",
+        "returnGeometry": "true",
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(url, params=params)
+        _check_remote_response(response, "Census TIGERweb", fips_code)
+        fc = response.json()
+    features = fc.get("features", [])
+    if not features:
+        raise ValueError(f"no such FIPS code: Census TIGERweb found no boundary for {fips_code!r}")
+    geometry = features[0]["geometry"]
+    return _bbox_from_geojson(geometry), geometry
 
 
 # -- Nominatim -------------------------------------------------------------
@@ -510,7 +640,7 @@ async def _geocode_nominatim(
             params={**base_params, "featuretype": "relation"},
             headers=_NOMINATIM_HEADERS,
         )
-        response.raise_for_status()
+        _check_remote_response(response, "Nominatim", query)
         results = response.json()
 
         if not results:
@@ -520,7 +650,7 @@ async def _geocode_nominatim(
                 params=base_params,
                 headers=_NOMINATIM_HEADERS,
             )
-            response.raise_for_status()
+            _check_remote_response(response, "Nominatim", query)
             results = response.json()
 
     if not results:

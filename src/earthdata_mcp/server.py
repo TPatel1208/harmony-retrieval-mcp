@@ -70,8 +70,13 @@ async def define_area_of_interest(
     """Define an area of interest and mint an ``aoi_`` handle.
 
     ``location`` may be a bbox string ``"-105,37,-104,38"`` (W,S,E,N decimal
-    degrees), a GeoJSON geometry/Feature as a JSON string, or a place name / HUC
-    watershed / FIPS code to geocode. Returns
+    degrees), a bare point ``"-93.6,41.6"`` (lon,lat), a GeoJSON geometry/Feature
+    as a JSON string, a HUC watershed code (``"14080101"``, or explicit ``"HUC
+    14080101"``), a US FIPS state/county code (``"06001"``, or explicit ``"FIPS
+    06001"``; 2-digit state, 5-digit county), or a place/watershed name to
+    geocode. A bare 2-digit code is ambiguous (valid as both HUC2 and a FIPS
+    state code) and raises a disambiguation error naming both prefixed forms —
+    use ``"HUC <code>"`` or ``"FIPS <code>"`` explicitly. Returns
     ``{"handle", "bbox", "geometry_summary", "source"}`` — ``geometry_summary``
     is ``{"type", "vertex_count"}`` (or ``None``); resolve the handle for the
     full geometry.

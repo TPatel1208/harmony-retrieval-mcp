@@ -556,7 +556,11 @@ async def test_define_area_wbd_huc_leading_zeros_preserved(
 @pytest.mark.parametrize(
     "huc_code,expected_layer",
     [
-        ("14", 1),
+        # 2-digit bare codes are excluded here: they collide with FIPS state
+        # codes and now raise a disambiguation error (see
+        # test_define_area_bare_2digit_raises_disambiguation below). HUC2
+        # layer routing is covered by the explicit "HUC-2 14" prefix form in
+        # test_define_area_huc_prefix_routes_to_correct_layer.
         ("1408", 2),
         ("140801", 3),
         ("14080101", 4),
@@ -983,3 +987,146 @@ async def test_huc_code_still_uses_wbd(
     )
     assert out["source"] == "usgs_wbd"
     assert len(httpx_mock.get_requests()) == 1
+
+
+# -- Blank/whitespace validation and FIPS support (new) ----------------------
+
+
+async def test_define_area_blank_location_raises_immediately(
+    httpx_mock, workspace_store, workspace_id
+) -> None:
+    # Empty string must raise instantly with a validation error.
+    # No HTTP calls should be made.
+    with pytest.raises(ValueError, match="location must be provided"):
+        await define_area_of_interest("", workspace_id=workspace_id, store=workspace_store)
+    assert len(httpx_mock.get_requests()) == 0
+
+
+async def test_define_area_whitespace_location_raises_immediately(
+    httpx_mock, workspace_store, workspace_id
+) -> None:
+    # Whitespace-only string must raise instantly with a validation error.
+    # No HTTP calls should be made.
+    with pytest.raises(ValueError, match="location must be provided"):
+        await define_area_of_interest("   ", workspace_id=workspace_id, store=workspace_store)
+    assert len(httpx_mock.get_requests()) == 0
+
+
+# -- FIPS code resolution (real store, HTTP mocked) ---------------------------
+
+_FIPS_COUNTY_POLYGON = {
+    "type": "Polygon",
+    "coordinates": [
+        [
+            [-122.34, 37.45],
+            [-121.46, 37.45],
+            [-121.46, 37.90],
+            [-122.34, 37.90],
+            [-122.34, 37.45],
+        ]
+    ],
+}
+_FIPS_COUNTY_FEATURE_COLLECTION = {
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "geometry": _FIPS_COUNTY_POLYGON,
+            "properties": {"NAME": "Alameda", "GEOID": "06001"},
+        }
+    ],
+}
+_EXPECTED_FIPS_COUNTY_BBOX = [-122.34, 37.45, -121.46, 37.9]
+
+
+async def test_define_area_fips_county_resolves_not_wbd(
+    httpx_mock, workspace_store, workspace_id
+) -> None:
+    # "06001" (Alameda County, CA) is a 5-digit code — valid only for FIPS
+    # (5 is an odd HUC length), so it must resolve via the FIPS/TIGERweb path
+    # and never touch the USGS WBD endpoint (the live-repro bug).
+    httpx_mock.add_response(json=_FIPS_COUNTY_FEATURE_COLLECTION)
+    out = await define_area_of_interest(
+        "06001", workspace_id=workspace_id, store=workspace_store
+    )
+    assert out["source"] == "census_fips"
+    assert out["bbox"] == _EXPECTED_FIPS_COUNTY_BBOX
+
+    request = httpx_mock.get_requests()[0]
+    assert "hydro.nationalmap.gov" not in str(request.url)
+    assert "tigerweb" in str(request.url).lower()
+    assert len(httpx_mock.get_requests()) == 1
+
+
+async def test_define_area_fips_state_prefix_resolves(
+    httpx_mock, workspace_store, workspace_id
+) -> None:
+    # Explicit "FIPS 06" prefix (California, state-level) resolves via the
+    # FIPS/TIGERweb states layer (layer 0), with source "census_fips".
+    state_fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": _FIPS_COUNTY_POLYGON,
+                "properties": {"NAME": "California", "GEOID": "06"},
+            }
+        ],
+    }
+    httpx_mock.add_response(json=state_fc)
+    out = await define_area_of_interest(
+        "FIPS 06", workspace_id=workspace_id, store=workspace_store
+    )
+    assert out["source"] == "census_fips"
+    request = httpx_mock.get_requests()[0]
+    assert "/0/query" in request.url.path  # layer 0 = States
+    assert len(httpx_mock.get_requests()) == 1
+
+
+async def test_define_area_bare_2digit_raises_disambiguation(
+    httpx_mock, workspace_store, workspace_id
+) -> None:
+    # "14" is a valid HUC2 code AND a valid FIPS state code (California-length
+    # ambiguity) — must raise instead of silently picking one, and no HTTP call
+    # should be made while ambiguous.
+    with pytest.raises(ValueError) as exc_info:
+        await define_area_of_interest(
+            "14", workspace_id=workspace_id, store=workspace_store
+        )
+    msg = str(exc_info.value)
+    assert "HUC 14" in msg
+    assert "FIPS 14" in msg
+    assert httpx_mock.get_requests() == []
+
+
+async def test_define_area_fips_prefix_no_such_county(
+    httpx_mock, workspace_store, workspace_id
+) -> None:
+    # Explicit "FIPS 99999" prefix routes to the FIPS/TIGERweb path; a genuine
+    # no-such-county result must fail with a "no such FIPS code" error, not a
+    # HUC-flavored message, and never touch USGS WBD.
+    httpx_mock.add_response(json=_WBD_EMPTY)
+    with pytest.raises(ValueError, match="no such FIPS code"):
+        await define_area_of_interest(
+            "FIPS 99999", workspace_id=workspace_id, store=workspace_store
+        )
+    request = httpx_mock.get_requests()[0]
+    assert "tigerweb" in str(request.url).lower()
+    assert len(httpx_mock.get_requests()) == 1
+
+
+async def test_define_area_wbd_500_wraps_clean_error(
+    httpx_mock, workspace_store, workspace_id
+) -> None:
+    # A raw 500 from USGS WBD must not leak as an unhandled HTTPStatusError with
+    # the backend URL — it should surface as a ValueError naming USGS WBD and
+    # the query, with no hydro.nationalmap.gov URL in the message text.
+    httpx_mock.add_response(status_code=500)
+    with pytest.raises(ValueError) as exc_info:
+        await define_area_of_interest(
+            "14080101", workspace_id=workspace_id, store=workspace_store
+        )
+    msg = str(exc_info.value)
+    assert "USGS WBD" in msg
+    assert "14080101" in msg
+    assert "hydro.nationalmap.gov" not in msg
