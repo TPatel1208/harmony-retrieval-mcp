@@ -56,6 +56,10 @@ _FORMAT_BY_SHAPE = {
 
 _LON_NAMES = ("lon", "longitude", "x")
 _LAT_NAMES = ("lat", "latitude", "y")
+_CF_LON_STD_NAMES = ("longitude",)
+_CF_LAT_STD_NAMES = ("latitude",)
+_CF_LON_UNITS = ("degrees_east",)
+_CF_LAT_UNITS = ("degrees_north",)
 
 _storage: StorageBackend | None = None
 
@@ -182,15 +186,24 @@ async def resample(
                 "timeseries.html#offset-aliases"
             ) from exc
     if spatial_factor:
-        lon, lat = _lon_name(result), _lat_name(result)
+        lon, lat = _find_lonlat(result)
         if lon is None and lat is None:
             raise ValueError(
                 "resample: no lon/lat spatial dimension found on the source dataset "
                 f"(looked for {_LON_NAMES + _LAT_NAMES}, case-insensitive, among "
-                f"{sorted(set(result.dims) | set(result.coords))}); "
+                f"{sorted(set(result.dims) | set(result.coords) | set(result.data_vars))}); "
                 "cannot apply the requested spatial_factor"
             )
-        dims = {name: spatial_factor for name in (lon, lat) if name is not None}
+        lon_ndim = result[lon].ndim if lon is not None else 0
+        lat_ndim = result[lat].ndim if lat is not None else 0
+        if lon_ndim >= 2 or lat_ndim >= 2:
+            # Swath: lon/lat are 2-D auxiliary coords over shared (scanline, pixel)
+            # dims — coarsen works on dims regardless of coord dimensionality, so
+            # coarsen those shared dims directly rather than the coord names.
+            swath_var = lon if lon_ndim >= 2 else lat
+            dims = {d: spatial_factor for d in result[swath_var].dims}
+        else:
+            dims = {name: spatial_factor for name in (lon, lat) if name is not None}
         result = result.coarsen(boundary="trim", **dims).mean()
 
     spec = {
@@ -435,6 +448,10 @@ def _apply_subset(
         return obj.select(variables) if variables else obj
 
     result = obj
+    if bbox is not None:
+        # Promote before variable selection so a variables=[...] filter can't drop
+        # a grouped geolocation array the bbox below still needs (PRD 005).
+        result = _promote_geo_coords(result)
     if variables:
         result = result[_resolve_variable_names(result, variables)]
     if bbox is not None:
@@ -484,20 +501,34 @@ def _resolve_variable_names(ds: xr.Dataset, variables: list[str]) -> list[str]:
 
 
 def _bbox_sel(ds: xr.Dataset, bbox: tuple[float, float, float, float]) -> xr.Dataset:
-    """Select a W,S,E,N box, honoring a descending latitude axis.
+    """Select a W,S,E,N box.
 
     Raises if neither a lon nor lat axis can be found: a caller who explicitly
     requested an AOI never gets a silent no-op — see CLAUDE.md's "no analysis
     tools" spirit applied to transforms, every one must record a real effect.
+
+    Two selection strategies, keyed on the discovered coordinates' dimensionality:
+    a 1-D dimension coordinate (a regular grid) uses index ``slice``-based ``sel``,
+    honoring a descending latitude axis. A 2-D auxiliary coordinate (swath
+    geolocation, a function of scanline × pixel) has no meaningful index slice, so
+    it's selected by value: a ``where`` mask against the bbox, dropping any
+    scanline/pixel index that has no in-bbox point at all so the result actually
+    shrinks (PRD 005).
     """
-    west, south, east, north = bbox
-    lon, lat = _lon_name(ds), _lat_name(ds)
+    lon, lat = _find_lonlat(ds)
     if lon is None and lat is None:
         raise ValueError(
             "subset: no lon/lat spatial dimension found on the source dataset "
             f"(looked for {_LON_NAMES + _LAT_NAMES}, case-insensitive, among "
-            f"{sorted(set(ds.dims) | set(ds.coords))}); cannot apply the requested AOI"
+            f"{sorted(set(ds.dims) | set(ds.coords) | set(ds.data_vars))}); "
+            "cannot apply the requested AOI"
         )
+    lon_ndim = ds[lon].ndim if lon is not None else 0
+    lat_ndim = ds[lat].ndim if lat is not None else 0
+    if lon_ndim >= 2 or lat_ndim >= 2:
+        return _bbox_sel_2d(ds, lon, lat, bbox)
+
+    west, south, east, north = bbox
     if lon is not None:
         ds = ds.sel({lon: slice(west, east)})
     if lat is not None:
@@ -509,14 +540,127 @@ def _bbox_sel(ds: xr.Dataset, bbox: tuple[float, float, float, float]) -> xr.Dat
     return ds
 
 
-def _lon_name(ds: xr.Dataset) -> str | None:
-    names = {n.lower(): n for n in ds.coords} | {n.lower(): n for n in ds.dims}
-    return next((names[n] for n in _LON_NAMES if n in names), None)
+def _bbox_sel_2d(
+    ds: xr.Dataset,
+    lon: str | None,
+    lat: str | None,
+    bbox: tuple[float, float, float, float],
+) -> xr.Dataset:
+    """Value-mask selection for 2-D auxiliary lon/lat (swath geolocation).
+
+    ``west > east`` is a valid antimeridian-crossing bbox (the AOI validator
+    explicitly allows it), handled as a two-interval longitude test. Raises if the
+    bbox intersects no point at all — an explicitly-requested AOI never silently
+    no-ops, matching the 1-D path's guarantee.
+    """
+    west, south, east, north = bbox
+    mask = None
+    if lon is not None:
+        lon_da = ds[lon]
+        lon_mask = (lon_da >= west) & (lon_da <= east) if west <= east else (
+            (lon_da >= west) | (lon_da <= east)
+        )
+        mask = lon_mask
+    if lat is not None:
+        lat_da = ds[lat]
+        lat_mask = (lat_da >= south) & (lat_da <= north)
+        mask = lat_mask if mask is None else (mask & lat_mask)
+    if not bool(mask.any()):
+        raise ValueError(
+            f"subset: the requested AOI {bbox} does not intersect any point of the "
+            f"swath's 2-D {lat}/{lon} geolocation; cannot apply the requested AOI"
+        )
+    return ds.where(mask, drop=True)
 
 
-def _lat_name(ds: xr.Dataset) -> str | None:
-    names = {n.lower(): n for n in ds.coords} | {n.lower(): n for n in ds.dims}
-    return next((names[n] for n in _LAT_NAMES if n in names), None)
+def _find_lonlat(ds: xr.Dataset) -> tuple[str | None, str | None]:
+    """Shared lon/lat discovery for every transform that needs spatial coords (PRD 005).
+
+    Tries, per axis, in priority order until one is unambiguous: (1) exact bare
+    names (``lon``/``longitude``/``x``, ``lat``/``latitude``/``y``, case-insensitive
+    — today's behavior); (2) flattened group-prefixed names — any variable whose
+    post-``__`` leaf matches a bare name (the ``_merge_groups`` convention, e.g.
+    ``geolocation__latitude``); (3) CF ``standard_name``/``units`` attribute
+    sniffing. Searches dims, coords, *and* data variables — grouped geolocation
+    arrays commonly land as data variables after flattening, not coordinates.
+    Raises if a tier finds more than one distinct candidate for an axis.
+    """
+    lon = _discover_axis(ds, "longitude", _LON_NAMES, _CF_LON_STD_NAMES, _CF_LON_UNITS)
+    lat = _discover_axis(ds, "latitude", _LAT_NAMES, _CF_LAT_STD_NAMES, _CF_LAT_UNITS)
+    return lon, lat
+
+
+def _discover_axis(
+    ds: xr.Dataset,
+    axis: str,
+    bare_names: tuple[str, ...],
+    cf_std_names: tuple[str, ...],
+    cf_units: tuple[str, ...],
+) -> str | None:
+    all_names = _all_variable_names(ds)
+
+    bare_hit = next((all_names[n] for n in bare_names if n in all_names), None)
+    if bare_hit is not None:
+        return bare_hit
+
+    flattened = sorted(
+        {
+            name
+            for name in all_names.values()
+            if "__" in name and name.rsplit("__", 1)[-1].lower() in bare_names
+        }
+    )
+    if len(flattened) == 1:
+        return flattened[0]
+    if len(flattened) > 1:
+        raise ValueError(
+            f"ambiguous {axis} coordinate: multiple flattened-name candidates match "
+            f"{bare_names}: {flattened}"
+        )
+
+    cf_hits = sorted(
+        {
+            name
+            for name, var in ds.variables.items()
+            if var.attrs.get("standard_name") in cf_std_names
+            or var.attrs.get("units") in cf_units
+        }
+    )
+    if len(cf_hits) == 1:
+        return cf_hits[0]
+    if len(cf_hits) > 1:
+        raise ValueError(
+            f"ambiguous {axis} coordinate: multiple CF-tagged candidates "
+            f"(standard_name/units): {cf_hits}"
+        )
+    return None
+
+
+def _all_variable_names(ds: xr.Dataset) -> dict[str, str]:
+    """Lowercase name → actual name, over dims, coords, and data variables."""
+    names: dict[str, str] = {}
+    for n in ds.dims:
+        names[n.lower()] = n
+    for n in ds.coords:
+        names[n.lower()] = n
+    for n in ds.data_vars:
+        names[n.lower()] = n
+    return names
+
+
+def _promote_geo_coords(ds: xr.Dataset) -> xr.Dataset:
+    """Promote discovered lon/lat data variables to coordinates.
+
+    Grouped geolocation arrays (e.g. ``geolocation__latitude``) commonly land as
+    data variables after group flattening. Promoting them to coordinates before a
+    ``variables=[...]`` selection keeps them attached to the result the same way a
+    flat grid's lat/lon coordinates already are — otherwise ``ds[[var]]`` would
+    silently drop the geolocation the bbox needs, and an explicitly-requested AOI
+    would no-op with nothing to select against.
+    """
+    lon, lat = _find_lonlat(ds)
+    to_promote = [n for n in (lon, lat) if n is not None and n in ds.data_vars]
+    return ds.set_coords(to_promote) if to_promote else ds
 
 
 def _time_calendar(ds: xr.Dataset) -> str:

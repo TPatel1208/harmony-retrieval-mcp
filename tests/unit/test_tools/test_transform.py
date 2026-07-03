@@ -67,6 +67,31 @@ def _grid_capitalized(var: str = "no2", lon=(-105.0, -104.5, -104.0)) -> xr.Data
     )
 
 
+def _swath_grid(var: str = "no2") -> xr.Dataset:
+    """A grouped/swath-shaped dataset: 2-D geolocation as flattened group-prefixed
+    data variables over (``scanline``, ``pixel``) dims — not 1-D dimension coords.
+
+    Mirrors what ``_merge_groups`` produces for TEMPO/OMI L2 swath products: lat/lon
+    live under a ``/geolocation`` subgroup and land here as ``geolocation__latitude``/
+    ``geolocation__longitude`` data variables, functions of scanline × pixel.
+    """
+    lat = np.array(
+        [[35.0, 35.0, 35.0, 35.0],
+         [36.0, 36.0, 36.0, 36.0],
+         [37.0, 37.0, 37.0, 37.0],
+         [38.0, 38.0, 38.0, 38.0]]
+    )
+    lon = np.array([[-106.0, -105.0, -104.0, -103.0]] * 4)
+    data = np.arange(16, dtype="float32").reshape(4, 4)
+    return xr.Dataset(
+        {
+            var: (("scanline", "pixel"), data),
+            "geolocation__latitude": (("scanline", "pixel"), lat),
+            "geolocation__longitude": (("scanline", "pixel"), lon),
+        }
+    )
+
+
 async def _seed_aoi(store, workspace_id: str) -> str:
     return await store.put_handle(
         workspace_id, HandleType.AOI, {"source": "bbox", "bbox": _BBOX}
@@ -378,6 +403,154 @@ async def test_subset_time_range_selects_correctly_on_julian_calendar(
     assert all(t.calendar == "julian" for t in cube["time"].values)
 
 
+# -- grouped/swath geolocation ----------------------------------------------
+# PRD 005: transform coordinate discovery must find flattened group-prefixed
+# geolocation (geolocation__latitude/longitude) and, when it's 2-D (swath, not a
+# regular grid), select by value-mask rather than index slice.
+
+
+async def test_subset_swath_2d_geolocation_clips_to_bbox(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """A 2-D geolocation__latitude/longitude swath must be discoverable and the AOI
+    must clip the swath's shared (scanline, pixel) dims down to the intersecting
+    region — not silently no-op because the names aren't the bare lon/lat list."""
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, _swath_grid())
+    # Rows lat=36,37 (pixel cols lon=-105,-104) — a clean interior 2x2 block.
+    aoi = await workspace_store.put_handle(
+        workspace_id, HandleType.AOI, {"source": "bbox", "bbox": [-105.5, 35.5, -103.5, 37.5]}
+    )
+
+    out = await subset(
+        src, aoi_handle=aoi, workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    assert cube.sizes["scanline"] == 2
+    assert cube.sizes["pixel"] == 2
+    assert set(cube["geolocation__latitude"].values.ravel().tolist()) == {36.0, 37.0}
+    assert set(cube["geolocation__longitude"].values.ravel().tolist()) == {-105.0, -104.0}
+
+
+async def test_subset_swath_variables_filter_does_not_drop_geolocation_needed_for_aoi(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """Regression: geolocation arrays land as data variables after group flattening
+    (not coordinates). A variables=[...] filter selecting only the science variable
+    must not silently drop them before the AOI bbox below needs to find them —
+    that would make an explicitly-requested AOI a silent no-op (story 9)."""
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, _swath_grid())
+    aoi = await workspace_store.put_handle(
+        workspace_id, HandleType.AOI, {"source": "bbox", "bbox": [-105.5, 35.5, -103.5, 37.5]}
+    )
+
+    out = await subset(
+        src, aoi_handle=aoi, variables=["no2"], workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    assert cube.sizes["scanline"] == 2
+    assert cube.sizes["pixel"] == 2
+
+
+async def test_subset_swath_aoi_no_intersection_raises(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """Story 4/9: an AOI that intersects no point of the 2-D swath geolocation must
+    raise, never silently return the whole swath or an empty-but-"successful" cube."""
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, _swath_grid())
+    # Swath covers lat 35..38, lon -106..-103 — this AOI is nowhere near it.
+    aoi = await workspace_store.put_handle(
+        workspace_id, HandleType.AOI, {"source": "bbox", "bbox": [10.0, 10.0, 20.0, 20.0]}
+    )
+
+    with pytest.raises(ValueError, match="AOI"):
+        await subset(
+            src, aoi_handle=aoi, workspace_id=workspace_id,
+            **_deps(workspace_store, provenance_store, local_backend),
+        )
+
+
+async def test_subset_swath_antimeridian_bbox_selects_both_edges(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """Story 5 (antimeridian): a W > E bbox must be a valid two-interval longitude
+    test on 2-D geolocation, selecting points on both sides of the date line."""
+    lat = np.array([[10.0, 10.0, 10.0, 10.0], [20.0, 20.0, 20.0, 20.0]])
+    lon = np.array([[-179.0, -100.0, 100.0, 179.0]] * 2)
+    ds = xr.Dataset(
+        {
+            "no2": (("scanline", "pixel"), np.arange(8, dtype="float32").reshape(2, 4)),
+            "geolocation__latitude": (("scanline", "pixel"), lat),
+            "geolocation__longitude": (("scanline", "pixel"), lon),
+        }
+    )
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, ds)
+    aoi = await workspace_store.put_handle(
+        workspace_id, HandleType.AOI, {"source": "bbox", "bbox": [170.0, 0.0, -170.0, 30.0]}
+    )
+
+    out = await subset(
+        src, aoi_handle=aoi, workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    lons = set(cube["geolocation__longitude"].values.ravel().tolist())
+    assert lons == {-179.0, 179.0}
+
+
+async def test_subset_cf_attribute_discovery_finds_oddly_named_coords(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """Story 3: oddly-named 1-D coords with proper CF standard_name/units attrs must
+    still resolve, without adding them to a hardcoded bare-name list."""
+    lat_vals = [37.0, 38.0, 39.0]
+    lon_vals = [-105.0, -104.5, -104.0]
+    ds = xr.Dataset(
+        {"ndvi": (("row_coord", "col_coord"), np.arange(9, dtype="float32").reshape(3, 3))},
+        coords={
+            "row_coord": ("row_coord", lat_vals, {"standard_name": "latitude", "units": "degrees_north"}),
+            "col_coord": ("col_coord", lon_vals, {"standard_name": "longitude", "units": "degrees_east"}),
+        },
+    )
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, ds)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await subset(
+        src, aoi_handle=aoi, workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    assert cube.sizes["row_coord"] == 1
+
+
+async def test_subset_ambiguous_cf_candidates_raises_naming_both(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """Two distinct CF-tagged latitude candidates is a genuine ambiguity — the error
+    must name both rather than silently picking one."""
+    ds = xr.Dataset(
+        {"ndvi": (("a",), np.array([1.0, 2.0], dtype="float32"))},
+        coords={
+            "lat_a": ("a", [37.0, 38.0], {"standard_name": "latitude"}),
+            "lat_b": ("a", [37.0, 38.0], {"standard_name": "latitude"}),
+        },
+    )
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, ds)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    with pytest.raises(ValueError, match="lat_a") as exc_info:
+        await subset(
+            src, aoi_handle=aoi, workspace_id=workspace_id,
+            **_deps(workspace_store, provenance_store, local_backend),
+        )
+    assert "lat_b" in str(exc_info.value)
+
+
 # -- reproject -------------------------------------------------------------
 
 
@@ -418,6 +591,23 @@ async def test_resample_returns_cube_and_records_edge(
     # coarsen(boundary="trim") halves the 3-wide axes down to 1.
     cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
     assert cube.sizes["lon"] == 1
+
+
+async def test_resample_spatial_factor_on_swath_coarsens_shared_dims(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """PRD 005 story 5: 2-D geolocation (swath) has no 1-D lon/lat dim to coarsen by
+    name — resample must coarsen the coords' shared (scanline, pixel) dims instead."""
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, _swath_grid())
+
+    out = await resample(
+        src, spatial_factor=2, workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+    assert cube.sizes["scanline"] == 2
+    assert cube.sizes["pixel"] == 2
 
 
 async def test_resample_spatial_factor_applies_to_capitalized_axis_names(
