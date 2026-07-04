@@ -74,3 +74,9 @@ class LocalFilesystemBackend(StorageBackend):
             return StatResult(key=key, size=path.stat().st_size)
 
         return await asyncio.to_thread(_stat)
+
+    async def uri(self, key: str) -> str:
+        path = self._path(key)
+        if not path.is_file():
+            raise KeyError(key)
+        return path.as_uri()

@@ -91,5 +91,22 @@ def test_base_backend_path_returns_none() -> None:
         async def delete(self, k): ...  # type: ignore[override]
         async def list(self, prefix=""): ...  # type: ignore[override]
         async def stat(self, k): ...  # type: ignore[override]
+        async def uri(self, k): ...  # type: ignore[override]
 
     assert _Stub().path("any_key") is None
+
+
+async def test_uri_returns_file_scheme_for_existing_key(tmp_path) -> None:
+    backend = _make_local(tmp_path)
+    await backend.put("a/b/obj.bin", b"hello world")
+
+    uri = await backend.uri("a/b/obj.bin")
+
+    assert uri.startswith("file://")
+    assert uri.endswith("a/b/obj.bin")
+
+
+async def test_uri_raises_for_missing_key(tmp_path) -> None:
+    backend = _make_local(tmp_path)
+    with pytest.raises(KeyError):
+        await backend.uri("does/not/exist.bin")

@@ -22,6 +22,7 @@ from earthdata_mcp.tools import (
     area,
     coverage,
     discovery,
+    export,
     preview,
     provenance,
     retrieval,
@@ -333,6 +334,46 @@ async def align(
 ) -> dict:
     """Align ≥2 gridded results to a common grid → a ``cube_`` handle + alignment report."""
     return await transform.align(source_handles, method, workspace_id=workspace_id)
+
+
+@mcp.tool
+async def export_result(
+    handle: str,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+) -> dict:
+    """Resolve a materialized ``obs_``/``cube_`` handle to an openable URI.
+
+    Returns ``{handle, status: "ready", storage_uri, media_type, size_bytes,
+    rematerialize_hint}``. ``storage_uri`` is scheme-agnostic — ``file://``
+    locally, a presigned ``https://`` URL for an S3 backend — so open-by-scheme
+    logic survives a move to hosted deployment unchanged. Exporting LRU-touches
+    the handle so an actively-read result is never the first thing evicted.
+
+    A pending or expired (evicted) handle answers ``{handle, status, message}``
+    instead of raising; an unknown or cross-workspace handle collapses to the
+    same ``not_found`` answer so existence never leaks.
+    """
+    return await export.export_result(handle, workspace_id)
+
+
+@mcp.tool
+async def rematerialize(
+    handle: str,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+) -> dict:
+    """Re-enqueue the durable job behind an evicted ``obs_`` handle.
+
+    Resubmits the request spec already persisted with the original job — never a
+    new or overridden spec — via the same enqueue path a fresh retrieval uses.
+    Returns ``{job_handle, obs_handle, status}``; poll ``job_handle`` with
+    ``get_retrieval_status`` and call ``export_result`` again once it is ready.
+
+    A handle whose result is still cached answers immediately with no provider
+    round-trip. A handle with no job behind it (e.g. a transform-derived
+    ``cube_``) or an unknown/cross-workspace handle answers a structured
+    ``{status: "not_found"}`` rather than raising.
+    """
+    return await export.rematerialize(handle, workspace_id)
 
 
 @mcp.tool

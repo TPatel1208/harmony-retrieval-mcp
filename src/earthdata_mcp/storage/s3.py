@@ -40,3 +40,6 @@ class ObjectStoreBackend(StorageBackend):
 
     async def stat(self, key: str) -> StatResult:
         raise NotImplementedError("ObjectStoreBackend is enabled in a later phase")
+
+    async def uri(self, key: str) -> str:
+        raise NotImplementedError("ObjectStoreBackend is enabled in a later phase")

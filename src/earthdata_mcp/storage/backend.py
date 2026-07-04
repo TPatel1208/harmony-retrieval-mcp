@@ -42,6 +42,15 @@ class StorageBackend(ABC):
     async def stat(self, key: str) -> StatResult:
         """Return metadata for ``key``; raise ``KeyError`` if absent."""
 
+    @abstractmethod
+    async def uri(self, key: str) -> str:
+        """A URI a consumer can open directly: ``file://`` locally, a presigned
+        ``https://`` GET URL for an object store. Raise ``KeyError`` if absent.
+
+        This is the scheme-agnostic egress contract (PRD 017): callers branch on
+        the returned URI's scheme, never on which backend is configured.
+        """
+
     def path(self, key: str) -> "Path | None":
         """Filesystem ``Path`` for ``key``, or ``None`` if not path-addressable (e.g. S3).
 

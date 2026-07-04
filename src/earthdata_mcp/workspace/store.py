@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from earthdata_mcp.workspace.models import Base, Handle, HandleType, mint_handle
@@ -131,6 +131,25 @@ class WorkspaceStore:
             # below never triggers a sync lazy-load (which raises ``MissingGreenlet``).
             await session.refresh(row)
             return _to_record(row)
+
+    async def touch_handle(self, workspace_id: str, handle: str) -> None:
+        """Bump ``handle``'s ``updated_at`` to now, without touching its payload.
+
+        The materialization cache's LRU eviction (PRD 015) orders candidates by
+        ``updated_at``; ``export_result`` (PRD 017) calls this so a result a
+        consumer is actively reading is never the first evicted. Same isolation
+        contract as :meth:`get_handle`.
+        """
+        async with self._session_factory() as session:
+            row = await session.get(Handle, handle)
+            if row is None:
+                raise HandleNotFoundError(handle)
+            if row.workspace_id != workspace_id:
+                raise CrossWorkspaceError(
+                    f"handle {handle!r} is not owned by workspace {workspace_id!r}"
+                )
+            row.updated_at = func.now()
+            await session.commit()
 
     async def list_handles(
         self, workspace_id: str, handle_type: HandleType | None = None

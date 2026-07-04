@@ -23,6 +23,7 @@ import io
 import os
 import tempfile
 import zipfile
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import numpy as np
@@ -43,6 +44,7 @@ from earthdata_mcp.providers.base import JobRef, JobStatus, MaterializedResult
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.tools import discovery as discovery_mod
 from earthdata_mcp.tools._dataio import NETCDF_BUNDLE_MEDIA_TYPE, open_result
+from earthdata_mcp.tools.export import export_result, rematerialize
 from earthdata_mcp.tools.provenance import get_provenance
 from earthdata_mcp.tools.retrieval import (
     get_retrieval_status,
@@ -574,3 +576,95 @@ async def test_opendap_bundle_path_runs_to_ready_and_opens(
     result = open_result(bundle, NETCDF_BUNDLE_MEDIA_TYPE)
     assert result.sizes["time"] == 2
     assert result["x"].values.tolist() == [10.0, 20.0]
+
+
+# -- export_result / rematerialize (PRD 017) -------------------------------
+
+
+def _real_netcdf_bytes(value: float) -> bytes:
+    """A minimal, genuinely-openable single-variable netCDF file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "g.nc")
+        xr.Dataset(
+            {"x": ("time", np.array([value], dtype="float64"))},
+            coords={"time": np.array([0], dtype="int64")},
+        ).to_netcdf(path, engine="h5netcdf", mode="w")
+        with open(path, "rb") as f:
+            return f.read()
+
+
+async def test_export_then_evict_then_rematerialize_then_export_again(
+    workspace_store, provenance_store, session_factory, patch_worker_seam,
+    local_backend, workspace_id,
+) -> None:
+    """The full recovery loop PRD 017 exists for: materialize → export → open
+    with xarray from the returned URI; then simulate eviction (delete the blob,
+    flip the handle to expired, as the eviction sweep would) → rematerialize →
+    drive the new job to READY → export again → open again — no memory of the
+    original retrieve_data arguments needed anywhere in the recovery half."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    patch_worker_seam(
+        _FakeProvider("harmony", "application/netcdf4", _real_netcdf_bytes(1.0), local_backend)
+    )
+
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        cmr=_make_cmr(), store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=AsyncMock(),
+    )
+    obs_handle = out["obs_handle"]
+
+    async with session_factory() as session:
+        job = await crud.get_job_by_handle(session, out["job_handle"])
+        job_id = job.job_id
+    await _drive_to_ready(session_factory, job_id)
+
+    exported = await export_result(
+        obs_handle, workspace_id=workspace_id, store=workspace_store, storage=local_backend,
+    )
+    assert exported["status"] == "ready"
+    ds_opened = xr.open_dataset(Path.from_uri(exported["storage_uri"]))
+    assert ds_opened["x"].values.tolist() == [1.0]
+
+    # Simulate eviction: delete the blob, flip the handle to expired — exactly
+    # what jobs/eviction.py's _evict_one does, without invoking the sweep itself.
+    evicted_record = await workspace_store.get_handle(workspace_id, obs_handle)
+    await local_backend.delete(evicted_record.payload["storage_key"])
+    await workspace_store.update_handle(
+        workspace_id, obs_handle, {"status": "expired", "storage_key": None}
+    )
+
+    evicted_export = await export_result(
+        obs_handle, workspace_id=workspace_id, store=workspace_store, storage=local_backend,
+    )
+    assert evicted_export["status"] == "expired"
+
+    re_enqueue = AsyncMock()
+    rematerialized = await rematerialize(
+        obs_handle, workspace_id=workspace_id,
+        store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=re_enqueue,
+    )
+    assert rematerialized["status"] == JobState.PENDING.value
+    assert rematerialized["obs_handle"] == obs_handle
+    re_enqueue.assert_awaited_once()
+    assert re_enqueue.await_args.args[0] == "submit_job"
+
+    # A different fake provider instance so the recovered job's materialized
+    # bytes are distinguishable from the first run's.
+    patch_worker_seam(
+        _FakeProvider("harmony", "application/netcdf4", _real_netcdf_bytes(2.0), local_backend)
+    )
+    async with session_factory() as session:
+        new_job = await crud.get_job_by_handle(session, rematerialized["job_handle"])
+        new_job_id = new_job.job_id
+        assert new_job.request_spec["concept_id"] == _CONCEPT_ID
+    await _drive_to_ready(session_factory, new_job_id)
+
+    re_exported = await export_result(
+        obs_handle, workspace_id=workspace_id, store=workspace_store, storage=local_backend,
+    )
+    assert re_exported["status"] == "ready"
+    ds_reopened = xr.open_dataset(Path.from_uri(re_exported["storage_uri"]))
+    assert ds_reopened["x"].values.tolist() == [2.0]

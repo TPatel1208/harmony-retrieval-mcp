@@ -126,6 +126,41 @@ async def test_update_handle_cross_workspace_denied(
         await workspace_store.update_handle("ws-intruder", handle, {"x": 1})
 
 
+# --- touch_handle ----------------------------------------------------------
+
+
+async def test_touch_handle_bumps_updated_at_without_changing_payload(
+    workspace_store: WorkspaceStore, workspace_id: str
+) -> None:
+    """PRD 017: ``export_result`` LRU-touches a materialized result so it is
+    never the first evicted — the payload must survive untouched."""
+    handle = await workspace_store.put_handle(
+        workspace_id, HandleType.OBS, {"status": "ready", "storage_key": "x/g.nc"}
+    )
+    before = (await workspace_store.get_handle(workspace_id, handle)).updated_at
+
+    await workspace_store.touch_handle(workspace_id, handle)
+
+    record = await workspace_store.get_handle(workspace_id, handle)
+    assert record.updated_at > before
+    assert record.payload == {"status": "ready", "storage_key": "x/g.nc"}
+
+
+async def test_touch_handle_cross_workspace_denied(
+    workspace_store: WorkspaceStore,
+) -> None:
+    handle = await workspace_store.put_handle("ws-owner", HandleType.OBS, {})
+    with pytest.raises(CrossWorkspaceError):
+        await workspace_store.touch_handle("ws-intruder", handle)
+
+
+async def test_touch_handle_unknown_raises(
+    workspace_store: WorkspaceStore, workspace_id: str
+) -> None:
+    with pytest.raises(HandleNotFoundError):
+        await workspace_store.touch_handle(workspace_id, "obs_doesnotexist")
+
+
 # --- ownership / isolation ----------------------------------------------
 
 
