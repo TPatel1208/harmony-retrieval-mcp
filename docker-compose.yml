@@ -36,6 +36,12 @@ services:
       DATABASE_URL: postgresql+asyncpg://postgres:${DB_PASSWORD:-postgres}@db:5432/earthdata_mcp
       REDIS_URL: redis://redis:6379/0
       EARTHDATA_DATA_DIR: /data
+      EARTHDATA_MCP_TRANSPORT: ${EARTHDATA_MCP_TRANSPORT:-stdio}
+      EARTHDATA_MCP_HOST: ${EARTHDATA_MCP_HOST:-0.0.0.0}
+      EARTHDATA_MCP_PORT: ${EARTHDATA_MCP_PORT:-8765}
+      EARTHDATA_MCP_TOKEN: ${EARTHDATA_MCP_TOKEN:-}
+    ports:
+      - "${EARTHDATA_MCP_PORT:-8765}:${EARTHDATA_MCP_PORT:-8765}"
     volumes:
       - ./src:/app/src
       - ./tests:/app/tests
@@ -45,9 +51,23 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # Phase 1 wires the skeleton; the MCP transport is finalized in a later phase.
-    # Keep the container alive so the gate can `docker compose exec` into it.
-    command: ["sleep", "infinity"]
+    networks:
+      - default
+      - earthdata_net
+    # stdio (default) has no server process for compose to run — the container
+    # stays up idle so the gate can `docker compose exec` into it, and an MCP
+    # client spawns the server itself as a child process. Under
+    # EARTHDATA_MCP_TRANSPORT=http, this *is* the server process: a second
+    # compose stack attaches over `earthdata_net` at http://mcp:${EARTHDATA_MCP_PORT}/mcp.
+    command:
+      - sh
+      - -c
+      - |
+        if [ "$$EARTHDATA_MCP_TRANSPORT" = "http" ]; then
+          exec python -m earthdata_mcp.server
+        else
+          exec sleep infinity
+        fi
 
   worker:
     build: .
@@ -83,7 +103,18 @@ services:
     volumes:
       - minio_data:/data
 
+networks:
+  # Fixed name (not project-prefixed) so a second, independent compose stack
+  # (e.g. Talking-to-Air) can join it — declare `earthdata_net: {external: true}`
+  # on that stack's side; this stack creates it on first `docker compose up`.
+  earthdata_net:
+    name: earthdata_net
+
 volumes:
   pg_data:
+  # Fixed name so a second compose stack can mount it at the same absolute
+  # path (/data) and resolve `export_result`'s `file://` URIs as a plain
+  # filesystem read — declare `earthdata_data: {external: true}` there.
   data:
+    name: earthdata_data
   minio_data:

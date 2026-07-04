@@ -8,7 +8,9 @@ backend.
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -72,6 +74,18 @@ class Settings(BaseSettings):
     harmony_rate_per_sec: float = 10.0
     appeears_rate_per_sec: float = 10.0
     opendap_rate_per_sec: float = 10.0
+
+    # MCP transport / bearer token (PRD 018) --------------------------------
+    # stdio (default) requires being the consumer's child process; http is the
+    # opt-in for a separate-container consumer (e.g. a second compose stack).
+    mcp_transport: Literal["stdio", "http"] = Field(
+        default="stdio", validation_alias="EARTHDATA_MCP_TRANSPORT"
+    )
+    mcp_host: str = Field(default="0.0.0.0", validation_alias="EARTHDATA_MCP_HOST")
+    mcp_port: int = Field(default=8765, validation_alias="EARTHDATA_MCP_PORT")
+    # Static bearer token required on every HTTP request when set; ignored under
+    # stdio. A tripwire, not real authn — see README's security posture note.
+    mcp_token: str = Field(default="", validation_alias="EARTHDATA_MCP_TOKEN")
 
     # Logging --------------------------------------------------------------
     log_level: str = "INFO"

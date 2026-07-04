@@ -17,7 +17,10 @@ from __future__ import annotations
 from typing import Any
 
 from fastmcp import FastMCP
+from starlette.middleware import Middleware
 
+from earthdata_mcp.config import get_settings
+from earthdata_mcp.http_auth import BearerTokenMiddleware
 from earthdata_mcp.tools import (
     area,
     coverage,
@@ -411,8 +414,20 @@ async def cite_dataset(
 
 
 def main() -> None:
-    """Run the MCP server."""
-    mcp.run()
+    """Run the MCP server: stdio by default, streamable HTTP when configured."""
+    settings = get_settings()
+    if settings.mcp_transport == "http":
+        middleware = []
+        if settings.mcp_token:
+            middleware.append(Middleware(BearerTokenMiddleware, token=settings.mcp_token))
+        mcp.run(
+            transport="http",
+            host=settings.mcp_host,
+            port=settings.mcp_port,
+            middleware=middleware,
+        )
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

@@ -123,8 +123,8 @@ boot, so retrievals survive a restart.
 
 ### Running the MCP server
 
-The container keeps itself alive (`sleep infinity`) so you can `exec` into it. To
-run the MCP server over stdio:
+**stdio (default).** The container keeps itself alive (`sleep infinity`) so you can
+`exec` into it:
 
 ```bash
 docker compose exec mcp python -m earthdata_mcp.server
@@ -133,6 +133,55 @@ docker compose exec mcp python -m earthdata_mcp.server
 Point your MCP client at that process (stdio transport). The server import has **no
 DB/network/credential side effects** — every tool builds its dependencies lazily on
 first call.
+
+**HTTP (cross-container consumers).** Set `EARTHDATA_MCP_TRANSPORT=http` in `.env`
+and the `mcp` service *becomes* the server process — `docker compose up` yields a
+working streamable-HTTP endpoint at `http://mcp:${EARTHDATA_MCP_PORT:-8765}/mcp`
+instead of the idle placeholder. Set `EARTHDATA_MCP_TOKEN` and every request needs
+`Authorization: Bearer <token>` (a missing/wrong token gets a bare 401); leave it
+unset to serve unauthenticated (fine for a single private-network lab box, not
+beyond it).
+
+#### Attaching a second stack (e.g. Talking-to-Air)
+
+This stack owns the shared network (`earthdata_net`) and materialization volume
+(`earthdata_data`) — both get fixed names and are created automatically the first
+time you run `docker compose up` here, no extra step needed on this side.
+
+A consumer running as its own, independent compose stack declares both as
+**external** (they already exist — this stack created them) and joins them on the
+service that talks to this server:
+
+```yaml
+services:
+  tta-backend:
+    # ...
+    environment:
+      MCP_URL: http://mcp:8765/mcp
+      MCP_TOKEN: ${EARTHDATA_MCP_TOKEN}
+    networks:
+      - earthdata_net
+    volumes:
+      - earthdata_data:/data   # same absolute path as this server's EARTHDATA_DATA_DIR
+
+networks:
+  earthdata_net:
+    external: true
+
+volumes:
+  earthdata_data:
+    external: true
+```
+
+Because both stacks mount the same volume at `/data`, a `file://` URI returned by
+`export_result` resolves identically inside the consumer container — opening it is
+a plain filesystem read, no download step.
+
+**Security posture.** This is a lab-box design: the bearer token is a tripwire (it
+stops an open port from being a free-for-all, and gets consumers sending
+credentials from day one) — it is **not** real authentication. Real authn/OAuth,
+an S3 backend with presigned URLs, and per-workspace quotas are deferred to a
+pre-hosting hardening phase; do not expose this beyond a private network as-is.
 
 ---
 
@@ -151,6 +200,9 @@ All settings come from environment variables (loaded from `.env` by Compose). Se
 | `EARTHDATA_DATA_DIR` | `/data` (Compose) / `./data` | Local materialization root (Zarr/Parquet land here). |
 | `EARTHDATA_CACHE_MAX_BYTES` | `5368709120` (~5 GiB) | Materialization cache eviction cap. |
 | `LOG_LEVEL` | `INFO` | Logging verbosity. |
+| `EARTHDATA_MCP_TRANSPORT` | `stdio` | `stdio` or `http` (streamable HTTP). See "Running the MCP server" above. |
+| `EARTHDATA_MCP_HOST` / `EARTHDATA_MCP_PORT` | `0.0.0.0` / `8765` | Bind address for `http` transport. |
+| `EARTHDATA_MCP_TOKEN` | — | Static bearer token required on every HTTP request when set. |
 
 Per-provider rate limits (token buckets, generous defaults) are also configurable:
 `CMR_RATE_PER_SEC` (20), `HARMONY_RATE_PER_SEC` / `APPEEARS_RATE_PER_SEC` /
