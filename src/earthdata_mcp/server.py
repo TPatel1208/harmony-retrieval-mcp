@@ -207,7 +207,12 @@ async def get_retrieval_status(
     job_handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
 ) -> dict:
-    """Read a retrieval job's durable state from Postgres (status/progress/error)."""
+    """Read a retrieval job's durable state from Postgres (status/progress/error).
+
+    An unknown, cross-workspace, or orphaned ``job_`` handle is a structured
+    ``{job_handle, status: "not_found", message}`` answer, not an error — a
+    missing job is a valid answer to "what's this job's status?".
+    """
     return await retrieval.get_retrieval_status(job_handle, workspace_id)
 
 
@@ -223,6 +228,10 @@ async def cancel_retrieval(
     caller's intent ("stop this job") is already satisfied by the time the call
     lands, since a job's state can change between when a caller decides to
     cancel and when the request arrives.
+
+    An unknown, cross-workspace, or orphaned ``job_`` handle is likewise not an
+    error: it returns ``{job_handle, status: "not_found", cancelled: False,
+    message}`` — "stop this job" on a gone job is already satisfied.
     """
     return await retrieval.cancel_retrieval(job_handle, workspace_id)
 

@@ -53,7 +53,7 @@ from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.handles import resolve_aoi, resolve_dataset
 from earthdata_mcp.workspace.models import HandleType, ProvenanceEventType, handle_type_of
 from earthdata_mcp.workspace.provenance import ProvenanceStore
-from earthdata_mcp.workspace.store import WorkspaceStore
+from earthdata_mcp.workspace.store import CrossWorkspaceError, HandleNotFoundError, WorkspaceStore
 
 #: An ``enqueue_fn`` enqueues ``(task_name, *args)`` onto the worker queue. The
 #: default wraps an Arq pool; tests inject an ``AsyncMock`` so no Redis is needed.
@@ -87,6 +87,16 @@ _PHASE_BY_STATE: dict[str, str] = {
     JobState.EXPIRED.value: "expired",
     JobState.CANCELLED.value: "cancelled",
 }
+
+#: PRD 014 — a well-formed ``job_`` handle that resolves to nothing is a
+#: structured answer, not a raised error. Unknown-to-the-store and
+#: cross-workspace collapse to this same message so handle existence never
+#: leaks across a workspace boundary; only the orphan case (handle visible in
+#: the caller's own workspace, no jobs row behind it) gets a distinct message.
+_NOT_FOUND_MESSAGE = "no job found for handle {handle!r}"
+_ORPHANED_HANDLE_MESSAGE = (
+    "handle {handle!r} exists in this workspace but has no job record behind it"
+)
 
 # Lazily-built process defaults. Stay ``None`` until the first un-injected call so
 # importing this module (and server.py) builds no engine and opens no connection.
@@ -277,8 +287,8 @@ async def get_retrieval_status(
 ) -> dict:
     """Read a job's current state **from Postgres** (never from memory, §4.3).
 
-    Resolves the ``job_`` handle within the workspace first (cross-workspace
-    access is denied), then reads the durable row. Returns
+    Resolves the ``job_`` handle within the workspace first, then reads the
+    durable row. Returns
     ``{job_handle, obs_handle, status, progress, phase, message, error,
     submitted_at, last_polled_at, provider_job_url}``. ``phase`` is a
     qualitative, provider-agnostic label derived from the durable state (PRD
@@ -286,19 +296,40 @@ async def get_retrieval_status(
     is not actually stalled (e.g. an AppEEARS job still queued at the
     provider). ``message`` is whatever status text the provider reported on
     the last poll, when any.
+
+    A missing job is a valid answer, not an exception (PRD 014): a handle
+    unknown to the workspace store, one owned by another workspace, and one
+    that exists but has no jobs row (an orphan) all return
+    ``{job_handle, status: "not_found", message}`` instead of raising — the
+    first two are byte-identical so handle existence never leaks across a
+    workspace boundary. A malformed handle (anything not prefixed ``job_``)
+    still raises ``ValueError``: that is a caller bug, not a missing job.
     """
     store = store or _default_store()
     session_factory = session_factory or _default_session_factory()
 
     if handle_type_of(job_handle) is not HandleType.JOB:
         raise ValueError(f"expected a job_ handle, got {job_handle!r}")
-    # Isolation gate: raises CrossWorkspaceError / HandleNotFoundError.
-    await store.get_handle(workspace_id, job_handle)
+    # Isolation gate, collapsed to a not_found answer (PRD 014): a handle
+    # unknown to the store and one owned by another workspace are
+    # indistinguishable to the caller, so existence never leaks.
+    try:
+        await store.get_handle(workspace_id, job_handle)
+    except (HandleNotFoundError, CrossWorkspaceError):
+        return {
+            "job_handle": job_handle,
+            "status": "not_found",
+            "message": _NOT_FOUND_MESSAGE.format(handle=job_handle),
+        }
 
     async with session_factory() as session:
         job = await crud.get_job_by_handle(session, job_handle)
         if job is None:
-            raise crud.JobNotFoundError(job_handle)
+            return {
+                "job_handle": job_handle,
+                "status": "not_found",
+                "message": _ORPHANED_HANDLE_MESSAGE.format(handle=job_handle),
+            }
         return {
             "job_handle": job.job_handle,
             "obs_handle": job.obs_handle,
@@ -350,18 +381,42 @@ async def cancel_retrieval(
       decides to cancel and when the call lands (e.g. it finishes or fails
       first), so this is not an illegal request — the caller's intent
       ("stop this job") is already satisfied.
+
+    A fourth outcome, a missing job, is likewise not an exception (PRD 014): a
+    handle unknown to the workspace store, one owned by another workspace, or
+    one that exists but has no jobs row (an orphan) all return
+    ``{job_handle, status: "not_found", cancelled: False, message}`` — "stop
+    this job" on a gone job is already satisfied. The first two are
+    byte-identical so handle existence never leaks across a workspace
+    boundary. A malformed handle (anything not prefixed ``job_``) still
+    raises ``ValueError``.
     """
     store = store or _default_store()
     session_factory = session_factory or _default_session_factory()
 
     if handle_type_of(job_handle) is not HandleType.JOB:
         raise ValueError(f"expected a job_ handle, got {job_handle!r}")
-    await store.get_handle(workspace_id, job_handle)  # isolation gate
+    # Isolation gate, collapsed to a not_found answer (PRD 014): see
+    # get_retrieval_status for why unknown and cross-workspace must match.
+    try:
+        await store.get_handle(workspace_id, job_handle)
+    except (HandleNotFoundError, CrossWorkspaceError):
+        return {
+            "job_handle": job_handle,
+            "status": "not_found",
+            "cancelled": False,
+            "message": _NOT_FOUND_MESSAGE.format(handle=job_handle),
+        }
 
     async with session_factory() as session:
         job = await crud.get_job_by_handle(session, job_handle)
         if job is None:
-            raise crud.JobNotFoundError(job_handle)
+            return {
+                "job_handle": job_handle,
+                "status": "not_found",
+                "cancelled": False,
+                "message": _ORPHANED_HANDLE_MESSAGE.format(handle=job_handle),
+            }
         current = JobState(job.state)
         if current in TERMINAL_STATES:
             return {"job_handle": job_handle, "status": job.state, "cancelled": False}

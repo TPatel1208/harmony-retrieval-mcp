@@ -38,8 +38,7 @@ from earthdata_mcp.tools.retrieval import (
     retrieve_subset,
     retrieve_timeseries,
 )
-from earthdata_mcp.workspace.models import HandleType
-from earthdata_mcp.workspace.store import CrossWorkspaceError
+from earthdata_mcp.workspace.models import HandleType, mint_handle
 
 #: AppEEARS layer map for the point-sample tests' "NDVI" variable.
 _APPEEARS_LAYERS = {"NDVI": {"Description": "NDVI"}}
@@ -1032,6 +1031,49 @@ async def test_get_status_falls_back_to_updated_at_for_legacy_rows(
     assert status["last_polled_at"] == updated_at.isoformat()
 
 
+async def test_get_status_unknown_handle_returns_not_found(
+    workspace_store, session_factory, workspace_id,
+) -> None:
+    """PRD 014: a well-formed but never-minted job_ handle is a structured
+    not_found answer, not a raised error — the caller's polling loop can
+    branch on it instead of catching an opaque tool error."""
+    unknown_handle = mint_handle(HandleType.JOB)
+
+    status = await get_retrieval_status(
+        unknown_handle, workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+
+    assert status["job_handle"] == unknown_handle
+    assert status["status"] == "not_found"
+    assert status["message"]
+
+
+async def test_get_status_orphan_handle_returns_distinct_not_found(
+    workspace_store, session_factory, workspace_id,
+) -> None:
+    """PRD 014: a job_ handle minted in the workspace store but with no jobs
+    row behind it (a server-side inconsistency) is still a not_found answer —
+    but with a message distinct from the plain unknown-handle case, since the
+    handle is legitimately visible in this workspace."""
+    orphan_handle = await workspace_store.put_handle(
+        workspace_id, HandleType.JOB, payload={"obs_handle": "obs_orphan"}
+    )
+
+    status = await get_retrieval_status(
+        orphan_handle, workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+
+    assert status["job_handle"] == orphan_handle
+    assert status["status"] == "not_found"
+    unknown_status = await get_retrieval_status(
+        mint_handle(HandleType.JOB), workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+    assert status["message"] != unknown_status["message"]
+
+
 async def test_get_status_wrong_handle_type_raises(
     workspace_store, session_factory, workspace_id,
 ) -> None:
@@ -1043,25 +1085,58 @@ async def test_get_status_wrong_handle_type_raises(
         )
 
 
-async def test_get_status_cross_workspace_denied(
+async def test_get_status_cross_workspace_returns_not_found(
     grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
     workspace_id,
 ) -> None:
+    """PRD 014: a handle owned by another workspace must not raise — and its
+    not_found response must be byte-identical to a never-minted handle's, so
+    existence never leaks across the workspace boundary."""
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
     out = await retrieve_data(
         ds, aoi, _TIME, workspace_id=workspace_id,
         **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
     )
+    job_handle = out["job_handle"]
+    never_minted = mint_handle(HandleType.JOB)
 
-    with pytest.raises(CrossWorkspaceError):
-        await get_retrieval_status(
-            out["job_handle"], workspace_id="ws-intruder",
-            store=workspace_store, session_factory=session_factory,
-        )
+    cross_workspace_status = await get_retrieval_status(
+        job_handle, workspace_id="ws-intruder",
+        store=workspace_store, session_factory=session_factory,
+    )
+    unknown_status = await get_retrieval_status(
+        never_minted, workspace_id="ws-intruder",
+        store=workspace_store, session_factory=session_factory,
+    )
+
+    assert cross_workspace_status["status"] == "not_found"
+    # Normalize each response's own handle out of its message, then compare —
+    # the wording must be identical, not just the shape.
+    assert cross_workspace_status["message"].replace(job_handle, "<handle>") == (
+        unknown_status["message"].replace(never_minted, "<handle>")
+    )
 
 
 # -- cancel_retrieval ------------------------------------------------------
+
+
+async def test_cancel_unknown_handle_returns_not_found(
+    workspace_store, session_factory, workspace_id,
+) -> None:
+    """PRD 014: cancelling an unknown handle resolves cleanly — the caller's
+    intent ("stop this job") is already satisfied on a gone job."""
+    unknown_handle = mint_handle(HandleType.JOB)
+
+    res = await cancel_retrieval(
+        unknown_handle, workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+
+    assert res["job_handle"] == unknown_handle
+    assert res["status"] == "not_found"
+    assert res["cancelled"] is False
+    assert res["message"]
 
 
 async def test_cancel_pending_job(
@@ -1163,22 +1238,59 @@ async def test_cancel_terminal_job_is_noop(
     assert job.state == terminal_state.value
 
 
-async def test_cancel_cross_workspace_denied(
+async def test_cancel_cross_workspace_returns_not_found(
     grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
     workspace_id,
 ) -> None:
+    """PRD 014: same not_found contract as get_retrieval_status — cancelling a
+    job from another workspace must not raise or leak that the job exists."""
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
     out = await retrieve_data(
         ds, aoi, _TIME, workspace_id=workspace_id,
         **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
     )
+    job_handle = out["job_handle"]
 
-    with pytest.raises(CrossWorkspaceError):
-        await cancel_retrieval(
-            out["job_handle"], workspace_id="ws-intruder",
-            store=workspace_store, session_factory=session_factory,
-        )
+    res = await cancel_retrieval(
+        job_handle, workspace_id="ws-intruder",
+        store=workspace_store, session_factory=session_factory,
+    )
+
+    assert res["job_handle"] == job_handle
+    assert res["status"] == "not_found"
+    assert res["cancelled"] is False
+    assert res["message"]
+
+    # The job's actual state is untouched.
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, job_handle)
+    assert job.state == JobState.PENDING.value
+
+
+async def test_cancel_orphan_handle_returns_distinct_not_found(
+    workspace_store, session_factory, workspace_id,
+) -> None:
+    """PRD 014: a job_ handle with no jobs row behind it cancels cleanly as
+    not_found, with a message distinct from the plain unknown-handle case."""
+    orphan_handle = await workspace_store.put_handle(
+        workspace_id, HandleType.JOB, payload={"obs_handle": "obs_orphan"}
+    )
+
+    res = await cancel_retrieval(
+        orphan_handle, workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+
+    assert res["job_handle"] == orphan_handle
+    assert res["status"] == "not_found"
+    assert res["cancelled"] is False
+
+    unknown_res = await cancel_retrieval(
+        mint_handle(HandleType.JOB), workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+    assert res["message"] != unknown_res["message"]
 
 
 # -- variable path resolution wired through planning -----------------------
