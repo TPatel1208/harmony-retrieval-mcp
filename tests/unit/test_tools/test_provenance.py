@@ -66,6 +66,100 @@ async def test_get_provenance_cross_workspace_denied(
         )
 
 
+async def test_get_provenance_job_handle_redirects_to_obs_lineage(
+    workspace_store, provenance_store, workspace_id,
+) -> None:
+    """The first handle a retrieve_* tool returns is the job_ handle — an agent's
+    most natural first call — so it must show the obs_ handle's lineage, not
+    empty arrays, and say which handle it redirected to."""
+    dataset = await workspace_store.put_handle(
+        workspace_id, HandleType.DATASET, {"concept_id": _CONCEPT_ID}
+    )
+    obs = await workspace_store.put_handle(
+        workspace_id, HandleType.OBS, {"status": "ready"}
+    )
+    await provenance_store.record_edge(
+        workspace_id, target_handle=obs, source_handle=dataset,
+        request_spec={"concept_id": _CONCEPT_ID},
+    )
+    await provenance_store.record_event(
+        workspace_id, obs, ProvenanceEventType.MATERIALIZED, {"size_bytes": 10}
+    )
+    job = await workspace_store.put_handle(
+        workspace_id, HandleType.JOB, {"obs_handle": obs, "dataset_handle": dataset}
+    )
+
+    out = await get_provenance(
+        job, workspace_id=workspace_id,
+        store=workspace_store, provenance=provenance_store,
+    )
+
+    assert out["handle"] == job
+    assert out["resolved_handle"] == obs
+    assert out["ancestors"] == [{"handle": dataset, "depth": 1}]
+    assert [e["event_type"] for e in out["events"]] == ["materialized"]
+
+
+async def test_get_provenance_empty_lineage_explains_which_handles_carry_it(
+    workspace_store, provenance_store, workspace_id,
+) -> None:
+    """A dataset_/aoi_ handle genuinely has no lineage — the response must say
+    why, so an agent can tell that apart from a bug."""
+    dataset = await workspace_store.put_handle(
+        workspace_id, HandleType.DATASET, {"concept_id": _CONCEPT_ID}
+    )
+
+    out = await get_provenance(
+        dataset, workspace_id=workspace_id,
+        store=workspace_store, provenance=provenance_store,
+    )
+
+    assert out["ancestors"] == []
+    assert out["events"] == []
+    assert "obs_" in out["note"] and "cube_" in out["note"]
+
+
+async def test_get_provenance_job_handle_without_obs_handle_falls_through_to_note(
+    workspace_store, provenance_store, workspace_id,
+) -> None:
+    """A job_ handle minted before submission has no obs_handle yet — redirection
+    must not KeyError, it must fall through to the empty-with-note behavior."""
+    job = await workspace_store.put_handle(
+        workspace_id, HandleType.JOB, {"dataset_handle": "dataset_x"}
+    )
+
+    out = await get_provenance(
+        job, workspace_id=workspace_id,
+        store=workspace_store, provenance=provenance_store,
+    )
+
+    assert out["handle"] == job
+    assert "resolved_handle" not in out
+    assert out["ancestors"] == []
+    assert out["events"] == []
+    assert "note" in out
+
+
+async def test_get_provenance_job_handle_cross_workspace_denied_before_redirection(
+    workspace_store, provenance_store, workspace_id,
+) -> None:
+    """The job_ handle itself must pass the isolation gate before its
+    obs_handle pointer is ever followed — redirection must never become a
+    cross-workspace side door."""
+    obs = await workspace_store.put_handle(
+        workspace_id, HandleType.OBS, {"status": "ready"}
+    )
+    job = await workspace_store.put_handle(
+        workspace_id, HandleType.JOB, {"obs_handle": obs}
+    )
+
+    with pytest.raises(CrossWorkspaceError):
+        await get_provenance(
+            job, workspace_id="ws-intruder",
+            store=workspace_store, provenance=provenance_store,
+        )
+
+
 # -- cite_dataset ----------------------------------------------------------
 
 

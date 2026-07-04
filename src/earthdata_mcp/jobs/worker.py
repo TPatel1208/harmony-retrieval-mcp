@@ -345,7 +345,9 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
             JobState.SUBMITTED,
             provider_job_url=ref.provider_job_url,
         )
-    await _provenance(ctx).record_event(
+    await _record_event_safe(
+        ctx,
+        job_id,
         spec.workspace_id,
         spec.obs_handle,
         ProvenanceEventType.SUBMITTED,
@@ -441,7 +443,9 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
             },
         )
 
-    await _provenance(ctx).record_event(
+    await _record_event_safe(
+        ctx,
+        job_id,
         spec.workspace_id,
         spec.obs_handle,
         ProvenanceEventType.MATERIALIZED,

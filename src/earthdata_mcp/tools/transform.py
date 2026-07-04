@@ -43,7 +43,7 @@ from earthdata_mcp.tools._dataio import (
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.tools.retrieval import _default_provenance
 from earthdata_mcp.workspace.handles import resolve_aoi, resolve_materialized
-from earthdata_mcp.workspace.models import HandleType
+from earthdata_mcp.workspace.models import HandleType, ProvenanceEventType
 from earthdata_mcp.workspace.provenance import ProvenanceStore
 from earthdata_mcp.workspace.store import WorkspaceStore
 
@@ -402,6 +402,16 @@ async def _emit_cube(
             source_handle=source_handle,
             request_spec=edge_spec,
         )
+
+    await provenance.record_event(
+        workspace_id,
+        cube_handle,
+        ProvenanceEventType.CREATED,
+        detail={
+            "operation": transform_spec["operation"],
+            "source_handles": list(source_handles),
+        },
+    )
 
     return {
         "handle": cube_handle,

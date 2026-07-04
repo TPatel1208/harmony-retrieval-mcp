@@ -238,6 +238,32 @@ async def test_submit_job_records_submitted_on_harmony_success(
     assert [e for e in events if e.event_type == "provider-fallback"] == []
 
 
+async def test_submit_job_reaches_submitted_and_enqueues_poll_even_when_provenance_store_raises(
+    session_factory, workspace_id, monkeypatch
+) -> None:
+    """The SUBMITTED event write must be crash-proof like the other provenance
+    writes on this path (PRD 013): a throwing provenance store must not stop
+    the job from reaching SUBMITTED or stop poll_job from being enqueued."""
+    job_id, _obs_handle = await _seed_pending_job(session_factory, workspace_id)
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_SucceedingProvider())
+    )
+
+    class _ThrowingProvenanceStore:
+        async def record_event(self, *args, **kwargs) -> None:
+            raise RuntimeError("provenance DB unreachable")
+
+    ctx = _ctx(session_factory)
+    ctx["provenance"] = _ThrowingProvenanceStore()
+
+    await worker_mod.submit_job(ctx, job_id)
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.SUBMITTED.value
+    ctx["redis"].enqueue_job.assert_any_await("poll_job", job_id)
+
+
 # -- PROVIDER_FALLBACK then SUBMITTED on Harmony-fails-then-OPeNDAP-succeeds -
 
 
@@ -495,6 +521,55 @@ async def test_materialize_job_records_materialized_with_detail_fields(
     assert detail["storage_key"] == "harmony/result/g1.nc"
     assert detail["media_type"] == "application/netcdf4"
     assert detail["size_bytes"] == 1234
+
+
+async def test_materialize_job_reaches_ready_even_when_provenance_store_raises(
+    session_factory, workspace_store, workspace_id, monkeypatch
+) -> None:
+    """The MATERIALIZED event write must be crash-proof too (PRD 013): a
+    throwing provenance store must not stop the job from reaching READY."""
+    obs_handle = await workspace_store.put_handle(
+        workspace_id, HandleType.OBS, {"status": "pending"}
+    )
+    job_id = uuid4().hex
+    request_spec = {
+        "concept_id": "C1-X",
+        "provider": "harmony",
+        "workspace_id": workspace_id,
+        "obs_handle": obs_handle,
+        "job_handle": f"job_{uuid4().hex[:16]}",
+    }
+    async with session_factory() as session:
+        session.add(
+            Job(
+                job_id=job_id,
+                job_handle=request_spec["job_handle"],
+                obs_handle=obs_handle,
+                provider="harmony",
+                request_spec=request_spec,
+                state=JobState.MATERIALIZING.value,
+                progress=50,
+                provider_job_url="https://example/jobs/j1",
+            )
+        )
+        await session.commit()
+
+    class _ThrowingProvenanceStore:
+        async def record_event(self, *args, **kwargs) -> None:
+            raise RuntimeError("provenance DB unreachable")
+
+    monkeypatch.setattr(discovery_mod, "_default_store", lambda: workspace_store)
+    monkeypatch.setattr(
+        worker_mod, "_load_provider", AsyncMock(return_value=_MaterializingProvider())
+    )
+    ctx = _ctx(session_factory)
+    ctx["provenance"] = _ThrowingProvenanceStore()
+
+    await worker_mod.materialize_job(ctx, job_id)
+
+    async with session_factory() as session:
+        job = await crud.get_job(session, job_id)
+    assert job.state == JobState.READY.value
 
 
 # -- poll_job persists progress and message from the provider (PRD 007) ----

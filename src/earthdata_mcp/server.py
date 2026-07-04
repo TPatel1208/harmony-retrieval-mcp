@@ -333,8 +333,15 @@ async def get_provenance(
 ) -> dict:
     """Return a handle's lineage: its ancestry graph (recursive CTE) and events.
 
-    Returns ``{handle, ancestors: [{handle, depth}], events: [...]}`` scoped to the
-    workspace — lineage never crosses a workspace boundary.
+    Events are ``created`` (a ``cube_`` handle's mint) or
+    ``routed``/``submitted``/``provider-fallback``/``opendap-not-applicable``/
+    ``job-failed``/``materialized`` (an ``obs_`` handle's retrieval lifecycle).
+    A ``job_`` handle redirects to its ``obs_`` handle's lineage (the response
+    then adds ``resolved_handle``); a handle with no lineage (e.g. ``dataset_``/
+    ``aoi_``) gets an explanatory ``note`` instead of bare empty arrays.
+    Returns ``{handle, ancestors: [{handle, depth}], events: [...],
+    resolved_handle?, note?}`` scoped to the workspace — lineage never crosses a
+    workspace boundary.
     """
     return await provenance.get_provenance(handle, workspace_id)
 

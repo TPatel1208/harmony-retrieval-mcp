@@ -40,7 +40,7 @@ from earthdata_mcp.tools.transform import (
     resample,
     subset,
 )
-from earthdata_mcp.workspace.models import HandleType
+from earthdata_mcp.workspace.models import HandleType, ProvenanceEventType
 from earthdata_mcp.workspace.store import CrossWorkspaceError
 
 _BBOX = [-105.0, 37.5, -104.0, 38.5]
@@ -210,6 +210,26 @@ async def test_subset_returns_cube_and_records_edge(
     # The bbox actually narrowed the lat axis (37.5..38.5 → lat 38 only).
     cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
     assert cube.sizes["lat"] == 1
+
+
+async def test_subset_records_created_event_on_the_new_cube(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """A cube's timeline must never be empty (PRD 013): the transform that mints
+    it also records a `created` event naming the operation and its sources."""
+    src = await _seed_cube(workspace_store, local_backend, workspace_id, _grid())
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    out = await subset(
+        src, aoi_handle=aoi, variables=["ndvi"], workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    events = await provenance_store.events(workspace_id, out["handle"])
+    assert [e.event_type for e in events] == [ProvenanceEventType.CREATED.value]
+    detail = events[0].detail
+    assert detail["operation"] == "subset"
+    assert src in detail["source_handles"]
 
 
 async def test_subset_bbox_applies_to_capitalized_axis_names(
