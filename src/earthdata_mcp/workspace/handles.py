@@ -20,7 +20,22 @@ from __future__ import annotations
 from earthdata_mcp.workspace.models import HandleType, handle_type_of
 from earthdata_mcp.workspace.store import WorkspaceStore
 
-__all__ = ["resolve_dataset", "resolve_aoi", "resolve_materialized"]
+__all__ = [
+    "resolve_dataset",
+    "resolve_aoi",
+    "resolve_materialized",
+    "EvictedResultError",
+]
+
+
+class EvictedResultError(ValueError):
+    """The handle's materialized result was reclaimed by the cache eviction cap.
+
+    Raised instead of the generic "not a materialized result" ``ValueError`` so
+    preview/statistics/transform can tell an evicted result apart from one that
+    was never materialized: nothing about how it was produced is lost (its
+    lineage and durable request spec survive), only its bytes were reclaimed.
+    """
 
 
 async def resolve_dataset(store: WorkspaceStore, workspace_id: str, handle: str) -> str:
@@ -67,6 +82,12 @@ async def resolve_materialized(
     payload = record.payload
     storage_key = payload.get("storage_key")
     media_type = payload.get("media_type")
+    if payload.get("status") == "expired":
+        raise EvictedResultError(
+            f"handle {handle!r} was evicted from the materialization cache and "
+            "can be re-materialized from its durable request spec (see "
+            "get_provenance)"
+        )
     if payload.get("status") != "ready" or not storage_key or not media_type:
         raise ValueError(f"handle {handle!r} is not a materialized result")
     return storage_key, media_type, payload

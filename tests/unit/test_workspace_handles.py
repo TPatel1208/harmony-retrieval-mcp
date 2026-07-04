@@ -14,6 +14,7 @@ from __future__ import annotations
 import pytest
 
 from earthdata_mcp.workspace.handles import (
+    EvictedResultError,
     resolve_aoi,
     resolve_dataset,
     resolve_materialized,
@@ -142,4 +143,16 @@ async def test_resolve_materialized_not_ready_raises(workspace_store, workspace_
         workspace_id, HandleType.OBS, {"status": "pending"}
     )
     with pytest.raises(ValueError, match="not a materialized result"):
+        await resolve_materialized(workspace_store, workspace_id, handle)
+
+
+async def test_resolve_materialized_evicted_raises_evicted_result_error(
+    workspace_store, workspace_id
+) -> None:
+    handle = await workspace_store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "expired", "media_type": "application/x-netcdf"},
+    )
+    with pytest.raises(EvictedResultError, match="re-materialized"):
         await resolve_materialized(workspace_store, workspace_id, handle)

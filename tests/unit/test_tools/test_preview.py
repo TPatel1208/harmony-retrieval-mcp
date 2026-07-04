@@ -33,6 +33,7 @@ from earthdata_mcp.tools.preview import (
     preview_dataset,
     summarize_dataset,
 )
+from earthdata_mcp.workspace.handles import EvictedResultError
 from earthdata_mcp.workspace.models import HandleType
 from earthdata_mcp.workspace.store import CrossWorkspaceError
 
@@ -372,6 +373,21 @@ async def test_summarize_unmaterialized_obs_returns_status(
     assert out["summary"] is None
 
 
+async def test_summarize_evicted_obs_raises_evicted_result_error(
+    workspace_store, workspace_id
+):
+    """PRD 015: unlike "pending" (a graceful status answer), an evicted result
+    fails with an actionable message — it is a materialization that happened
+    and was reclaimed, not one still in flight."""
+    handle = await workspace_store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "expired", "media_type": "application/x-netcdf"},
+    )
+    with pytest.raises(EvictedResultError, match="re-materialized"):
+        await summarize_dataset(handle, workspace_id=workspace_id, store=workspace_store)
+
+
 async def test_summarize_julian_calendar_obs_does_not_crash(
     workspace_store, local_backend, workspace_id
 ):
@@ -403,6 +419,18 @@ async def test_summarize_standard_calendar_obs_reports_datetime64(
 
 
 # -- inspect_statistics ----------------------------------------------------
+
+
+async def test_inspect_statistics_evicted_raises_evicted_result_error(
+    workspace_store, workspace_id
+):
+    handle = await workspace_store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "expired", "media_type": "application/x-netcdf"},
+    )
+    with pytest.raises(EvictedResultError, match="re-materialized"):
+        await inspect_statistics(handle, workspace_id=workspace_id, store=workspace_store)
 
 
 async def test_inspect_statistics_descriptive(

@@ -40,6 +40,7 @@ from earthdata_mcp.tools.transform import (
     resample,
     subset,
 )
+from earthdata_mcp.workspace.handles import EvictedResultError
 from earthdata_mcp.workspace.models import HandleType, ProvenanceEventType
 from earthdata_mcp.workspace.store import CrossWorkspaceError
 
@@ -1107,6 +1108,24 @@ async def test_non_materialized_source_rejected(
     with pytest.raises(ValueError, match="not a materialized result"):
         await subset(
             pending, workspace_id=workspace_id,
+            **_deps(workspace_store, provenance_store, local_backend),
+        )
+
+
+async def test_evicted_source_raises_evicted_result_error(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """PRD 015: a source reclaimed by cache eviction fails with an actionable
+    message (re-materializable from spec), not the generic not-materialized
+    error a caller can't distinguish from "never ran"."""
+    evicted = await workspace_store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "expired", "media_type": "application/x-netcdf"},
+    )
+    with pytest.raises(EvictedResultError, match="re-materialized"):
+        await subset(
+            evicted, workspace_id=workspace_id,
             **_deps(workspace_store, provenance_store, local_backend),
         )
 

@@ -30,11 +30,13 @@ from earthdata_mcp import providers
 from earthdata_mcp.config import get_settings
 from earthdata_mcp.db import create_engine, create_session_factory
 from earthdata_mcp.jobs import crud
+from earthdata_mcp.jobs.eviction import EvictionService
 from earthdata_mcp.jobs.models import Job
 from earthdata_mcp.jobs.state import TERMINAL_STATES, JobState
 from earthdata_mcp.providers.base import JobRef, RetrievalProvider
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.providers.request_spec import InvalidSpecError, RequestSpec
+from earthdata_mcp.storage import get_storage_backend
 from earthdata_mcp.workspace.models import ProvenanceEventType
 from earthdata_mcp.workspace.provenance import ProvenanceStore
 
@@ -80,6 +82,31 @@ def _provenance(ctx: dict[str, Any]) -> ProvenanceStore:
         store = ProvenanceStore(_session_factory(ctx))
         ctx["provenance"] = store
     return store
+
+
+def _eviction(ctx: dict[str, Any]) -> EvictionService:
+    """Return the ctx-cached :class:`EvictionService`, building it once.
+
+    Mirrors :func:`_provenance`'s ctx-caching convention (PRD 015).
+    """
+    service = ctx.get("eviction")
+    if service is None:
+        service = EvictionService(
+            _session_factory(ctx), get_storage_backend(), get_settings().earthdata_cache_max_bytes
+        )
+        ctx["eviction"] = service
+    return service
+
+
+async def _sweep_eviction_safe(ctx: dict[str, Any], *, protected_handle: str | None) -> None:
+    """Run the eviction sweep without ever letting it block the caller (PRD 015):
+    mirrors :func:`_record_event_safe`'s log-and-swallow convention — cache
+    maintenance must never be the reason a materialization or startup fails.
+    """
+    try:
+        await _eviction(ctx).sweep(protected_handle=protected_handle)
+    except Exception:
+        logger.exception("eviction sweep failed")
 
 
 async def _record_event_safe(
@@ -401,7 +428,12 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
 
 
 async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
-    """Persist a ``MATERIALIZING`` job's result and advance to ``READY``."""
+    """Persist a ``MATERIALIZING`` job's result and advance to ``READY``.
+
+    Once ``READY``, runs the cache eviction sweep (PRD 015) with this job's own
+    result protected — a retrieval can never evict its own output before it's
+    read. The sweep is best-effort: it never fails the materialization.
+    """
     session_factory = _session_factory(ctx)
     async with session_factory() as session:
         job = await crud.get_job(session, job_id)
@@ -458,6 +490,8 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
     )
     async with session_factory() as session:
         await crud.transition_state(session, job_id, JobState.READY, progress=100)
+
+    await _sweep_eviction_safe(ctx, protected_handle=spec.obs_handle)
 
 
 async def healthcheck(ctx: dict[str, Any]) -> str:
@@ -529,6 +563,10 @@ async def startup(ctx: dict[str, Any]) -> None:
         if task is not None:
             await redis.enqueue_job(task, job_id)
             logger.info("resuming job %s (%s) via %s", job_id, state.value, task)
+
+    # PRD 015: converge a box restarted after heavy use below the cap without
+    # waiting for the next retrieval.
+    await _sweep_eviction_safe(ctx, protected_handle=None)
 
 
 # -- helpers ----------------------------------------------------------------

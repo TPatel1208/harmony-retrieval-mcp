@@ -34,7 +34,11 @@ from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.storage import StorageBackend, get_storage_backend
 from earthdata_mcp.tools._dataio import open_result, open_result_lazy
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
-from earthdata_mcp.workspace.handles import resolve_aoi, resolve_materialized
+from earthdata_mcp.workspace.handles import (
+    EvictedResultError,
+    resolve_aoi,
+    resolve_materialized,
+)
 from earthdata_mcp.workspace.models import HandleType, handle_type_of
 from earthdata_mcp.workspace.store import WorkspaceStore
 
@@ -301,6 +305,11 @@ async def summarize_dataset(
             storage_key, media_type, _payload = await resolve_materialized(
                 store, workspace_id, handle
             )
+        except EvictedResultError:
+            # An evicted result is a materialization that happened and was
+            # reclaimed — an actionable failure, not the graceful "pending" shape
+            # below (PRD 015).
+            raise
         except ValueError:
             # Not yet materialized — isolation must still be enforced here too.
             record = await store.get_handle(workspace_id, handle)  # isolation gate

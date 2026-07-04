@@ -78,6 +78,17 @@ async def get_job_by_handle(session: AsyncSession, job_handle: str) -> Job | Non
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+async def get_job_by_obs_handle(session: AsyncSession, obs_handle: str) -> Job | None:
+    """Load the job that produced ``obs_handle``, or ``None``.
+
+    Used by the eviction service (PRD 015) to walk a job across the legal
+    ``ready -> expired`` edge when its result is evicted; a transform-owned
+    ``cube_`` handle has no job row, so callers must treat ``None`` as fine.
+    """
+    stmt = select(Job).where(Job.obs_handle == obs_handle)
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
 async def reclaim_non_terminal(session: AsyncSession) -> list[Job]:
     """Return every job not in a terminal state — the restart-resume work list.
 
