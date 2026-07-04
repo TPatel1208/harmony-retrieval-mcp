@@ -38,6 +38,7 @@ from earthdata_mcp.providers._capabilities import (
     CollectionCapabilities,
     ServiceCapability,
 )
+from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import JobRef, JobStatus, MaterializedResult
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.tools import discovery as discovery_mod
@@ -268,13 +269,17 @@ async def test_harmony_path_runs_to_ready_with_provenance(
     assert {a["handle"] for a in prov["ancestors"]} == {ds}
 
     # The job-lifecycle event trail: a clean first-attempt Harmony success records
-    # SUBMITTED -> MATERIALIZED, with no phantom PROVIDER_FALLBACK event (this is
-    # the gap this test previously missed: it asserted only on ancestry).
+    # ROUTED -> SUBMITTED -> MATERIALIZED, with no phantom PROVIDER_FALLBACK event
+    # (this is the gap this test previously missed: it asserted only on ancestry).
     assert prov["events"], "get_provenance returned no events for a completed job"
     ordered_types = [e["event_type"] for e in reversed(prov["events"])]
-    assert ordered_types == ["submitted", "materialized"]
+    assert ordered_types == ["routed", "submitted", "materialized"]
 
-    submitted = prov["events"][-1]
+    routed = prov["events"][-1]
+    assert routed["detail"]["path"] == "harmony"
+    assert routed["detail"]["pinned_service"] == "l3-subsetter"
+
+    submitted = prov["events"][1]
     assert submitted["detail"]["provider"] == "harmony"
 
     materialized = prov["events"][0]
@@ -292,9 +297,9 @@ async def test_harmony_fallback_path_records_fallback_then_submitted_then_materi
     local_backend, workspace_id, monkeypatch,
 ) -> None:
     """A job that falls back from Harmony to OPeNDAP records the full trail:
-    PROVIDER_FALLBACK -> SUBMITTED -> MATERIALIZED, with the fallback's reason
-    naming the Harmony failure and the eventual SUBMITTED/MATERIALIZED naming
-    the provider that actually produced the result (opendap)."""
+    ROUTED -> PROVIDER_FALLBACK -> SUBMITTED -> MATERIALIZED, with the fallback's
+    reason naming the Harmony failure and the eventual SUBMITTED/MATERIALIZED
+    naming the provider that actually produced the result (opendap)."""
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
 
@@ -349,9 +354,13 @@ async def test_harmony_fallback_path_records_fallback_then_submitted_then_materi
         store=workspace_store, provenance=provenance_store,
     )
     ordered_types = [e["event_type"] for e in reversed(prov["events"])]
-    assert ordered_types == ["provider-fallback", "submitted", "materialized"]
+    assert ordered_types == ["routed", "provider-fallback", "submitted", "materialized"]
 
-    fallback = prov["events"][-1]
+    routed = prov["events"][-1]
+    assert routed["detail"]["path"] == "harmony"
+    assert routed["detail"]["pinned_service"] is None
+
+    fallback = prov["events"][-2]
     assert fallback["detail"]["from_provider"] == "harmony"
     assert fallback["detail"]["to_provider"] == "opendap"
     assert fallback["detail"]["reason"]["error_type"] == "RuntimeError"
@@ -410,10 +419,20 @@ async def test_harmony_failure_with_no_opendap_urls_records_not_applicable(
         store=workspace_store, provenance=provenance_store,
     )
     ordered_types = [e["event_type"] for e in reversed(prov["events"])]
-    assert ordered_types == ["opendap-not-applicable"]
-    not_applicable = prov["events"][0]
+    assert ordered_types == ["routed", "opendap-not-applicable", "job-failed"]
+
+    routed = prov["events"][-1]
+    assert routed["detail"]["path"] == "harmony"
+
+    not_applicable = prov["events"][1]
     assert not_applicable["detail"]["reason"] == "no_opendap_endpoint_discovered"
     assert "unsupported" in not_applicable["detail"]["harmony_error"]["message"]
+
+    job_failed = prov["events"][0]
+    assert job_failed["detail"]["stage"] == "submit"
+    assert job_failed["detail"]["provider"] == "harmony"
+    assert job_failed["detail"]["classification"] == "infrastructure"
+    assert "unsupported" in job_failed["detail"]["message"]
 
     status = await get_retrieval_status(
         out["job_handle"], workspace_id=workspace_id,
@@ -428,7 +447,7 @@ async def test_harmony_failure_with_no_opendap_urls_records_not_applicable(
 
 async def test_appeears_point_path_materialises_parquet(
     workspace_store, provenance_store, session_factory, patch_worker_seam,
-    local_backend, workspace_id,
+    local_backend, workspace_id, monkeypatch,
 ) -> None:
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
@@ -440,6 +459,15 @@ async def test_appeears_point_path_materialises_parquet(
     patch_worker_seam(
         _FakeProvider("appeears", "application/x-parquet", buf.getvalue(), local_backend)
     )
+
+    # retrieve_timeseries's planning step (_check_appeears_catalog) builds its own
+    # real AppEEARSProvider and calls the product/layer lookup directly — a network
+    # seam the worker-provider fake above doesn't reach. Fake it here too, so the
+    # gate never needs live AppEEARS/EDL access.
+    async def _fake_fetch_layer_map(self, product: str) -> dict:
+        return {"NDVI": {}}
+
+    monkeypatch.setattr(AppEEARSProvider, "_fetch_layer_map", _fake_fetch_layer_map)
 
     out = await retrieve_timeseries(
         ds, _TIME, ["NDVI"], workspace_id=workspace_id, aoi_handle=aoi,
