@@ -31,6 +31,7 @@ from earthdata_mcp.tools import (
     retrieval,
     transform,
     understanding,
+    workspace,
 )
 
 mcp = FastMCP("earthdata-mcp")
@@ -59,9 +60,11 @@ async def describe_dataset(
 ) -> dict:
     """Resolve a ``dataset_`` handle to its metadata, variables, and advisory notes.
 
-    Compact by default (name/long_name/units/advisory_notes per variable; core
-    collection identification fields only). Pass ``detail=True`` for the full
-    per-variable UMM-Var enrichment and the complete collection metadata.
+    Compact by default (name/long_name/units/fill_values/valid_ranges/
+    advisory_notes per variable — a variable with neither fill values nor a
+    valid range in UMM-Var carries a ``mask_metadata_note`` flagging the gap;
+    core collection identification fields only). Pass ``detail=True`` for the
+    full per-variable UMM-Var enrichment and the complete collection metadata.
     """
     return await understanding.describe_dataset(dataset_handle, workspace_id, detail)
 
@@ -411,6 +414,22 @@ async def cite_dataset(
     collection_citations, reference_citation_count}``.
     """
     return await provenance.cite_dataset(dataset_handle, workspace_id)
+
+
+@mcp.tool
+async def list_workspace(
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    handle_type: str | None = None,
+) -> dict:
+    """Re-enumerate a workspace's handles — for a consumer reconnecting after a
+    restart or page reload, with no conversation history to replay them from.
+
+    ``handle_type`` optionally filters to one kind (``dataset``, ``aoi``, ``query``,
+    ``obs``, ``cube``, ``preview``, ``job``). Returns ``{handles: [{handle, type,
+    created_at, summary}]}``, oldest first; ``summary`` is a small type-specific
+    slice of the handle's payload, not the full payload.
+    """
+    return await workspace.list_workspace(workspace_id, handle_type)
 
 
 def main() -> None:

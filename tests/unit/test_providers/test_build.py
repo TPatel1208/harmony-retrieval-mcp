@@ -111,6 +111,51 @@ def test_build_opendap_without_geometry_in_spec() -> None:
     assert provider._var_dims == {}
 
 
+def test_build_opendap_preserves_none_coord_lat_lon() -> None:
+    """A spec with no single global coord_lat/coord_lon (the DMR-fallback case —
+    a grouped product with no UMM-Var, where each variable's coordinates live in
+    ``var_coords`` instead) must reach the provider as ``None``, not silently
+    coerce to the literal string ``"lat"``/``"lon"`` — those names are wrong for
+    any collection whose real coordinate variables are named differently
+    (``latitude``/``longitude``, HDF-EOS5 grids, ...), and a wrong global
+    coord_lat/coord_lon still gets projected into the DAP4 constraint expression
+    even when it should have been omitted in favor of var_coords."""
+    spec = _spec("opendap", opendap_urls=["https://hyrax.example/g1"])
+    provider = build(spec, _caps())
+    assert provider._coord_lat is None
+    assert provider._coord_lon is None
+
+
+def test_build_opendap_passes_explicit_coord_lat_lon() -> None:
+    spec = _spec(
+        "opendap",
+        opendap_urls=["https://hyrax.example/g1"],
+        coord_lat="latitude",
+        coord_lon="longitude",
+    )
+    provider = build(spec, _caps())
+    assert provider._coord_lat == "latitude"
+    assert provider._coord_lon == "longitude"
+
+
+def test_build_opendap_passes_var_coords() -> None:
+    """A resumed job must rebuild the same per-variable group-local lat/lon the
+    original plan resolved from the granule's DMR (PRD 009) — dropping it here
+    would silently fall back to a wrong global coordinate for every grouped
+    variable in a no-UMM-Var collection."""
+    spec = _spec(
+        "opendap",
+        opendap_urls=["https://hyrax.example/g1"],
+        var_coords={"/gt1l/land_segments/terrain/h_te_best_fit": ["/gt1l/land_segments/latitude", "/gt1l/land_segments/longitude"]},
+    )
+    provider = build(spec, _caps())
+    assert provider._var_coords == {
+        "/gt1l/land_segments/terrain/h_te_best_fit": (
+            "/gt1l/land_segments/latitude", "/gt1l/land_segments/longitude",
+        )
+    }
+
+
 def test_build_defaults_to_harmony_when_provider_absent() -> None:
     """A legacy spec without a 'provider' key resolves to Harmony (its old default)."""
     spec = RequestSpec.from_jsonb({"concept_id": "C1-X"})

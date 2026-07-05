@@ -126,9 +126,10 @@ async def test_describe_resolves_metadata_and_variables(
 async def test_describe_compact_by_default_trims_variable_and_metadata_fields(
     httpx_mock, provider, workspace_store, workspace_id
 ) -> None:
-    """Compact response: name/long_name/units/advisory_notes per variable, core
-    identification fields only in the collection metadata echo — the shape a
-    400-variable collection needs to stay usable."""
+    """Compact response: name/long_name/units/fill_values/valid_ranges/
+    advisory_notes per variable, core identification fields only in the
+    collection metadata echo — the shape a 400-variable collection needs to
+    stay usable."""
     handle = await _seed_dataset_handle(workspace_store, workspace_id)
     _mock_get_variables(httpx_mock)
 
@@ -137,7 +138,9 @@ async def test_describe_compact_by_default_trims_variable_and_metadata_fields(
     )
 
     var = out["variables"][0]
-    assert set(var) == {"name", "long_name", "units", "advisory_notes"}
+    assert set(var) >= {
+        "name", "long_name", "units", "fill_values", "valid_ranges", "advisory_notes",
+    }
     assert out["metadata"] == {
         "concept_id": "C1-X",
         "short_name": "TEMPO_NO2_L3",
@@ -146,6 +149,63 @@ async def test_describe_compact_by_default_trims_variable_and_metadata_fields(
         "processing_level": "3",
     }
     assert "abstract" not in out["metadata"]
+
+
+async def test_describe_variable_surfaces_fill_and_valid_range_when_present(
+    httpx_mock, provider, workspace_store, workspace_id
+) -> None:
+    """A variable whose UMM-Var record carries fill values / a valid range must
+    surface them per-variable, even in the compact (default) response — a
+    consumer applying masks should never need detail=True just to see them."""
+    handle = await _seed_dataset_handle(workspace_store, workspace_id)
+    httpx_mock.add_response(
+        json={"items": [{"meta": {"associations": {"variables": ["V1-X"]}}}]}
+    )
+    httpx_mock.add_response(
+        json={
+            "items": [
+                {
+                    "meta": {"concept-id": "V1-X"},
+                    "umm": {
+                        "Name": "no2",
+                        "Units": "molecules/cm2",
+                        "FillValues": [{"Value": -1.267651e30}],
+                        "ValidRanges": [{"Min": 0, "Max": 1e21}],
+                    },
+                }
+            ]
+        }
+    )
+
+    out = await describe_dataset(
+        handle, workspace_id=workspace_id, cmr=provider, store=workspace_store
+    )
+
+    var = out["variables"][0]
+    assert var["fill_values"] == [{"Value": -1.267651e30}]
+    assert var["valid_ranges"] == [{"Min": 0, "Max": 1e21}]
+    assert "mask_metadata_note" not in var
+
+
+async def test_describe_variable_flags_missing_mask_metadata(
+    httpx_mock, provider, workspace_store, workspace_id
+) -> None:
+    """A variable with no fill/valid-range records in CMR must carry an explicit
+    advisory note naming the gap — an empty list alone is indistinguishable from
+    "genuinely no fill value", so a consumer can't safely infer either way
+    without the note."""
+    handle = await _seed_dataset_handle(workspace_store, workspace_id)
+    _mock_get_variables(httpx_mock)  # no FillValues/ValidRanges in this record
+
+    out = await describe_dataset(
+        handle, workspace_id=workspace_id, cmr=provider, store=workspace_store
+    )
+
+    var = out["variables"][0]
+    assert var["fill_values"] == []
+    assert var["valid_ranges"] == []
+    assert "fill" in var["mask_metadata_note"].lower()
+    assert "valid" in var["mask_metadata_note"].lower()
 
 
 async def test_describe_detail_true_returns_full_shape(

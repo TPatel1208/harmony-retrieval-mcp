@@ -57,6 +57,16 @@ _COMPACT_METADATA_FIELDS = (
     "processing_level",
 )
 
+#: Attached to a variable when CMR's UMM-Var record carries neither fill values
+#: nor a valid range — an empty list alone is indistinguishable from "genuinely
+#: no fill value", so a consumer applying masks needs this said explicitly
+#: rather than silently trusting the emptiness.
+_MASK_METADATA_GAP_NOTE = (
+    "CMR has no fill-value or valid-range records for this variable in "
+    "UMM-Var. Do not assume the data is unmasked — verify against the "
+    "product's data dictionary before applying a hand-pinned override."
+)
+
 
 async def describe_dataset(
     dataset_handle: str,
@@ -89,7 +99,7 @@ async def describe_dataset(
     short_name = collection.get("short_name")
 
     variables: list[dict] = [
-        enrich_variable(_to_umm_var(var), short_name=short_name)
+        _flag_missing_mask_metadata(enrich_variable(_to_umm_var(var), short_name=short_name))
         for var in await cmr.get_variables(concept_id)
     ]
 
@@ -160,14 +170,29 @@ def _compact_metadata(collection: dict) -> dict:
     return {k: collection.get(k) for k in _COMPACT_METADATA_FIELDS}
 
 
+def _flag_missing_mask_metadata(var: dict) -> dict:
+    """Attach :data:`_MASK_METADATA_GAP_NOTE` when UMM-Var has neither fill
+    values nor a valid range for ``var`` — a fact about the record, so it is
+    checked once here and survives into both compact and detail responses."""
+    if not var.get("fill_values") and not var.get("valid_ranges"):
+        var["mask_metadata_note"] = _MASK_METADATA_GAP_NOTE
+    return var
+
+
 def _compact_variable(var: dict) -> dict:
-    """Name/long_name/units/advisory_notes only — never the full QA enrichment."""
-    return {
+    """Name/long_name/units/fill_values/valid_ranges/advisory_notes — the QA
+    facts a consumer needs to apply masks without opting into full detail."""
+    out = {
         "name": var.get("name"),
         "long_name": var.get("long_name"),
         "units": var.get("units"),
+        "fill_values": var.get("fill_values", []),
+        "valid_ranges": var.get("valid_ranges", []),
         "advisory_notes": var.get("advisory_notes", []),
     }
+    if "mask_metadata_note" in var:
+        out["mask_metadata_note"] = var["mask_metadata_note"]
+    return out
 
 
 def _to_umm_var(var: dict) -> dict:

@@ -99,6 +99,30 @@ def test_resolve_unknown_full_path_raises_with_close_matches() -> None:
         assert "h_te_best_fit" in str(exc)
 
 
+def test_resolve_group_qualified_path_without_leading_slash() -> None:
+    """UMM-Var's own ``Name`` field for a grouped variable (e.g. CMR's
+    ``key_science_data/column_amount`` for OMHCHOd) never carries a leading
+    slash — describe_dataset hands that string back to a consumer verbatim, so
+    passing it straight into retrieve_subset must resolve exactly like the
+    full ``/``-prefixed path, not fall through to bare-leaf (last-segment-only)
+    matching, which would find zero matches and raise."""
+    tree = parse_dmr(_load("atl08_grouped.dmr.xml"))
+    resolved, expansions = resolve_variables(
+        tree, ("gt1l/land_segments/terrain/h_te_best_fit",)
+    )
+    assert resolved == ("/gt1l/land_segments/terrain/h_te_best_fit",)
+    assert expansions == {}
+
+
+def test_resolve_unknown_group_qualified_path_without_leading_slash_raises() -> None:
+    tree = parse_dmr(_load("atl08_grouped.dmr.xml"))
+    try:
+        resolve_variables(tree, ("gt1l/land_segments/terrain/h_te_best_ft",))
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "h_te_best_fit" in str(exc)
+
+
 def test_resolve_bare_leaf_unique_match() -> None:
     tree = parse_dmr(_load("smap_single_group.dmr.xml"))
     resolved, expansions = resolve_variables(tree, ("sm_surface",))

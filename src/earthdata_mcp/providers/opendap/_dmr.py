@@ -131,23 +131,28 @@ def resolve_variables(
 ) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
     """Resolve each requested name against the DMR tree's real paths.
 
-    A full path (starts with ``/``) must exist verbatim. A bare leaf name is
-    matched case-insensitively against every path's last segment: one match
-    resolves to it; more than one match — the parallel-sibling-group case
-    (ICESat-2's six beams) — expands to *all* of them, recorded in the
-    returned expansion map (``original name -> resolved paths``) so the
-    caller can surface it in provenance. Zero matches, in either case, raises
-    ``ValueError`` with difflib close matches over the tree's full paths —
-    unlike CMR UMM-V resolution, the DMR is authoritative ground truth for
-    this granule, so an unresolvable name must never reach OPeNDAP.
+    A full path (starts with ``/``, or contains ``/`` at all — UMM-Var's own
+    ``Name`` field for a grouped variable, e.g. ``key_science_data/column_amount``,
+    is group-qualified but never carries a leading slash, and describe_dataset
+    hands that string back to a consumer verbatim) must exist verbatim once a
+    leading ``/`` is assumed. A bare leaf name (no ``/`` at all) is matched
+    case-insensitively against every path's last segment: one match resolves to
+    it; more than one match — the parallel-sibling-group case (ICESat-2's six
+    beams) — expands to *all* of them, recorded in the returned expansion map
+    (``original name -> resolved paths``) so the caller can surface it in
+    provenance. Zero matches, in either case, raises ``ValueError`` with difflib
+    close matches over the tree's full paths — unlike CMR UMM-V resolution, the
+    DMR is authoritative ground truth for this granule, so an unresolvable name
+    must never reach OPeNDAP.
     """
     all_paths = sorted(tree.variables)
     resolved: list[str] = []
     expansions: dict[str, tuple[str, ...]] = {}
     for user_var in variables:
-        if user_var.startswith("/"):
-            if user_var in tree.variables:
-                resolved.append(user_var)
+        if "/" in user_var:
+            full_path = user_var if user_var.startswith("/") else f"/{user_var}"
+            if full_path in tree.variables:
+                resolved.append(full_path)
                 continue
             raise ValueError(_unknown_variable_message(user_var, all_paths))
         leaf_lower = user_var.lower()

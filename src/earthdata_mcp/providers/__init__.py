@@ -62,11 +62,17 @@ def build(spec: RequestSpec, caps: CollectionCapabilities) -> RetrievalProvider:
         return OPeNDAPProvider(
             caps,
             opendap_urls=list(spec.opendap_urls),
-            coord_lat=spec.coord_lat or "lat",
-            coord_lon=spec.coord_lon or "lon",
+            # ``None`` is a real, meaningful value here (the DMR-fallback case: no
+            # single global coordinate pair, each variable's own is in
+            # ``var_coords`` instead) — never coerce it to a literal "lat"/"lon",
+            # which is wrong for any collection whose real coordinate variables
+            # are named differently.
+            coord_lat=spec.coord_lat,
+            coord_lon=spec.coord_lon,
             coord_time=spec.coord_time,
             lat_axis=spec.lat_axis,
             lon_axis=spec.lon_axis,
             var_dims=spec.var_dims,
+            var_coords=spec.var_coords,
         )
     raise ValueError(f"no retrieval provider for spec provider {spec.provider!r}")

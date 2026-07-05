@@ -204,6 +204,43 @@ async def test_get_variables_returns_empty_without_associations(
     assert await provider.get_variables("C1-X") == []
 
 
+async def test_get_variables_batches_a_large_association_list(
+    httpx_mock, provider: CMRProvider
+) -> None:
+    """A collection with hundreds of UMM-Var associations (MOD08_D3 carries 975)
+    must never put every id on one query string — CloudFront returns a bare 414
+    (Request-URI Too Long) well before CMR's own limits kick in, and that 414's
+    boilerplate HTML gives no hint it's a batching problem. The complete list
+    must come back too, never silently truncated to the default page limit:
+    describe_dataset's ``variable_count`` promises "always the true total," and
+    retrieve_subset's plan-time ``validate_variables`` must be able to confirm
+    a real variable name that simply isn't among the first 50 associations in
+    CMR's (arbitrary) ordering."""
+    ids = [f"V{i}-X" for i in range(cmr_mod._VARIABLE_ID_BATCH_SIZE + 1)]
+    httpx_mock.add_response(
+        json={"items": [{"meta": {"associations": {"variables": ids}}}]}
+    )
+    httpx_mock.add_response(
+        json={
+            "items": [
+                {"meta": {"concept-id": v}, "umm": {"Name": v}}
+                for v in ids[: cmr_mod._VARIABLE_ID_BATCH_SIZE]
+            ]
+        }
+    )
+    httpx_mock.add_response(
+        json={
+            "items": [
+                {"meta": {"concept-id": v}, "umm": {"Name": v}}
+                for v in ids[cmr_mod._VARIABLE_ID_BATCH_SIZE :]
+            ]
+        }
+    )
+    variables = await provider.get_variables("C1-X")
+    assert len(variables) == len(ids)
+    assert {v["name"] for v in variables} == set(ids)
+
+
 async def test_check_availability_is_count_only(
     httpx_mock, provider: CMRProvider
 ) -> None:

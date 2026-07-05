@@ -44,6 +44,10 @@ _DEFAULT_LIMIT = 10
 _MAX_LIMIT = 50
 _PAGE_SIZE = 500
 
+# ``concept_id[]`` entries per ``get_variables`` batch — comfortably under the
+# URL length CloudFront starts rejecting with a bare 414 (docs/cmr_patterns.md).
+_VARIABLE_ID_BATCH_SIZE = 100
+
 
 class CMRError(Exception):
     """A non-retryable CMR error (4xx): a malformed query, not a transient fault."""
@@ -292,19 +296,34 @@ class CMRProvider:
     ) -> list[dict]:
         """Two-phase lookup: collection associations → ``variables.umm_json``.
 
-        A keyword-only call (no collection) skips phase 1 and searches globally.
+        A keyword-only call (no collection) skips phase 1, searches globally, and
+        is capped at ``limit`` (an open-ended search needs a cap). A collection-
+        scoped call ignores ``limit`` and always returns the *complete*
+        association list instead — describe_dataset's ``variable_count`` promises
+        "always the true total," and retrieve_subset's plan-time
+        ``validate_variables`` must be able to confirm a real variable that
+        simply isn't among the first ``limit`` associations in CMR's (arbitrary)
+        ordering. The list is batched into groups of :data:`_VARIABLE_ID_BATCH_SIZE`
+        ``concept_id[]`` entries per request — some real collections (MOD08_D3/
+        MYD08_D3 carry 975 UMM-Var associations) put enough ids on one query
+        string that CloudFront rejects it with a bare 414 well before CMR's own
+        limits would.
         """
-        params: dict[str, Any] = {}
         if collection_concept_id:
             ids = await self._association_ids(collection_concept_id, "variables")
             if not ids:
                 return []
-            params["concept_id[]"] = ids
-        if keyword:
-            params["keyword"] = keyword
-        if not params:
+            items: list[dict] = []
+            for i in range(0, len(ids), _VARIABLE_ID_BATCH_SIZE):
+                batch = ids[i : i + _VARIABLE_ID_BATCH_SIZE]
+                params: dict[str, Any] = {"concept_id[]": batch}
+                if keyword:
+                    params["keyword"] = keyword
+                items.extend(await self._search(_VARIABLES, params, limit=len(batch)))
+            return [normalize_variable_item(i) for i in items]
+        if not keyword:
             return []
-        items = await self._search(_VARIABLES, params, limit=limit)
+        items = await self._search(_VARIABLES, {"keyword": keyword}, limit=limit)
         return [normalize_variable_item(i) for i in items]
 
     async def get_services(
