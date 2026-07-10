@@ -49,6 +49,7 @@ from earthdata_mcp.tools.provenance import get_provenance
 from earthdata_mcp.tools.retrieval import (
     get_retrieval_status,
     retrieve_data,
+    retrieve_subset,
     retrieve_timeseries,
 )
 from earthdata_mcp.workspace.models import HandleType
@@ -664,6 +665,89 @@ async def test_export_then_evict_then_rematerialize_then_export_again(
 
     re_exported = await export_result(
         obs_handle, workspace_id=workspace_id, store=workspace_store, storage=local_backend,
+    )
+    assert re_exported["status"] == "ready"
+    ds_reopened = xr.open_dataset(Path.from_uri(re_exported["storage_uri"]))
+    assert ds_reopened["x"].values.tolist() == [2.0]
+
+
+# -- retrieve_subset idempotent dedupe end-to-end (PRD 020) -----------------
+
+
+async def test_retrieve_subset_dedupe_end_to_end_materialized_then_evicted(
+    workspace_store, provenance_store, session_factory, patch_worker_seam,
+    local_backend, workspace_id,
+) -> None:
+    """retrieve → await → retrieve identical (exactly one provider job ever
+    ran, the second call returns in one round-trip); then evict the key →
+    retrieve identical again (rematerialize-equivalent replay) — the two
+    production surfaces PRD 020 exists for."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    patch_worker_seam(
+        _FakeProvider("harmony", "application/netcdf4", _real_netcdf_bytes(1.0), local_backend)
+    )
+    enqueue = AsyncMock()
+
+    first = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        cmr=_make_cmr(), store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=enqueue,
+    )
+    async with session_factory() as session:
+        job = await crud.get_job_by_handle(session, first["job_handle"])
+        job_id = job.job_id
+    await _drive_to_ready(session_factory, job_id)
+
+    second = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        cmr=_make_cmr(), store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=enqueue,
+    )
+    assert second["reused"] is True
+    assert second["obs_handle"] == first["obs_handle"]
+    assert second["status"] == "ready"
+    # Exactly one provider job ever ran — the second call cost no extra enqueue.
+    enqueue.assert_awaited_once()
+
+    exported = await export_result(
+        first["obs_handle"], workspace_id=workspace_id,
+        store=workspace_store, storage=local_backend,
+    )
+    assert exported["status"] == "ready"
+
+    # Simulate eviction: delete the blob, flip the handle to expired — exactly
+    # what jobs/eviction.py's _evict_one does.
+    evicted_record = await workspace_store.get_handle(workspace_id, first["obs_handle"])
+    await local_backend.delete(evicted_record.payload["storage_key"])
+    await workspace_store.update_handle(
+        workspace_id, first["obs_handle"], {"status": "expired", "storage_key": None},
+    )
+
+    # A different fake provider instance so the recovered job's materialized
+    # bytes are distinguishable from the first run's.
+    patch_worker_seam(
+        _FakeProvider("harmony", "application/netcdf4", _real_netcdf_bytes(2.0), local_backend)
+    )
+    third = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        cmr=_make_cmr(), store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=enqueue,
+    )
+    assert third["reused"] is True
+    assert third["obs_handle"] == first["obs_handle"]
+    assert third["job_handle"] != first["job_handle"]
+    assert third["status"] == JobState.PENDING.value
+    assert enqueue.await_count == 2
+
+    async with session_factory() as session:
+        new_job = await crud.get_job_by_handle(session, third["job_handle"])
+        new_job_id = new_job.job_id
+    await _drive_to_ready(session_factory, new_job_id)
+
+    re_exported = await export_result(
+        first["obs_handle"], workspace_id=workspace_id,
+        store=workspace_store, storage=local_backend,
     )
     assert re_exported["status"] == "ready"
     ds_reopened = xr.open_dataset(Path.from_uri(re_exported["storage_uri"]))

@@ -16,7 +16,11 @@ from earthdata_mcp.providers._capabilities import (
 )
 from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange
 from earthdata_mcp.providers.opendap import AxisGeometry
-from earthdata_mcp.providers.request_spec import InvalidSpecError, RequestSpec
+from earthdata_mcp.providers.request_spec import (
+    InvalidSpecError,
+    RequestSpec,
+    compute_request_signature,
+)
 from earthdata_mcp.providers.router import RoutingDecision
 
 _CONCEPT_ID = "C1234567890-LPCLOUD"
@@ -375,6 +379,58 @@ def test_cache_key_matches_golden_value_and_is_stable_across_round_trip() -> Non
 
     reconstructed = RequestSpec.from_jsonb(spec.to_jsonb())
     assert reconstructed.cache_key() == spec.cache_key()
+
+
+# -- compute_request_signature(): canonicalization (PRD 020) -----------------
+
+
+def _sig(**overrides) -> str:
+    kwargs = dict(
+        concept_id=_CONCEPT_ID,
+        bbox=_BBOX,
+        time_range=_TIME,
+        variables=("NO2",),
+        output_format="application/netcdf4",
+    )
+    kwargs.update(overrides)
+    return compute_request_signature(**kwargs)
+
+
+def test_signature_ignores_variable_order_and_duplication() -> None:
+    assert _sig(variables=("NO2", "O3")) == _sig(variables=("O3", "NO2"))
+    assert _sig(variables=("NO2", "O3")) == _sig(variables=("NO2", "NO2", "O3"))
+
+
+def test_signature_collides_across_equivalent_time_spellings() -> None:
+    assert _sig(time_range="2024-01-01/2024-03-31") == _sig(
+        time_range="2024-01-01T00:00:00Z/2024-03-31T00:00:00Z"
+    )
+
+
+def test_signature_collides_across_aoi_handles_with_same_resolved_bbox() -> None:
+    """Two different ``aoi_`` handles resolving to the identical bbox produce the
+    same signature — the resolved geometry is what's canonical, not the handle."""
+    bbox_from_handle_a = (-105.0, 37.0, -104.0, 38.0)
+    bbox_from_handle_b = (-105.0, 37.0, -104.0, 38.0)
+    assert _sig(bbox=bbox_from_handle_a) == _sig(bbox=bbox_from_handle_b)
+
+
+def test_signature_differs_by_output_format() -> None:
+    assert _sig(output_format="application/netcdf4") != _sig(
+        output_format="application/x-parquet"
+    )
+
+
+def test_signature_strict_subset_time_range_is_not_a_collision() -> None:
+    """Exact match only (PRD 020 decision 2026-07-10): a narrower time range
+    inside a wider one is a miss, not a reuse."""
+    assert _sig(time_range="2024-01-01/2024-03-31") != _sig(
+        time_range="2024-01-08/2024-01-15"
+    )
+
+
+def test_signature_differs_by_concept_id() -> None:
+    assert _sig(concept_id=_CONCEPT_ID) != _sig(concept_id="C999-OTHER")
 
 
 # -- legacy tolerance ---------------------------------------------------------

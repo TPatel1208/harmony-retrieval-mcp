@@ -79,13 +79,22 @@ async def get_job_by_handle(session: AsyncSession, job_handle: str) -> Job | Non
 
 
 async def get_job_by_obs_handle(session: AsyncSession, obs_handle: str) -> Job | None:
-    """Load the job that produced ``obs_handle``, or ``None``.
+    """Load the most recently created job that produced ``obs_handle``, or ``None``.
 
-    Used by the eviction service (PRD 015) to walk a job across the legal
+    An ``obs_`` handle can have more than one job row behind it over its
+    lifetime — each rematerialize/reuse re-enqueue (PRD 017, PRD 020) mints a
+    fresh job row while keeping the same handle identity — so this orders by
+    ``created_at`` and takes the latest; that is always the live job. Used by
+    the eviction service (PRD 015) to walk a job across the legal
     ``ready -> expired`` edge when its result is evicted; a transform-owned
     ``cube_`` handle has no job row, so callers must treat ``None`` as fine.
     """
-    stmt = select(Job).where(Job.obs_handle == obs_handle)
+    stmt = (
+        select(Job)
+        .where(Job.obs_handle == obs_handle)
+        .order_by(Job.created_at.desc())
+        .limit(1)
+    )
     return (await session.execute(stmt)).scalar_one_or_none()
 
 

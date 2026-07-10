@@ -65,6 +65,7 @@ class ProvenanceEventType(StrEnum):
     MATERIALIZED = "materialized"
     EXPIRED = "expired"
     RE_MATERIALIZED = "re-materialized"
+    REUSED = "reused"
 
 
 class Base(DeclarativeBase):
@@ -118,7 +119,7 @@ class ProvenanceEdge(Base):
 class ProvenanceEvent(Base):
     """A first-class lineage event (``created``/``submitted``/``provider-fallback``/
     ``opendap-not-applicable``/``job-failed``/``materialized``/``expired``/
-    ``re-materialized``) attached to a handle."""
+    ``re-materialized``/``reused``) attached to a handle."""
 
     __tablename__ = "provenance_events"
 

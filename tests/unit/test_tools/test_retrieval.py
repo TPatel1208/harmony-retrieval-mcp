@@ -772,6 +772,210 @@ async def test_retrieve_subset_sets_variable_flag(
     assert spec["variables"] == ["NDVI"]
 
 
+# -- retrieve_subset idempotent dedupe (PRD 020) ----------------------------
+
+
+async def test_retrieve_subset_reuses_materialized_handle(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    first = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    # Simulate the worker having materialized the result (as materialize_job does).
+    await workspace_store.update_handle(
+        workspace_id, first["obs_handle"],
+        {
+            "status": "ready",
+            "storage_key": "harmony/x/result",
+            "media_type": "application/netcdf4",
+        },
+    )
+
+    second = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    assert second["reused"] is True
+    assert second["obs_handle"] == first["obs_handle"]
+    assert second["job_handle"] == first["job_handle"]
+    assert second["status"] == "ready"
+    assert second["provider"] == "harmony"
+    # No second job was ever enqueued, and the hit short-circuited before the
+    # (network) OPeNDAP granule search the miss path would have run again.
+    mock_enqueue.assert_awaited_once()
+    assert grid_cmr.search_granules.await_count == 1
+
+    events = await provenance_store.events(workspace_id, first["obs_handle"])
+    assert any(e.event_type == "reused" for e in events)
+
+
+async def test_retrieve_subset_collapses_duplicate_while_job_running(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """Story 6: a second identical call while the first job is still in flight
+    collapses onto it instead of racing a duplicate provider job."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    first = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    second = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    assert second["reused"] is True
+    assert second["job_handle"] == first["job_handle"]
+    assert second["obs_handle"] == first["obs_handle"]
+    assert second["status"] == JobState.PENDING.value
+    mock_enqueue.assert_awaited_once()
+
+
+async def test_retrieve_subset_reuse_evicted_handle_reenqueues_original_spec(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """Story 4: a match whose data was evicted re-enqueues via the same
+    durable-replay path ``rematerialize`` uses, keeping the same obs_ handle
+    identity and resubmitting the *original* persisted spec unchanged."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    first = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    async with session_factory() as session:
+        original_job = await get_job_by_handle(session, first["job_handle"])
+        original_spec = original_job.request_spec
+    await workspace_store.update_handle(
+        workspace_id, first["obs_handle"], {"status": "expired", "storage_key": None},
+    )
+
+    second = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    assert second["reused"] is True
+    assert second["obs_handle"] == first["obs_handle"]
+    assert second["job_handle"] != first["job_handle"]
+    assert second["status"] == JobState.PENDING.value
+    async with session_factory() as session:
+        new_job = await get_job_by_handle(session, second["job_handle"])
+    assert new_job.request_spec == original_spec
+    assert mock_enqueue.await_count == 2
+
+    events = await provenance_store.events(workspace_id, first["obs_handle"])
+    assert any(e.event_type == "re-materialized" for e in events)
+    assert any(e.event_type == "reused" for e in events)
+
+
+async def test_retrieve_subset_reuses_across_different_aoi_handles_same_bbox(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """Two different ``aoi_`` handles that resolve to the same bbox match — the
+    resolved geometry is canonical, not which handle carried it."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi1 = await _seed_aoi(workspace_store, workspace_id)
+    aoi2 = await _seed_aoi(workspace_store, workspace_id)
+    assert aoi1 != aoi2
+
+    first = await retrieve_subset(
+        ds, aoi1, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    second = await retrieve_subset(
+        ds, aoi2, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    assert second["reused"] is True
+    assert second["obs_handle"] == first["obs_handle"]
+
+
+async def test_retrieve_subset_variable_subset_is_a_miss(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """Story 7: a genuinely narrower request (one variable fewer) is a fresh
+    retrieval, not a reuse — exact match only."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI", "EVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    second = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    assert "reused" not in second
+    assert mock_enqueue.await_count == 2
+
+
+async def test_retrieve_subset_never_reuses_across_workspaces(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """Story 5: signatures are scoped to the workspace — an identical request
+    from another workspace never observes reuse (and never learns the first
+    workspace's handle exists)."""
+    other_workspace_id = f"{workspace_id}-other"
+    ds1 = await _seed_dataset(workspace_store, workspace_id)
+    aoi1 = await _seed_aoi(workspace_store, workspace_id)
+    ds2 = await _seed_dataset(workspace_store, other_workspace_id)
+    aoi2 = await _seed_aoi(workspace_store, other_workspace_id)
+
+    first = await retrieve_subset(
+        ds1, aoi1, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    second = await retrieve_subset(
+        ds2, aoi2, _TIME, ["NDVI"], workspace_id=other_workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    assert "reused" not in second
+    assert second["obs_handle"] != first["obs_handle"]
+    assert mock_enqueue.await_count == 2
+
+
+async def test_retrieve_data_and_retrieve_timeseries_never_dedupe(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """PRD 020 scopes dedupe to ``retrieve_subset`` only — a repeat
+    ``retrieve_data`` call still enqueues a fresh job every time."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    first = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    second = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    assert "reused" not in second
+    assert second["obs_handle"] != first["obs_handle"]
+    assert mock_enqueue.await_count == 2
+
+
 # -- retrieve_timeseries ---------------------------------------------------
 
 

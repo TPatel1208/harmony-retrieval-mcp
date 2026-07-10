@@ -30,7 +30,7 @@ from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, Transfor
 from earthdata_mcp.providers.opendap import AxisGeometry, VarDimPlan
 from earthdata_mcp.providers.router import RoutingDecision
 
-__all__ = ["InvalidSpecError", "RequestSpec"]
+__all__ = ["InvalidSpecError", "RequestSpec", "compute_request_signature"]
 
 _DEFAULT_FORMAT = "application/netcdf4"
 
@@ -338,4 +338,46 @@ def _compute_cache_key(
             service_version or "",
         ]
     )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+# -- request signature (PRD 020: exact-match dedupe) --------------------------
+
+
+def compute_request_signature(
+    *,
+    concept_id: str | None,
+    bbox: tuple[float, float, float, float] | None,
+    time_range: str | None,
+    variables: tuple[str, ...],
+    output_format: str,
+) -> str:
+    """The canonical signature of a *request*, for ``retrieve_subset``'s
+    exact-match reuse lookup (PRD 020) — deliberately distinct from
+    :func:`_compute_cache_key` above.
+
+    ``cache_key`` is a materialization identity: it folds in ``service_name``
+    and ``service_version``, i.e. *how* the request was routed, and (today)
+    backs no lookup at all — nothing reads it back. A repeat of the same
+    request can legitimately route differently between submissions (an
+    unpinned Harmony submit lets the server pick a different chain, a
+    service's capabilities can change), so routing details must never decide
+    whether two requests are "the same ask". This signature hashes only the
+    user's intent — dataset, resolved AOI, normalized time bounds, variables,
+    output format — and is looked up among a workspace's existing ``obs_``
+    handles at submit time, not stored for any other purpose.
+
+    Canonicalization: ``bbox`` is already the *resolved* geometry (whatever
+    ``aoi_`` handle it came from), so two different handles for the same
+    polygon collide for free. ``time_range`` is round-tripped through
+    :class:`TimeRange` so equivalent spellings of the same instant (date-only
+    vs. full timestamp) collide. ``variables`` is sorted and deduplicated so
+    order/repetition never matters. A strict subset of a wider time range (or
+    of a wider variable list) is a deliberate miss — no containment
+    reasoning here, exact match only.
+    """
+    aoi_str = ",".join(str(c) for c in bbox) if bbox is not None else ""
+    canonical_time = TimeRange.from_cmr(time_range).to_cmr() if time_range else ""
+    var_str = ",".join(sorted(set(variables)))
+    raw = ":".join([concept_id or "", aoi_str, canonical_time, var_str, output_format])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]

@@ -24,10 +24,7 @@ graph is left exactly as it was.
 
 from __future__ import annotations
 
-from uuid import uuid4
-
 from earthdata_mcp.jobs import crud
-from earthdata_mcp.jobs.state import JobState
 from earthdata_mcp.storage import StorageBackend, get_storage_backend
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.tools.retrieval import (
@@ -35,8 +32,9 @@ from earthdata_mcp.tools.retrieval import (
     _default_enqueue,
     _default_provenance,
     _default_session_factory,
+    _reenqueue_replay,
 )
-from earthdata_mcp.workspace.models import HandleType, ProvenanceEventType, handle_type_of
+from earthdata_mcp.workspace.models import HandleType, handle_type_of
 from earthdata_mcp.workspace.provenance import ProvenanceStore
 from earthdata_mcp.workspace.store import CrossWorkspaceError, HandleNotFoundError, WorkspaceStore
 
@@ -200,30 +198,12 @@ async def rematerialize(
             ),
         }
 
-    new_job_id = uuid4().hex
-    new_job_handle = await store.put_handle(
-        workspace_id, HandleType.JOB, payload={"obs_handle": handle}
+    return await _reenqueue_replay(
+        handle=handle,
+        workspace_id=workspace_id,
+        job=job,
+        store=store,
+        provenance=provenance,
+        session_factory=session_factory,
+        enqueue_fn=enqueue_fn,
     )
-    await store.update_handle(workspace_id, handle, {"status": "pending"})
-    async with session_factory() as session:
-        await crud.create_job(
-            session,
-            job_id=new_job_id,
-            job_handle=new_job_handle,
-            obs_handle=handle,
-            provider=job.provider,
-            request_spec=job.request_spec,
-        )
-    await provenance.record_event(
-        workspace_id,
-        handle,
-        ProvenanceEventType.RE_MATERIALIZED,
-        detail={"job_handle": new_job_handle, "previous_job_handle": job.job_handle},
-    )
-    await enqueue_fn("submit_job", new_job_id)
-
-    return {
-        "job_handle": new_job_handle,
-        "obs_handle": handle,
-        "status": JobState.PENDING.value,
-    }

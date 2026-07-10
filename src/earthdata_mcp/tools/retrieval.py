@@ -19,6 +19,11 @@ Format follows shape (§4.4): a gridded collection defaults to Zarr, a point
 collection to Parquet, everything else to netCDF-4 — we never force tabular data
 through a cube. The chosen format is recorded in the spec and must match the
 routed service's ``output_formats`` or the route fails at planning time.
+
+``retrieve_subset`` is additionally idempotent per workspace (PRD 020): before
+planning, it computes a canonical signature of the request and looks it up
+among the workspace's existing ``obs_`` handles (see :func:`_check_reuse`),
+reusing an exact match instead of enqueueing a duplicate job.
 """
 
 from __future__ import annotations
@@ -47,7 +52,8 @@ from earthdata_mcp.providers.opendap import (
     plan_subset,
     validate_variables,
 )
-from earthdata_mcp.providers.request_spec import RequestSpec
+from earthdata_mcp.jobs.models import Job
+from earthdata_mcp.providers.request_spec import RequestSpec, compute_request_signature
 from earthdata_mcp.providers.router import Router
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.handles import resolve_aoi, resolve_dataset
@@ -208,6 +214,16 @@ async def retrieve_subset(
     endpoints (date-only or full timestamp) — the same grammar the coverage
     tools accept. Both bounds are required (no open ranges) and empty input is
     rejected before any handle, CMR, or DB call.
+
+    Idempotent per workspace (PRD 020): a request whose canonical signature
+    (resolved dataset, resolved AOI, normalized time bounds, variables,
+    output format) exactly matches an earlier one in this workspace reuses
+    that handle instead of enqueueing a new job — ``reused: true`` is added to
+    the response. A materialized match returns immediately; an in-flight match
+    collapses onto it; an evicted match re-enqueues via the same durable-replay
+    path ``rematerialize`` uses, keeping the same ``obs_`` handle identity.
+    Exact match only — a strict subset (fewer variables, a narrower time
+    range) is a miss, and reuse never crosses a workspace boundary.
     """
     return await _submit_retrieval(
         dataset_handle=dataset_handle,
@@ -225,6 +241,7 @@ async def retrieve_subset(
         provenance=provenance,
         session_factory=session_factory,
         enqueue_fn=enqueue_fn,
+        dedupe=True,
     )
 
 
@@ -453,12 +470,21 @@ async def _submit_retrieval(
     provenance: ProvenanceStore | None,
     session_factory,
     enqueue_fn: EnqueueFn | None,
+    dedupe: bool = False,
 ) -> dict:
     """Plan → persist a durable job → enqueue. The shared core of the three
     ``retrieve_*`` tools.
 
     Order matters: routing happens **before** any handle or row is created, so an
     unserviceable request (``NotRetrievable``) leaves no orphan job behind.
+
+    ``dedupe=True`` (``retrieve_subset`` only, PRD 020) additionally computes
+    the request's canonical signature right after the output format is known
+    and, on an exact match against an existing handle in this workspace,
+    returns the reused handle instead of proceeding — short-circuiting before
+    the OPeNDAP granule search, routing, and any handle/job creation.
+    ``retrieve_data``/``retrieve_timeseries`` leave this ``False`` and are
+    unaffected.
     """
     # allow_open=False: TimeRange.from_cmr below needs both bounds to build a
     # closed range, unlike the coverage tools' open-range-friendly grammar.
@@ -475,6 +501,36 @@ async def _submit_retrieval(
     )
 
     caps = await cmr.collection_capabilities(concept_id)
+
+    # Format by shape (grid/swath → netCDF-4). An explicit caller format still wins.
+    # Computed here — before OPeNDAP discovery/routing below — because a dedupe
+    # signature needs the final format and a hit should short-circuit both.
+    if needs_point_sample:
+        fmt = output_format or _FORMAT_BY_SHAPE["point"]
+    elif output_format is not None:
+        fmt = output_format
+    else:
+        fmt = _FORMAT_BY_SHAPE.get(caps.output_shape, _DEFAULT_FORMAT)
+
+    signature = None
+    if dedupe:
+        signature = compute_request_signature(
+            concept_id=concept_id,
+            bbox=bbox,
+            time_range=time_range,
+            variables=variables,
+            output_format=fmt,
+        )
+        reused = await _check_reuse(
+            store=store,
+            session_factory=session_factory,
+            provenance=provenance,
+            enqueue_fn=enqueue_fn,
+            workspace_id=workspace_id,
+            signature=signature,
+        )
+        if reused is not None:
+            return reused
 
     # Discover OPeNDAP URLs for any gridded/swath collection with a bbox — not just
     # those with no Harmony services. A collection may have service associations that
@@ -499,14 +555,6 @@ async def _submit_retrieval(
     # point-sample) or its collection has no registered UMM-V catalog.
     if needs_variable and variables and opendap_plan is not None:
         validate_variables(opendap_plan.cmr_vars, variables)
-
-    # Format by shape (grid/swath → netCDF-4). An explicit caller format still wins.
-    if needs_point_sample:
-        fmt = output_format or _FORMAT_BY_SHAPE["point"]
-    elif output_format is not None:
-        fmt = output_format
-    else:
-        fmt = _FORMAT_BY_SHAPE.get(caps.output_shape, _DEFAULT_FORMAT)
 
     plan = RetrievalPlan(
         output_format=fmt,
@@ -582,9 +630,13 @@ async def _submit_retrieval(
         await _check_appeears_catalog(decision.provider)
 
     # Mint the two handles, then persist the durable spec that ties them together.
-    obs_handle = await store.put_handle(
-        workspace_id, HandleType.OBS, payload={"status": "pending"}
-    )
+    # ``signature`` (PRD 020, ``dedupe=True`` only) rides in the obs_ handle's own
+    # payload so a later identical request finds this one via
+    # ``find_handle_by_payload_value`` — no parallel index.
+    obs_payload = {"status": "pending"}
+    if signature is not None:
+        obs_payload["signature"] = signature
+    obs_handle = await store.put_handle(workspace_id, HandleType.OBS, payload=obs_payload)
     # Durable, re-materializable record of *why* this path was chosen — computed
     # by `route` from data already in hand, never re-derived here (CLAUDE.md: the
     # union-trap booleans are never trusted; provenance never stores an ephemeral
@@ -643,6 +695,127 @@ async def _submit_retrieval(
         "obs_handle": obs_handle,
         "status": JobState.PENDING.value,
         "provider": decision.path,
+    }
+
+
+# -- idempotent dedupe (PRD 020) -------------------------------------------
+
+
+async def _check_reuse(
+    *,
+    store: WorkspaceStore,
+    session_factory,
+    provenance: ProvenanceStore,
+    enqueue_fn: EnqueueFn,
+    workspace_id: str,
+    signature: str,
+) -> dict | None:
+    """Exact-match reuse lookup for ``retrieve_subset`` (PRD 020).
+
+    Looks up ``signature`` among the workspace's existing ``obs_`` handles
+    (never across a workspace boundary). ``None`` means a miss — the caller
+    proceeds with a normal submission. A hit returns one of three shapes,
+    matching a normal ``retrieve_subset`` response plus ``reused: true``:
+
+    * materialized (handle payload ``status == "ready"``) — the existing
+      handles, no enqueue.
+    * still in flight (``status`` is whatever a pending job leaves it at) —
+      the existing ``job_`` handle, no enqueue (collapses a duplicate
+      double-fire onto the job already running).
+    * evicted (``status == "expired"``) — re-enqueued via
+      :func:`_reenqueue_replay`, the same durable-replay path
+      ``rematerialize`` uses, keeping the same ``obs_`` handle identity.
+
+    Records a ``reused`` provenance event on the existing handle either way
+    (never a new lineage node — reuse is an event, not a derivation).
+    """
+    match = await store.find_handle_by_payload_value(
+        workspace_id, HandleType.OBS, "signature", signature
+    )
+    if match is None:
+        return None
+
+    async with session_factory() as session:
+        job = await crud.get_job_by_obs_handle(session, match.handle)
+
+    status = match.payload.get("status")
+    if status == "expired":
+        if job is None:
+            # No job to replay from — not a usable match; fall through to a
+            # normal submission rather than handing back a dead end.
+            return None
+        result = await _reenqueue_replay(
+            handle=match.handle,
+            workspace_id=workspace_id,
+            job=job,
+            store=store,
+            provenance=provenance,
+            session_factory=session_factory,
+            enqueue_fn=enqueue_fn,
+        )
+    else:
+        result = {
+            "job_handle": job.job_handle if job is not None else None,
+            "obs_handle": match.handle,
+            "status": status or "unknown",
+            "provider": job.provider if job is not None else None,
+        }
+
+    await provenance.record_event(
+        workspace_id,
+        match.handle,
+        ProvenanceEventType.REUSED,
+        detail={"signature": signature, "status": status},
+    )
+    result["reused"] = True
+    return result
+
+
+async def _reenqueue_replay(
+    *,
+    handle: str,
+    workspace_id: str,
+    job: Job,
+    store: WorkspaceStore,
+    provenance: ProvenanceStore,
+    session_factory,
+    enqueue_fn: EnqueueFn,
+) -> dict:
+    """Re-enqueue the durable job behind ``handle`` from ``job``'s already-
+    persisted request spec — never inventing a new spec, never accepting
+    overrides. Mints a fresh ``job_`` handle but keeps ``handle`` itself
+    (the ``obs_``/``cube_`` identity never changes).
+
+    Shared by :func:`~earthdata_mcp.tools.export.rematerialize` (PRD 017,
+    caller-initiated recovery) and :func:`_check_reuse`'s evicted branch
+    (PRD 020, submit-time reuse) — one durable-replay path, two callers.
+    """
+    new_job_id = uuid4().hex
+    new_job_handle = await store.put_handle(
+        workspace_id, HandleType.JOB, payload={"obs_handle": handle}
+    )
+    await store.update_handle(workspace_id, handle, {"status": "pending"})
+    async with session_factory() as session:
+        await crud.create_job(
+            session,
+            job_id=new_job_id,
+            job_handle=new_job_handle,
+            obs_handle=handle,
+            provider=job.provider,
+            request_spec=job.request_spec,
+        )
+    await provenance.record_event(
+        workspace_id,
+        handle,
+        ProvenanceEventType.RE_MATERIALIZED,
+        detail={"job_handle": new_job_handle, "previous_job_handle": job.job_handle},
+    )
+    await enqueue_fn("submit_job", new_job_id)
+
+    return {
+        "job_handle": new_job_handle,
+        "obs_handle": handle,
+        "status": JobState.PENDING.value,
     }
 
 

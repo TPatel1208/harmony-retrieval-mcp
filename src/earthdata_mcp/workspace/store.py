@@ -151,6 +151,32 @@ class WorkspaceStore:
             row.updated_at = func.now()
             await session.commit()
 
+    async def find_handle_by_payload_value(
+        self, workspace_id: str, handle_type: HandleType, key: str, value: str
+    ) -> HandleRecord | None:
+        """The most recently created handle of ``handle_type`` in ``workspace_id``
+        whose ``payload[key] == value``, or ``None``.
+
+        Backs ``retrieve_subset``'s exact-match reuse lookup (PRD 020): the
+        canonical request signature lives in an ``obs_`` handle's own payload
+        at creation time, so dedupe reduces to a lookup over the workspace's
+        existing handles rather than a parallel index. Same workspace-scoping
+        as every other read here, so a match never crosses a workspace
+        boundary.
+        """
+        stmt = (
+            select(Handle)
+            .where(Handle.workspace_id == workspace_id)
+            .where(Handle.handle_type == HandleType(handle_type).value)
+            .order_by(Handle.created_at.desc())
+        )
+        async with self._session_factory() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        for row in rows:
+            if row.payload and row.payload.get(key) == value:
+                return _to_record(row)
+        return None
+
     async def list_handles(
         self, workspace_id: str, handle_type: HandleType | None = None
     ) -> list[HandleRecord]:
