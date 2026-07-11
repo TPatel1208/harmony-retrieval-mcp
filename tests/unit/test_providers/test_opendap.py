@@ -856,6 +856,14 @@ _AMBIGUOUS_VARS = [
     {"name": "/b/ndvi", "standard_name": None},
 ]
 
+# GLDAS-shaped: a flat collection whose UMM-Var names carry no group path — no
+# hierarchy for an NcML aggregation to flatten, so no DMR verification is needed.
+_FLAT_VARS = [
+    {"name": "precipitation", "standard_name": None},
+    {"name": "lat", "standard_name": "latitude"},
+    {"name": "lon", "standard_name": "longitude"},
+]
+
 # UMM-C reports the grid's outer *edges*, not the first cell's value (see
 # _discover_grid_geometry's docstring).
 _GRID_EXTENT = (-180.0, -60.0, 180.0, 90.0)
@@ -1159,13 +1167,85 @@ async def test_plan_subset_dmr_fetch_failure_degrades_to_variables_only() -> Non
 
 
 @pytest.mark.asyncio
-async def test_plan_subset_umm_v_present_never_consults_dmr() -> None:
-    """When UMM-Var actually has entries, the DMR is never fetched — UMM-V
-    remains the first source (PRD 009: "one round-trip we already make")."""
+async def test_plan_subset_flat_umm_v_never_consults_dmr() -> None:
+    """A flat collection whose UMM-Var names carry no group path (GLDAS) never
+    fetches the DMR — there is nothing an NcML aggregation could flatten, so
+    UMM-V remains the sole source and no extra round-trip is paid."""
     cmr = _PlanCmrStub(
-        granules=[_granule_with_opendap_url(OPENDAP_URL)], variables=_GROUPED_VARS
+        granules=[_granule_with_opendap_url(OPENDAP_URL)], variables=_FLAT_VARS
     )
-    await plan_subset(
-        cmr, _grid_caps(), "C1-GES_DISC", _PLAN_BBOX, "", ("vertical_column_total",)
+    plan = await plan_subset(
+        cmr, _grid_caps(), "C1-GES_DISC", _PLAN_BBOX, "", ("precipitation",)
     )
     assert cmr.get_dmr_called is False
+    assert plan.variables == ("precipitation",)
+
+
+# -- plan_subset: UMM-V ↔ DMR variable-path reconciliation (OMNO2d) ----------
+#
+# UMM-V records a variable's archive-native /HDFEOS/GRIDS/.../Data_Fields path,
+# but an NcML-aggregating Hyrax endpoint flattens that to the DMR root under
+# the bare leaf. When UMM-V is present its group path bypasses the empty-UMM-V
+# DMR fallback and 400s ("variable not found") — so a group-qualified name is
+# reconciled against the granule DMR before it reaches the constraint.
+
+# OMNO2d-shaped UMM-V: group-qualified Names (no leading slash, the CMR form)
+# whose leaves flatten to DMR root; no lat/lon standard_name (coords stay None).
+_NCML_FLATTENED_VARS = [
+    {"name": "HDFEOS/GRIDS/ColumnAmountNO2/Data_Fields/ColumnAmountNO2", "standard_name": None},
+    {"name": "HDFEOS/GRIDS/ColumnAmountNO2/Data_Fields/ColumnAmountNO2Trop", "standard_name": None},
+    {"name": "HDFEOS/GRIDS/ColumnAmountNO2/Data_Fields/Weight", "standard_name": None},
+]
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_remaps_flattened_group_path_to_dmr_root() -> None:
+    """OMNO2d: a UMM-V group-qualified variable the NcML endpoint flattened is
+    remapped to its real DMR root path, so the CE projects a name the endpoint
+    accepts instead of 400ing on the archive-native group path."""
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)],
+        variables=_NCML_FLATTENED_VARS,
+        dmr_xml=_dmr_fixture("omno2d_ncml_flattened.dmr.xml"),
+    )
+    plan = await plan_subset(
+        cmr, _grid_caps(), "C1266136111-GES_DISC", _PLAN_BBOX, "", ("ColumnAmountNO2Trop",)
+    )
+    assert cmr.get_dmr_called is True
+    assert plan.variables == ("/ColumnAmountNO2Trop",)
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_keeps_group_path_the_dmr_confirms_verbatim() -> None:
+    """A grouped endpoint that preserves its hierarchy (TEMPO) confirms the
+    UMM-V group path verbatim in the DMR — reconciliation is a no-op remap and
+    the path is kept unchanged (never flattened away)."""
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)],
+        variables=_GROUPED_VARS,
+        dmr_xml=_dmr_fixture("tempo_grouped.dmr.xml"),
+    )
+    plan = await plan_subset(
+        cmr, _grid_caps(), "C1-TEMPO", _PLAN_BBOX, "", ("vertical_column_total",)
+    )
+    assert cmr.get_dmr_called is True
+    assert plan.variables == ("/product/vertical_column_total",)
+
+
+@pytest.mark.asyncio
+async def test_plan_subset_reconcile_dmr_failure_leaves_names_unchanged() -> None:
+    """A DMR fetch failure during reconciliation never raises and never guesses:
+    the group-qualified UMM-V name passes through untouched (today's behaviour),
+    degrading gracefully rather than blocking the job."""
+    cmr = _PlanCmrStub(
+        granules=[_granule_with_opendap_url(OPENDAP_URL)],
+        variables=_NCML_FLATTENED_VARS,
+        dmr_xml=RuntimeError("network error"),
+    )
+    plan = await plan_subset(
+        cmr, _grid_caps(), "C1266136111-GES_DISC", _PLAN_BBOX, "", ("ColumnAmountNO2Trop",)
+    )
+    assert cmr.get_dmr_called is True
+    assert plan.variables == (
+        "HDFEOS/GRIDS/ColumnAmountNO2/Data_Fields/ColumnAmountNO2Trop",
+    )

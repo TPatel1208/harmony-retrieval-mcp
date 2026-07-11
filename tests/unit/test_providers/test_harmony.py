@@ -108,6 +108,52 @@ async def test_submit_maps_plan_to_request_with_matched_service(l2_caps) -> None
 
 
 @pytest.mark.asyncio
+async def test_submit_widens_degenerate_temporal_range(l2_caps) -> None:
+    """A single-day request normalizes to start == stop (a date-only
+    '2024-06-15/2024-06-15' parses to midnight on both ends). Harmony rejects a
+    zero-width window ("start must be earlier than its stop datetime"), so submit
+    nudges stop one second forward — the window is non-degenerate and a daily
+    granule still overlaps it."""
+    client = MagicMock()
+    client.submit.return_value = "job-day"
+    p = _provider(l2_caps, client=client)
+    instant = dt.datetime(2024, 6, 15, tzinfo=dt.timezone.utc)
+    plan = RetrievalPlan(
+        output_format="application/netcdf",
+        needs_variable=True,
+        concept_id="C2930725014-LARC_CLOUD",
+        time_range=TimeRange(start=instant, end=instant),
+        transform=TransformSpec(output_format="application/netcdf", variables=("NO2",)),
+    )
+    await p.submit(plan)
+    request = client.submit.call_args.args[0]
+    assert request.temporal["start"] == instant
+    assert request.temporal["stop"] == instant + dt.timedelta(seconds=1)
+    assert request.temporal["start"] < request.temporal["stop"]
+
+
+@pytest.mark.asyncio
+async def test_submit_preserves_non_degenerate_temporal_range(l2_caps) -> None:
+    """A normal multi-day window is passed through untouched — the widening only
+    fires for a zero-width start == stop range."""
+    client = MagicMock()
+    client.submit.return_value = "job-range"
+    p = _provider(l2_caps, client=client)
+    start = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+    end = dt.datetime(2024, 3, 1, tzinfo=dt.timezone.utc)
+    plan = RetrievalPlan(
+        output_format="application/netcdf",
+        needs_variable=True,
+        concept_id="C2930725014-LARC_CLOUD",
+        time_range=TimeRange(start=start, end=end),
+        transform=TransformSpec(output_format="application/netcdf", variables=("NO2",)),
+    )
+    await p.submit(plan)
+    request = client.submit.call_args.args[0]
+    assert request.temporal == {"start": start, "stop": end}
+
+
+@pytest.mark.asyncio
 async def test_submit_variable_png_pins_the_imagenator(l2_caps) -> None:
     client = MagicMock()
     client.submit.return_value = "job-png"

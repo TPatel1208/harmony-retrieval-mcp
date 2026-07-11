@@ -28,6 +28,7 @@ import re
 import tempfile
 import zipfile
 from collections.abc import Callable
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -260,10 +261,19 @@ class HarmonyProvider:
         if plan.aoi is not None and plan.aoi.bbox is not None:
             kwargs["spatial"] = harmony.BBox(*plan.aoi.bbox)
         if plan.time_range is not None:
-            kwargs["temporal"] = {
-                "start": plan.time_range.start,
-                "stop": plan.time_range.end,
-            }
+            start, stop = plan.time_range.start, plan.time_range.end
+            # Harmony rejects a zero-width temporal window ("The temporal range's
+            # start must be earlier than its stop datetime"), but a single-day
+            # request normalizes to start == stop (a date-only '2024-06-15/
+            # 2024-06-15' parses to midnight on both ends). Nudge stop one second
+            # forward so the window is non-degenerate: a daily granule still
+            # overlaps it and a genuine instant request is unchanged in practice.
+            # Only Harmony is this strict — CMR granule search (the OPeNDAP path)
+            # accepts start == stop — so this widening belongs here at submit
+            # time, not in the shared time_range grammar.
+            if stop <= start:
+                stop = start + timedelta(seconds=1)
+            kwargs["temporal"] = {"start": start, "stop": stop}
         transform = plan.transform
         if transform is not None:
             if transform.variables:

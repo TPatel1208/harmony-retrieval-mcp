@@ -267,6 +267,56 @@ async def _resolve_from_dmr(
     return (resolved, var_coords, expansions)
 
 
+async def _reconcile_variables_with_dmr(
+    cmr: object,
+    opendap_url: str,
+    variables: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Remap UMM-V group-qualified variable paths onto the granule DMR's real paths.
+
+    UMM-V records a variable's ``Name`` as its archive-native (HDF-EOS5)
+    group-qualified path — e.g. ``HDFEOS/GRIDS/ColumnAmountNO2/Data_Fields/
+    ColumnAmountNO2Trop``. But a Hyrax endpoint that serves the granule through
+    an NcML aggregation (GES DISC's ``.he5.ncml`` L3 products — OMNO2d)
+    *flattens* that hierarchy: the variable is exposed at the DMR root under its
+    bare leaf (``/ColumnAmountNO2Trop``). Projecting the UMM-V path then draws a
+    400 from Hyrax ("the constraint expression referenced a variable that was
+    not found in the dataset"), and because UMM-V *is* present the empty-UMM-V
+    DMR fallback (:func:`_resolve_from_dmr`) never runs to catch it.
+
+    So we verify — never guess (CLAUDE.md) — each name against the granule's own
+    DMR, the one authority for what the endpoint actually accepts. A path
+    present verbatim is kept (the endpoint preserved groups — TEMPO). A path the
+    DMR lacks is remapped to the DMR path whose leaf matches, but only when
+    exactly one does; a leaf with zero or several DMR matches is left untouched
+    (the flattened DMR is an endpoint quirk, not authority to *reject* a
+    variable UMM-V already confirmed exists — leaving it reproduces today's
+    behaviour rather than newly blocking the job). Fail-soft: a DMR that can't
+    be fetched or parsed returns the names unchanged.
+    """
+    try:
+        xml_text = await cmr.get_dmr(opendap_url)  # type: ignore[attr-defined]
+    except Exception:
+        return variables
+    if not xml_text:
+        return variables
+    try:
+        tree = parse_dmr(xml_text)
+    except ET.ParseError:
+        return variables
+
+    reconciled: list[str] = []
+    for var in variables:
+        fqn = var if var.startswith("/") else f"/{var}"
+        if fqn in tree.variables:
+            reconciled.append(var)
+            continue
+        leaf = _leaf(var)
+        matches = [p for p in tree.variables if _leaf(p) == leaf]
+        reconciled.append(matches[0] if len(matches) == 1 else var)
+    return tuple(reconciled)
+
+
 #: Cap on granules pulled into a single OPeNDAP bundle (one DAP4 bbox subset each).
 #: Matches CMR's per-request granule limit; a wider window is truncated to this.
 _OPENDAP_GRANULE_LIMIT = 50
@@ -373,6 +423,15 @@ async def plan_subset(
         dmr_result = await _resolve_from_dmr(cmr, urls[0], resolved_variables)
         if dmr_result is not None:
             resolved_variables, var_coords, variable_expansions = dmr_result
+    elif any("/" in v for v in resolved_variables):
+        # UMM-V is present, but its variable Names are archive-native paths an
+        # NcML-aggregating endpoint flattens (OMNO2d) — verify each against the
+        # granule DMR and remap a flattened one to its real root path, so the CE
+        # never projects a variable the endpoint 400s on. Only a group-qualified
+        # name can be flattened, so a flat collection (GLDAS) skips this round-trip.
+        resolved_variables = await _reconcile_variables_with_dmr(
+            cmr, urls[0], resolved_variables
+        )
 
     lat_axis: AxisGeometry | None = None
     lon_axis: AxisGeometry | None = None

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<Dataset xmlns="http://xml.opendap.org/ns/DAP/4.0#" dapVersion="4.0" dmrVersion="1.0"
+         name="OMI-Aura_L3-OMNO2d_2024m0615_v003-2024m0709t210629.he5.ncml">
+    <!-- GES DISC serves this HDF-EOS5 L3 product through an NcML aggregation
+         (.he5.ncml), which FLATTENS the archive-native /HDFEOS/GRIDS/.../
+         Data_Fields group hierarchy: every science variable is exposed at the
+         DMR root under its bare leaf, and the grid axes are plain root
+         lat/lon (not the UMM-V YDim/XDim). Trimmed from the live DMR at
+         https://acdisc.gesdisc.eosdis.nasa.gov/opendap/HDF-EOS5/ncml/
+         Aura_OMI_Level3/OMNO2d.003/2024/…he5.ncml.dmr (2026-07-11). -->
+    <Dimension name="lat" size="720"/>
+    <Dimension name="lon" size="1440"/>
+    <Float32 name="ColumnAmountNO2">
+        <Dim name="/lat"/>
+        <Dim name="/lon"/>
+        <Attribute name="fullnamepath" type="String">
+            <Value>/HDFEOS/GRIDS/ColumnAmountNO2/Data Fields/ColumnAmountNO2</Value>
+        </Attribute>
+    </Float32>
+    <Float32 name="ColumnAmountNO2Trop">
+        <Dim name="/lat"/>
+        <Dim name="/lon"/>
+        <Attribute name="fullnamepath" type="String">
+            <Value>/HDFEOS/GRIDS/ColumnAmountNO2/Data Fields/ColumnAmountNO2Trop</Value>
+        </Attribute>
+    </Float32>
+    <Float32 name="Weight">
+        <Dim name="/lat"/>
+        <Dim name="/lon"/>
+    </Float32>
+    <Float32 name="lat">
+        <Dim name="/lat"/>
+    </Float32>
+    <Float32 name="lon">
+        <Dim name="/lon"/>
+    </Float32>
+</Dataset>
