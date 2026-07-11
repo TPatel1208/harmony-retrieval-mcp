@@ -28,6 +28,7 @@ reusing an exact match instead of enqueueing a duplicate job.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
@@ -59,7 +60,12 @@ from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.handles import resolve_aoi, resolve_dataset
 from earthdata_mcp.workspace.models import HandleType, ProvenanceEventType, handle_type_of
 from earthdata_mcp.workspace.provenance import ProvenanceStore
-from earthdata_mcp.workspace.store import CrossWorkspaceError, HandleNotFoundError, WorkspaceStore
+from earthdata_mcp.workspace.store import (
+    CrossWorkspaceError,
+    HandleNotFoundError,
+    HandleRecord,
+    WorkspaceStore,
+)
 
 #: An ``enqueue_fn`` enqueues ``(task_name, *args)`` onto the worker queue. The
 #: default wraps an Arq pool; tests inject an ``AsyncMock`` so no Redis is needed.
@@ -636,7 +642,43 @@ async def _submit_retrieval(
     obs_payload = {"status": "pending"}
     if signature is not None:
         obs_payload["signature"] = signature
-    obs_handle = await store.put_handle(workspace_id, HandleType.OBS, payload=obs_payload)
+        # Atomic insert against the partial unique index on (workspace_id,
+        # signature) — the safety net for PRD 020 story 6: two concurrent
+        # identical retrieve_subset calls can both miss the earlier
+        # SELECT-based ``_check_reuse`` above (a classic check-then-act race),
+        # but only one of them wins this insert. The loser collapses onto the
+        # winner's handle exactly like a sequential reuse hit, so at most one
+        # job is ever enqueued per signature.
+        obs_record, created = await store.put_handle_unique_signature(
+            workspace_id, HandleType.OBS, obs_payload
+        )
+        if created:
+            obs_handle = obs_record.handle
+        else:
+            reused = await _await_reuse_after_conflict(
+                obs_record,
+                store=store,
+                session_factory=session_factory,
+                provenance=provenance,
+                enqueue_fn=enqueue_fn,
+                workspace_id=workspace_id,
+                signature=signature,
+            )
+            if reused is not None:
+                return reused
+            # The winner's own job died (FAILED/CANCELLED) or genuinely never
+            # landed even after the retry above — the same "miss" verdict
+            # _check_reuse's early SELECT path would reach, but the signature
+            # slot is already claimed, so recovery means submitting a fresh
+            # job under its existing handle rather than minting a new one.
+            # Reset the payload to "pending" (a no-op for the FAILED/CANCELLED
+            # case, which never left "pending" to begin with; load-bearing
+            # only for the defensive expired-with-no-job case, so a live job
+            # underneath is never masked by a stale "expired" status).
+            obs_handle = obs_record.handle
+            await store.update_handle(workspace_id, obs_handle, {"status": "pending"})
+    else:
+        obs_handle = await store.put_handle(workspace_id, HandleType.OBS, payload=obs_payload)
     # Durable, re-materializable record of *why* this path was chosen — computed
     # by `route` from data already in hand, never re-derived here (CLAUDE.md: the
     # union-trap booleans are never trusted; provenance never stores an ephemeral
@@ -713,28 +755,75 @@ async def _check_reuse(
     """Exact-match reuse lookup for ``retrieve_subset`` (PRD 020).
 
     Looks up ``signature`` among the workspace's existing ``obs_`` handles
-    (never across a workspace boundary). ``None`` means a miss — the caller
-    proceeds with a normal submission. A hit returns one of three shapes,
-    matching a normal ``retrieve_subset`` response plus ``reused: true``:
+    (never across a workspace boundary) and, on a hit, delegates to
+    :func:`_reuse_response_for_match` to build the response. ``None`` means a
+    miss (no match, or a match that turned out unusable) — the caller proceeds
+    with a normal submission.
 
-    * materialized (handle payload ``status == "ready"``) — the existing
-      handles, no enqueue.
-    * still in flight (``status`` is whatever a pending job leaves it at) —
-      the existing ``job_`` handle, no enqueue (collapses a duplicate
-      double-fire onto the job already running).
-    * evicted (``status == "expired"``) — re-enqueued via
-      :func:`_reenqueue_replay`, the same durable-replay path
-      ``rematerialize`` uses, keeping the same ``obs_`` handle identity.
-
-    Records a ``reused`` provenance event on the existing handle either way
-    (never a new lineage node — reuse is an event, not a derivation).
+    This is a read-only pre-check, cheap insurance against the wasted
+    OPeNDAP/routing work below when a duplicate is likely; it is not itself
+    the concurrency guarantee (two callers can both pass it before either has
+    written a handle). See :func:`_submit_retrieval`'s atomic
+    ``put_handle_unique_signature`` insert for that.
     """
     match = await store.find_handle_by_payload_value(
         workspace_id, HandleType.OBS, "signature", signature
     )
     if match is None:
         return None
+    return await _reuse_response_for_match(
+        match,
+        store=store,
+        session_factory=session_factory,
+        provenance=provenance,
+        enqueue_fn=enqueue_fn,
+        workspace_id=workspace_id,
+        signature=signature,
+    )
 
+
+async def _reuse_response_for_match(
+    match: HandleRecord,
+    *,
+    store: WorkspaceStore,
+    session_factory,
+    provenance: ProvenanceStore,
+    enqueue_fn: EnqueueFn,
+    workspace_id: str,
+    signature: str,
+) -> dict | None:
+    """Build the reuse response for an ``obs_`` handle already known to match
+    ``signature`` — shared by :func:`_check_reuse`'s pre-submit SELECT and
+    :func:`_submit_retrieval`'s atomic-insert conflict fallback (PRD 020 story
+    6): a duplicate discovered by the database's unique constraint is handled
+    identically to one discovered by the earlier lookup.
+
+    Returns one of three shapes, matching a normal ``retrieve_subset``
+    response plus ``reused: true``:
+
+    * materialized (handle payload ``status == "ready"``) — the existing
+      handles, no enqueue.
+    * still in flight (a non-terminal job actually behind the ``pending``
+      payload) — the existing ``job_`` handle, no enqueue (collapses a
+      duplicate double-fire onto the job already running).
+    * evicted (``status == "expired"``) — re-enqueued via
+      :func:`_reenqueue_replay`, the same durable-replay path
+      ``rematerialize`` uses, keeping the same ``obs_`` handle identity.
+
+    ``None`` means the match is unusable and the caller must treat it as a
+    miss:
+
+    * an evicted handle with no job row to replay from, or
+    * a payload frozen at ``pending`` behind a job that is actually FAILED or
+      CANCELLED (or has no job row at all). The worker only ever writes
+      ``"ready"`` on success and ``"expired"`` on eviction — a failed or
+      cancelled job never touches the handle payload, so without this check a
+      dead job would look identical to one still running and the matching
+      signature would be permanently un-retryable.
+
+    Records a ``reused`` provenance event on the existing handle for every hit
+    (never a new lineage node — reuse is an event, not a derivation).
+    """
     async with session_factory() as session:
         job = await crud.get_job_by_obs_handle(session, match.handle)
 
@@ -753,12 +842,25 @@ async def _check_reuse(
             session_factory=session_factory,
             enqueue_fn=enqueue_fn,
         )
-    else:
+    elif status == "ready":
         result = {
             "job_handle": job.job_handle if job is not None else None,
             "obs_handle": match.handle,
-            "status": status or "unknown",
+            "status": status,
             "provider": job.provider if job is not None else None,
+        }
+    else:
+        # status is "pending" (or unset). That alone can't distinguish a job
+        # still legitimately in flight from one that died without ever
+        # touching the handle — treat a dead or missing job the same as the
+        # expired-with-no-job case above: not a usable match.
+        if job is None or JobState(job.state) in (JobState.FAILED, JobState.CANCELLED):
+            return None
+        result = {
+            "job_handle": job.job_handle,
+            "obs_handle": match.handle,
+            "status": status or "unknown",
+            "provider": job.provider,
         }
 
     await provenance.record_event(
@@ -769,6 +871,60 @@ async def _check_reuse(
     )
     result["reused"] = True
     return result
+
+
+#: Bounds for :func:`_await_reuse_after_conflict`'s retry of a just-lost
+#: ``put_handle_unique_signature`` race. The winner's obs_ handle insert and
+#: its job-row insert are two separate commits a few awaits apart (routing
+#: provenance, a job_ handle mint, spec serialization all sit in between) — a
+#: loser that looks up the winner's job immediately can catch that window and
+#: find none yet. In practice this resolves in low single-digit milliseconds;
+#: the bound exists only to cap how long a genuinely stuck/dead winner (a
+#: crash between its two commits) makes this call wait before giving up.
+_RACE_RETRY_ATTEMPTS = 20
+_RACE_RETRY_DELAY_SECONDS = 0.05
+
+
+async def _await_reuse_after_conflict(
+    match: HandleRecord,
+    *,
+    store: WorkspaceStore,
+    session_factory,
+    provenance: ProvenanceStore,
+    enqueue_fn: EnqueueFn,
+    workspace_id: str,
+    signature: str,
+) -> dict | None:
+    """Resolve the loser side of a ``put_handle_unique_signature`` race (PRD
+    020 story 6): the winner's obs_ handle is already committed (that's *why*
+    this call lost), but its job row may not be yet.
+
+    :func:`_reuse_response_for_match` treats "handle exists, no job behind
+    it" as a dead match — correct for its other caller (:func:`_check_reuse`'s
+    plain SELECT, where no concurrent insert is in flight and a jobless
+    handle really is orphaned). Applied naively here it would misread the
+    winner's brief window mid-commit as a dead job and mint a second job for
+    the same signature — exactly the bug this whole mechanism exists to
+    prevent. Retrying briefly closes that window; only a winner that never
+    finishes (crashes between its two commits) exhausts the retries and falls
+    through to the dead-match ``None`` a caller must recover from by
+    submitting fresh.
+    """
+    for attempt in range(_RACE_RETRY_ATTEMPTS):
+        reused = await _reuse_response_for_match(
+            match,
+            store=store,
+            session_factory=session_factory,
+            provenance=provenance,
+            enqueue_fn=enqueue_fn,
+            workspace_id=workspace_id,
+            signature=signature,
+        )
+        if reused is not None:
+            return reused
+        if attempt < _RACE_RETRY_ATTEMPTS - 1:
+            await asyncio.sleep(_RACE_RETRY_DELAY_SECONDS)
+    return None
 
 
 async def _reenqueue_replay(
@@ -816,6 +972,7 @@ async def _reenqueue_replay(
         "job_handle": new_job_handle,
         "obs_handle": handle,
         "status": JobState.PENDING.value,
+        "provider": job.provider,
     }
 
 

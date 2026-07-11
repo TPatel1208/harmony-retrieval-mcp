@@ -10,7 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from earthdata_mcp.workspace.models import Base, Handle, HandleType, mint_handle
@@ -50,9 +51,23 @@ class HandleRecord:
 
 
 async def create_schema(engine: AsyncEngine) -> None:
-    """Create the workspace + provenance tables (idempotent)."""
+    """Create the workspace + provenance tables (idempotent).
+
+    Also creates a partial unique index on ``(workspace_id, payload->>'signature')``
+    for ``handle_type = 'obs'`` handles carrying a signature — the database-level
+    uniqueness guarantee behind :meth:`WorkspaceStore.put_handle_unique_signature`
+    (PRD 020 story 6: two concurrent identical ``retrieve_subset`` calls must
+    collapse onto one job, not just usually collapse onto one).
+    """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_handles_workspace_signature "
+                "ON handles (workspace_id, (payload->>'signature')) "
+                "WHERE handle_type = 'obs' AND payload ? 'signature'"
+            )
+        )
 
 
 async def drop_schema(engine: AsyncEngine) -> None:
@@ -86,6 +101,57 @@ class WorkspaceStore:
             )
             await session.commit()
         return handle
+
+    async def put_handle_unique_signature(
+        self, workspace_id: str, handle_type: HandleType, payload: dict
+    ) -> tuple[HandleRecord, bool]:
+        """Insert a handle whose ``payload["signature"]`` is unique within
+        ``workspace_id`` — or discover the row that already won the race.
+
+        Backs ``retrieve_subset``'s exact-match dedupe (PRD 020 story 6). The
+        earlier ``find_handle_by_payload_value`` lookup (:func:`_check_reuse` in
+        ``tools/retrieval.py``) is a check-then-act read: two concurrent
+        identical requests can both miss it and both proceed to insert a
+        handle, which would enqueue two jobs for the same signature. This
+        closes that window at the database, via the partial unique index
+        ``create_schema`` creates on ``(workspace_id, payload->>'signature')``
+        for ``handle_type = 'obs'`` handles that carry a signature.
+
+        Returns ``(record, True)`` for the winner — the row this call just
+        inserted. Returns ``(record, False)`` with the pre-existing row when a
+        concurrent caller already won: the caller must treat that as a reuse
+        hit, never as license to insert a second job for the same signature.
+        """
+        signature = payload["signature"]
+        handle = mint_handle(handle_type)
+        row = Handle(
+            handle=handle,
+            workspace_id=workspace_id,
+            handle_type=HandleType(handle_type).value,
+            payload=payload,
+        )
+        async with self._session_factory() as session:
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+            else:
+                return _to_record(row), True
+
+        existing = await self.find_handle_by_payload_value(
+            workspace_id, handle_type, "signature", signature
+        )
+        if existing is None:
+            # The unique index only rejects an insert when a colliding row is
+            # live, so this would mean it vanished between the failed commit
+            # and this lookup — not possible under Postgres's transaction
+            # isolation. Surface loudly rather than silently drop the guarantee.
+            raise RuntimeError(
+                f"unique-signature insert for {signature!r} conflicted but no "
+                "existing handle with that signature was found"
+            )
+        return existing, False
 
     async def get_handle(self, workspace_id: str, handle: str) -> HandleRecord:
         """Resolve ``handle`` within ``workspace_id``.
@@ -163,19 +229,23 @@ class WorkspaceStore:
         existing handles rather than a parallel index. Same workspace-scoping
         as every other read here, so a match never crosses a workspace
         boundary.
+
+        The ``payload[key] == value`` match is a JSONB predicate pushed into
+        the query (``payload->>key = value``, ``LIMIT 1``) rather than a Python
+        loop over every handle of this type — on the hot submit path this
+        would otherwise grow linearly with the workspace's session history.
         """
         stmt = (
             select(Handle)
             .where(Handle.workspace_id == workspace_id)
             .where(Handle.handle_type == HandleType(handle_type).value)
+            .where(Handle.payload[key].astext == value)
             .order_by(Handle.created_at.desc())
+            .limit(1)
         )
         async with self._session_factory() as session:
-            rows = (await session.execute(stmt)).scalars().all()
-        for row in rows:
-            if row.payload and row.payload.get(key) == value:
-                return _to_record(row)
-        return None
+            row = (await session.execute(stmt)).scalar_one_or_none()
+        return _to_record(row) if row is not None else None
 
     async def list_handles(
         self, workspace_id: str, handle_type: HandleType | None = None

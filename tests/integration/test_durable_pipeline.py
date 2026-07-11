@@ -19,6 +19,7 @@ Two paths are covered:
 
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 import tempfile
@@ -752,3 +753,123 @@ async def test_retrieve_subset_dedupe_end_to_end_materialized_then_evicted(
     assert re_exported["status"] == "ready"
     ds_reopened = xr.open_dataset(Path.from_uri(re_exported["storage_uri"]))
     assert ds_reopened["x"].values.tolist() == [2.0]
+
+
+async def test_retrieve_subset_dedupe_failed_job_falls_through_to_fresh_submission(
+    workspace_store, provenance_store, session_factory, patch_worker_seam,
+    local_backend, workspace_id,
+) -> None:
+    """End-to-end: retrieve_subset -> the real worker fails the job (Harmony
+    submit raises, no OPeNDAP fallback discovered) -> the job row lands
+    FAILED, but the obs_ handle payload stays frozen at ``{"status":
+    "pending"}`` (only ``materialize_job`` ever writes ``"ready"``, only
+    eviction writes ``"expired"`` — the failure path only ever touches the
+    jobs row). An identical retrieve_subset must not hand back that dead job
+    as a reuse hit: it submits a fresh job under the *same* obs_ handle
+    identity, which the worker then drives to READY normally, exportable at
+    the end — proving the signature was never permanently un-retryable."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    class _AlwaysFailsProvider:
+        async def submit(self, plan):
+            raise RuntimeError("harmony 503")
+
+    patch_worker_seam(_AlwaysFailsProvider())
+    enqueue = AsyncMock()
+
+    first = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        cmr=_make_cmr(), store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=enqueue,
+    )
+    async with session_factory() as session:
+        job = await crud.get_job_by_handle(session, first["job_handle"])
+        job_id = job.job_id
+
+    ctx = {"session_factory": session_factory, "redis": AsyncMock()}
+    with pytest.raises(RuntimeError):
+        await worker_mod.submit_job(ctx, job_id)
+
+    async with session_factory() as session:
+        job = await crud.get_job_by_handle(session, first["job_handle"])
+    assert job.state == JobState.FAILED.value
+
+    obs = await workspace_store.get_handle(workspace_id, first["obs_handle"])
+    assert obs.payload["status"] == "pending"  # never touched by the failure path
+
+    patch_worker_seam(
+        _FakeProvider("harmony", "application/netcdf4", _real_netcdf_bytes(1.0), local_backend)
+    )
+    second = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        cmr=_make_cmr(), store=workspace_store, provenance=provenance_store,
+        session_factory=session_factory, enqueue_fn=enqueue,
+    )
+
+    assert "reused" not in second
+    assert second["obs_handle"] == first["obs_handle"]
+    assert second["job_handle"] != first["job_handle"]
+    # The dead job's own submit attempt plus this fresh retry.
+    assert enqueue.await_count == 2
+
+    async with session_factory() as session:
+        new_job = await crud.get_job_by_handle(session, second["job_handle"])
+        new_job_id = new_job.job_id
+    await _drive_to_ready(session_factory, new_job_id)
+
+    exported = await export_result(
+        first["obs_handle"], workspace_id=workspace_id,
+        store=workspace_store, storage=local_backend,
+    )
+    assert exported["status"] == "ready"
+
+
+async def test_retrieve_subset_concurrent_identical_calls_collapse_onto_one_job(
+    workspace_store, provenance_store, session_factory, patch_worker_seam,
+    local_backend, workspace_id,
+) -> None:
+    """Story 6, driven through the real Postgres-backed stack: two concurrent
+    identical retrieve_subset calls must collapse onto exactly one job. The
+    earlier SELECT-based reuse check is a check-then-act read on its own —
+    both calls can miss it before either has written a handle. The partial
+    unique index on (workspace_id, signature) is what actually closes the
+    window: whichever call's handle insert loses collapses onto the winner's
+    handle instead of enqueueing a second job."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    patch_worker_seam(
+        _FakeProvider("harmony", "application/netcdf4", _real_netcdf_bytes(1.0), local_backend)
+    )
+    enqueue = AsyncMock()
+
+    results = await asyncio.gather(
+        retrieve_subset(
+            ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+            cmr=_make_cmr(), store=workspace_store, provenance=provenance_store,
+            session_factory=session_factory, enqueue_fn=enqueue,
+        ),
+        retrieve_subset(
+            ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+            cmr=_make_cmr(), store=workspace_store, provenance=provenance_store,
+            session_factory=session_factory, enqueue_fn=enqueue,
+        ),
+    )
+
+    obs_handles = {r["obs_handle"] for r in results}
+    job_handles = {r["job_handle"] for r in results}
+    assert len(obs_handles) == 1
+    assert len(job_handles) == 1
+    assert sum(1 for r in results if r.get("reused")) == 1
+    enqueue.assert_awaited_once()
+
+    async with session_factory() as session:
+        job = await crud.get_job_by_handle(session, next(iter(job_handles)))
+        job_id = job.job_id
+    await _drive_to_ready(session_factory, job_id)
+
+    exported = await export_result(
+        next(iter(obs_handles)), workspace_id=workspace_id,
+        store=workspace_store, storage=local_backend,
+    )
+    assert exported["status"] == "ready"

@@ -17,6 +17,7 @@ Two assertions are load-bearing (per the design review):
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -878,6 +879,122 @@ async def test_retrieve_subset_reuse_evicted_handle_reenqueues_original_spec(
     events = await provenance_store.events(workspace_id, first["obs_handle"])
     assert any(e.event_type == "re-materialized" for e in events)
     assert any(e.event_type == "reused" for e in events)
+
+
+async def test_retrieve_subset_failed_job_is_not_reused_and_reenqueues_fresh_job(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """A FAILED job leaves the obs_ handle payload frozen at
+    ``{"status": "pending"}`` forever: the worker only writes ``"ready"`` on
+    success (materialize_job) and ``"expired"`` on eviction — a failed job's
+    exception handler updates only the jobs row, never the handle payload. An
+    identical retrieve_subset call must not match that dead job and hand back
+    a permanently un-retryable ``reused: true`` response; it falls through to
+    a fresh submission instead, same spirit as the existing evicted-with-no-job
+    guard. The obs_ handle identity is preserved (the signature's slot is
+    already claimed at the database level), but the job is brand new."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    first = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, first["job_handle"])
+        job.state = JobState.FAILED.value
+        job.error = "harmony 503: infrastructure"
+        await session.commit()
+
+    second = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    assert "reused" not in second
+    assert second["obs_handle"] == first["obs_handle"]
+    assert second["job_handle"] != first["job_handle"]
+    assert second["status"] == JobState.PENDING.value
+    assert second["provider"] == "harmony"
+    # The dead job's own submission enqueue plus this fresh retry's enqueue.
+    assert mock_enqueue.await_count == 2
+
+    async with session_factory() as session:
+        new_job = await get_job_by_handle(session, second["job_handle"])
+        old_job = await get_job_by_handle(session, first["job_handle"])
+    assert new_job.state == JobState.PENDING.value
+    # The dead job row is untouched — it stays FAILED, not silently resurrected.
+    assert old_job.state == JobState.FAILED.value
+
+
+async def test_retrieve_subset_cancelled_job_is_not_reused(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """Same dead-job poisoning as FAILED: cancel_retrieval also only updates
+    the jobs row, never the obs_ handle payload, so a CANCELLED job must be
+    treated as a miss too, not just FAILED."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    first = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, first["job_handle"])
+        job.state = JobState.CANCELLED.value
+        await session.commit()
+
+    second = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    assert "reused" not in second
+    assert second["obs_handle"] == first["obs_handle"]
+    assert second["job_handle"] != first["job_handle"]
+    assert mock_enqueue.await_count == 2
+
+
+async def test_retrieve_subset_concurrent_identical_calls_collapse_onto_one_job(
+    grid_cmr, workspace_store, provenance_store, session_factory, workspace_id,
+) -> None:
+    """Story 6, the actual race: two concurrent identical retrieve_subset
+    calls must collapse onto exactly one job. The earlier SELECT-based
+    ``_check_reuse`` is a check-then-act read on its own — both calls can miss
+    it before either has written a handle. The database-level uniqueness
+    guarantee (a partial unique index on (workspace_id, signature), enforced
+    via ``put_handle_unique_signature``) is what actually closes the window:
+    whichever call's insert loses collapses onto the winner's handle instead
+    of enqueueing a second job."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    enqueue = AsyncMock()
+
+    results = await asyncio.gather(
+        retrieve_subset(
+            ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+            **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, enqueue),
+        ),
+        retrieve_subset(
+            ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+            **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, enqueue),
+        ),
+    )
+
+    obs_handles = {r["obs_handle"] for r in results}
+    job_handles = {r["job_handle"] for r in results}
+    assert len(obs_handles) == 1
+    assert len(job_handles) == 1
+    # Exactly one of the two calls sees reused:true (the loser); the winner's
+    # response is a normal first-time submission.
+    assert sum(1 for r in results if r.get("reused")) == 1
+    enqueue.assert_awaited_once()
+
+    obs_records = await workspace_store.list_handles(workspace_id, HandleType.OBS)
+    assert len(obs_records) == 1
 
 
 async def test_retrieve_subset_reuses_across_different_aoi_handles_same_bbox(
