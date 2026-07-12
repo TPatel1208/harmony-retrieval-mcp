@@ -164,6 +164,13 @@ class OPeNDAPProvider:
         """OPeNDAP is synchronous — the subset is ready as soon as it is built."""
         return JobStatus(state=JobState.READY, progress=100)
 
+    async def cancel(self, job: JobRef) -> None:
+        """Documented no-op (PRD 021): OPeNDAP is synchronous — each granule fetch
+        completes (or fails) within a single ``materialize`` call, so there is no
+        durable upstream job for a provider-side cancel to reach. Present only to
+        satisfy the ``RetrievalProvider`` Protocol uniformly."""
+        return None
+
     async def materialize(self, job: JobRef) -> MaterializedResult:
         """Fetch each DAP4 subset off the JobRef and persist them as one zip bundle.
 

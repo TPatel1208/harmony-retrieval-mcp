@@ -195,6 +195,18 @@ async def test_poll_is_ready_immediately() -> None:
     assert status.progress == 100
 
 
+# -- cancel: documented no-op (PRD 021) -------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_a_documented_noop() -> None:
+    """OPeNDAP is synchronous — there is no durable upstream job to cancel, and
+    calling cancel must never make an HTTP call (no httpx_mock fixture requested
+    here — a real request would surface as a connection error)."""
+    result = await _provider().cancel(JobRef(provider="opendap", provider_job_url="u"))
+    assert result is None
+
+
 # -- submit: multiple granules -> newline-joined constraint URLs -----------
 
 

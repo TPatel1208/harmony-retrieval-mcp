@@ -295,6 +295,69 @@ async def test_poll_invokes_on_progress(l2_caps) -> None:
     assert seen[0].progress == 10
 
 
+# -- cancel: best-effort, idempotent (PRD 021) ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_calls_client_cancel_with_mapped_id(l2_caps) -> None:
+    client = MagicMock()
+    p = _provider(l2_caps, client=client)
+    await p.cancel(JobRef(provider="harmony", provider_job_id=_VALID_UUID))
+    client.cancel.assert_called_once_with(_VALID_UUID)
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_idempotent_on_already_terminal_conflict(l2_caps) -> None:
+    """harmony-py's client.cancel raises a two-arg Exception(reason, message) for
+    a 409 (job already in a terminal state) — the Protocol says this must not
+    raise, so it is logged and swallowed."""
+    client = MagicMock()
+    client.cancel.side_effect = Exception("Conflict", "Job status cannot transition")
+    p = _provider(l2_caps, client=client)
+    await p.cancel(JobRef(provider="harmony", provider_job_id=_VALID_UUID))  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_idempotent_on_unknown_job_404(l2_caps) -> None:
+    import requests
+
+    client = MagicMock()
+    response = MagicMock(status_code=404)
+    client.cancel.side_effect = requests.HTTPError(response=response)
+    p = _provider(l2_caps, client=client)
+    await p.cancel(JobRef(provider="harmony", provider_job_id=_VALID_UUID))  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_cancel_reraises_genuine_failures(l2_caps) -> None:
+    client = MagicMock()
+    client.cancel.side_effect = ConnectionError("network unreachable")
+    p = _provider(l2_caps, client=client)
+    with pytest.raises(ConnectionError):
+        await p.cancel(JobRef(provider="harmony", provider_job_id=_VALID_UUID))
+
+
+@pytest.mark.asyncio
+async def test_cancel_reraises_non_terminal_http_error(l2_caps) -> None:
+    import requests
+
+    client = MagicMock()
+    response = MagicMock(status_code=500)
+    client.cancel.side_effect = requests.HTTPError(response=response)
+    p = _provider(l2_caps, client=client)
+    with pytest.raises(requests.HTTPError):
+        await p.cancel(JobRef(provider="harmony", provider_job_id=_VALID_UUID))
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_a_noop_for_missing_or_malformed_job_id(l2_caps) -> None:
+    client = MagicMock()
+    p = _provider(l2_caps, client=client)
+    await p.cancel(JobRef(provider="harmony", provider_job_id=None))
+    await p.cancel(JobRef(provider="harmony", provider_job_id="not-a-uuid"))
+    client.cancel.assert_not_called()
+
+
 # -- materialize: persist through StorageBackend ---------------------------
 
 

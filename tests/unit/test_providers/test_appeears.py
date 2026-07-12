@@ -469,6 +469,47 @@ async def test_poll_failed_surfaces_error_and_fires_on_progress(httpx_mock) -> N
     assert seen == [s]
 
 
+# -- cancel: DELETE the task, idempotent (PRD 021) --------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_deletes_the_task(httpx_mock) -> None:
+    _mock_login(httpx_mock)
+    httpx_mock.add_response(url=f"{BASE}/task/t1", method="DELETE", status_code=200)
+    await _provider().cancel(JobRef(provider="appeears", provider_job_id="t1"))
+
+    delete_req = httpx_mock.get_requests()[1]
+    assert delete_req.method == "DELETE"
+    assert delete_req.url == f"{BASE}/task/t1"
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_idempotent_on_already_gone_task(httpx_mock) -> None:
+    _mock_login(httpx_mock)
+    httpx_mock.add_response(url=f"{BASE}/task/t1", method="DELETE", status_code=404)
+    await _provider().cancel(JobRef(provider="appeears", provider_job_id="t1"))  # no raise
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_idempotent_on_conflict(httpx_mock) -> None:
+    _mock_login(httpx_mock)
+    httpx_mock.add_response(url=f"{BASE}/task/t1", method="DELETE", status_code=409)
+    await _provider().cancel(JobRef(provider="appeears", provider_job_id="t1"))  # no raise
+
+
+@pytest.mark.asyncio
+async def test_cancel_reraises_other_http_errors(httpx_mock) -> None:
+    _mock_login(httpx_mock)
+    httpx_mock.add_response(url=f"{BASE}/task/t1", method="DELETE", status_code=500)
+    with pytest.raises(httpx.HTTPStatusError):
+        await _provider().cancel(JobRef(provider="appeears", provider_job_id="t1"))
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_a_noop_without_a_task_id() -> None:
+    await _provider().cancel(JobRef(provider="appeears", provider_job_id=None))
+
+
 # -- retry: re-login on 401/403 mid-session --------------------------------
 
 

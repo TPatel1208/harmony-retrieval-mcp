@@ -70,6 +70,9 @@ def test_a_minimal_retrieval_provider_conforms() -> None:
         async def materialize(self, job: JobRef) -> MaterializedResult:
             return MaterializedResult(storage_key="k", media_type="application/netcdf")
 
+        async def cancel(self, job: JobRef) -> None:
+            return None
+
     assert isinstance(FakeRetrieval(), RetrievalProvider)
     assert not isinstance(FakeRetrieval(), MetadataProvider)
 

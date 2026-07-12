@@ -56,7 +56,7 @@ from earthdata_mcp.tools._dataio import (
 from earthdata_mcp.tools.area import define_area_of_interest
 from earthdata_mcp.tools.discovery import search_datasets
 from earthdata_mcp.tools.export import export_result
-from earthdata_mcp.tools.retrieval import get_retrieval_status, retrieve_subset
+from earthdata_mcp.tools.retrieval import cancel_retrieval, get_retrieval_status, retrieve_subset
 from earthdata_mcp.tools.understanding import describe_dataset
 from earthdata_mcp.workspace import ProvenanceStore, WorkspaceStore, create_schema
 
@@ -135,6 +135,101 @@ _MATRIX = [
 @pytest.mark.parametrize("entry", _MATRIX, ids=[c.label for c in _MATRIX])
 def test_live_matrix_collection(entry: _Collection) -> None:
     asyncio.run(_run(entry))
+
+
+@pytest.mark.skipif(not _HAS_CREDS, reason="no EDL credentials in environment")
+def test_live_matrix_cancel_harmony_job() -> None:
+    """PRD 021: submit a real Harmony job and cancel it mid-flight, confirming
+    the provider-side cancel actually reaches Harmony's ``/jobs/{id}/cancel``
+    endpoint, not just the local durable state. Uses the first (Harmony-routed)
+    collection in the matrix — TEMPO NO2 L3."""
+    asyncio.run(_run_cancel(_MATRIX[0]))
+
+
+async def _run_cancel(entry: _Collection) -> None:
+    settings = Settings()
+    engine = create_async_engine(settings.database_url)
+    await create_schema(engine)
+    await create_jobs_schema(engine)
+    session_factory = create_session_factory(engine)
+    store = WorkspaceStore(session_factory)
+    provenance = ProvenanceStore(session_factory)
+    workspace_id = f"ws-live-cancel-{uuid4().hex}"
+    cmr = CMRProvider()
+
+    try:
+        window = await _recent_window(cmr, entry)
+        if window is None:
+            pytest.skip(f"{entry.label}: no granule over {_BBOX} in CMR right now")
+
+        search_out = await search_datasets(
+            entry.short_name, filters={"concept_id": entry.concept_id},
+            workspace_id=workspace_id, cmr=cmr, store=store,
+        )
+        assert search_out["count"] >= 1, f"{entry.label}: search_datasets found nothing"
+        dataset_handle = search_out["datasets"][0]["handle"]
+
+        aoi_out = await define_area_of_interest(_BBOX, workspace_id, store=store)
+        aoi_handle = aoi_out["handle"]
+
+        retrieve_out = await retrieve_subset(
+            dataset_handle, aoi_handle, window, [entry.variable],
+            workspace_id=workspace_id,
+            cmr=cmr, store=store, provenance=provenance,
+            session_factory=session_factory,
+        )
+        job_handle = retrieve_out["job_handle"]
+        assert retrieve_out["provider"] == "harmony", (
+            f"{entry.label}: expected a Harmony-routed job to exercise the real "
+            f"cancel path, got {retrieve_out['provider']!r}"
+        )
+
+        # Wait for the real (already-running) worker to actually submit to
+        # Harmony before cancelling — cancelling while still "pending" reports
+        # upstream: "unsupported" (no provider_job_url yet) and never exercises
+        # the real Harmony cancel endpoint this test is for.
+        status = await _poll_until_submitted_or_terminal(job_handle, workspace_id, store, session_factory)
+        if status["status"] in {s.value for s in TERMINAL_STATES}:
+            pytest.skip(
+                f"{entry.label}: job reached {status['status']!r} before it could "
+                "be cancelled mid-flight"
+            )
+
+        cancel_out = await cancel_retrieval(
+            job_handle, workspace_id, store=store, session_factory=session_factory,
+        )
+        assert cancel_out["cancelled"] is True
+        assert cancel_out["upstream"] != "error", (
+            f"{entry.label}: provider-side cancel failed — see logs for the "
+            "classified exception"
+        )
+
+        final_status = await _poll_to_terminal(job_handle, workspace_id, store, session_factory)
+        assert final_status["status"] in {s.value for s in TERMINAL_STATES}, (
+            f"{entry.label}: cancelled job never reached a terminal state: {final_status}"
+        )
+    finally:
+        await engine.dispose()
+
+
+async def _poll_until_submitted_or_terminal(job_handle, workspace_id, store, session_factory) -> dict:
+    """Poll until the worker has actually submitted the job upstream (state
+    leaves ``pending``) or it reaches a terminal state on its own."""
+    deadline = time.monotonic() + POLL_TIMEOUT_S
+    status = await get_retrieval_status(
+        job_handle, workspace_id, store=store, session_factory=session_factory,
+    )
+    terminal = {s.value for s in TERMINAL_STATES}
+    while status["status"] == JobState.PENDING.value:
+        if time.monotonic() > deadline:
+            pytest.skip(f"{job_handle}: job never left pending in time to cancel mid-flight")
+        await asyncio.sleep(POLL_INTERVAL_S)
+        status = await get_retrieval_status(
+            job_handle, workspace_id, store=store, session_factory=session_factory,
+        )
+        if status["status"] in terminal:
+            break
+    return status
 
 
 async def _recent_window(cmr: CMRProvider, entry: _Collection) -> str | None:

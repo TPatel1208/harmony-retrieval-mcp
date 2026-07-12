@@ -216,6 +216,11 @@ async def get_retrieval_status(
 ) -> dict:
     """Read a retrieval job's durable state from Postgres (status/progress/error).
 
+    Also carries a curated slice of what the job pertains to — ``short_name``,
+    ``variables``, ``aoi_bbox``, ``time_range``, ``provider``,
+    ``output_format``, and ``granule_count`` — whichever of those the job's
+    request actually set; never the raw internal spec.
+
     An unknown, cross-workspace, or orphaned ``job_`` handle is a structured
     ``{job_handle, status: "not_found", message}`` answer, not an error — a
     missing job is a valid answer to "what's this job's status?".
@@ -229,6 +234,15 @@ async def cancel_retrieval(
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
 ) -> dict:
     """Cancel a non-terminal retrieval job.
+
+    Flips the local durable state to cancelled (the worker stops
+    polling/materializing) and then best-effort cancels the job at its
+    provider too — real for Harmony and AppEEARS, a no-op for the synchronous
+    OPeNDAP path. The response carries ``upstream``: ``"requested"`` (issued
+    to the provider), ``"unsupported"`` (OPeNDAP, or a job never submitted
+    upstream), ``"already_terminal"`` (the job had already finished before
+    this call landed), or ``"error"`` (the provider cancel failed — logged,
+    never fatal to this call; the local cancel still succeeds).
 
     Idempotent: a job that is already terminal (ready/failed/expired/cancelled)
     is left as-is and its current status is returned rather than raising — the

@@ -29,17 +29,23 @@ reusing an exact match instead of enqueueing a duplicate job.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from earthdata_mcp.config import get_settings
 from earthdata_mcp.db import create_engine, create_session_factory
 from earthdata_mcp.jobs import crud
 from earthdata_mcp.jobs.state import LEGAL_TRANSITIONS, TERMINAL_STATES, JobState
+from earthdata_mcp.providers import build as _build_provider
+from earthdata_mcp.providers._capabilities import CollectionCapabilities
 from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import (
     AOI,
+    JobRef,
     RetrievalPlan,
+    RetrievalProvider,
     TimeRange,
     TransformSpec,
     normalize_time_range,
@@ -54,7 +60,11 @@ from earthdata_mcp.providers.opendap import (
     validate_variables,
 )
 from earthdata_mcp.jobs.models import Job
-from earthdata_mcp.providers.request_spec import RequestSpec, compute_request_signature
+from earthdata_mcp.providers.request_spec import (
+    InvalidSpecError,
+    RequestSpec,
+    compute_request_signature,
+)
 from earthdata_mcp.providers.router import Router
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.handles import resolve_aoi, resolve_dataset
@@ -67,9 +77,17 @@ from earthdata_mcp.workspace.store import (
     WorkspaceStore,
 )
 
+logger = logging.getLogger(__name__)
+
 #: An ``enqueue_fn`` enqueues ``(task_name, *args)`` onto the worker queue. The
 #: default wraps an Arq pool; tests inject an ``AsyncMock`` so no Redis is needed.
 EnqueueFn = Callable[..., Awaitable[object]]
+
+#: A ``provider_factory`` builds the ``RetrievalProvider`` ``cancel_retrieval`` calls
+#: ``cancel`` on, from the job's own durable spec. The default (``_default_cancel_provider``)
+#: never re-fetches CMR capabilities (PRD 021: cancel must stay fast); tests inject a
+#: fake provider instead of a real Harmony/AppEEARS client.
+CancelProviderFactory = Callable[[RequestSpec], RetrievalProvider]
 
 #: Default output media type per result shape (§4.4 format-by-shape).
 #:
@@ -301,6 +319,38 @@ async def retrieve_timeseries(
     )
 
 
+#: The curated slice of ``request_spec`` :func:`get_retrieval_status` projects
+#: (PRD 021). Never the raw spec: ``opendap_urls`` alone can carry dozens of
+#: URLs and must not cross the wire.
+_ENRICHMENT_KEYS = (
+    "short_name",
+    "variables",
+    "aoi_bbox",
+    "time_range",
+    "provider",
+    "output_format",
+)
+
+
+def _status_enrichment(spec: dict) -> dict:
+    """Curate ``job.request_spec`` into what a job *pertains to* (PRD 021).
+
+    A field absent from the spec (``None`` — the dataclass's own default for
+    an optional field like ``aoi_bbox``/``time_range``) is omitted entirely
+    rather than emitted as ``null``, so a consumer never has to distinguish
+    "not applicable to this job" from "not yet known." ``granule_count`` is
+    derived from ``opendap_urls`` (discovered at planning time for any
+    gridded/swath bbox request, regardless of which provider ultimately runs
+    it) — the only granule tally the durable spec carries; omitted when no
+    OPeNDAP URLs were discovered (e.g. an AppEEARS point-sample job).
+    """
+    enrichment = {key: spec[key] for key in _ENRICHMENT_KEYS if spec.get(key) is not None}
+    opendap_urls = spec.get("opendap_urls")
+    if opendap_urls:
+        enrichment["granule_count"] = len(opendap_urls)
+    return enrichment
+
+
 async def get_retrieval_status(
     job_handle: str,
     workspace_id: str = DEFAULT_WORKSPACE,
@@ -313,10 +363,14 @@ async def get_retrieval_status(
     Resolves the ``job_`` handle within the workspace first, then reads the
     durable row. Returns
     ``{job_handle, obs_handle, status, progress, phase, message, error,
-    submitted_at, last_polled_at, provider_job_url}``. ``phase`` is a
-    qualitative, provider-agnostic label derived from the durable state (PRD
-    007) — the signal a caller falls back to when ``progress`` is 0 but the job
-    is not actually stalled (e.g. an AppEEARS job still queued at the
+    submitted_at, last_polled_at, provider_job_url}`` plus a curated slice of
+    the already-loaded ``request_spec`` — ``short_name``, ``variables``,
+    ``aoi_bbox``, ``time_range``, ``provider``, ``output_format``, and
+    ``granule_count`` (PRD 021, see :func:`_status_enrichment`) — so a caller
+    can tell what a job pertains to without resolving other handles. ``phase``
+    is a qualitative, provider-agnostic label derived from the durable state
+    (PRD 007) — the signal a caller falls back to when ``progress`` is 0 but
+    the job is not actually stalled (e.g. an AppEEARS job still queued at the
     provider). ``message`` is whatever status text the provider reported on
     the last poll, when any.
 
@@ -364,6 +418,7 @@ async def get_retrieval_status(
             "submitted_at": job.created_at.isoformat(),
             "last_polled_at": (job.last_polled_at or job.updated_at).isoformat(),
             "provider_job_url": job.provider_job_url,
+            **_status_enrichment(job.request_spec),
         }
 
 
@@ -380,19 +435,114 @@ _NON_CANCELLABLE_NOTE = (
 )
 
 
+def _cancel_capabilities(spec: RequestSpec) -> CollectionCapabilities:
+    """A capabilities stub good enough to construct a cancel-only provider.
+
+    ``cancel`` touches no capability-gated logic (``find_service`` and
+    friends, used only by ``can_handle``/``submit``) — it only needs the
+    provider constructor's required identity fields, so this never re-fetches
+    from CMR. A provider-side cancel must stay fast and must not block the
+    tool on a network round-trip nothing here actually needs.
+    """
+    return CollectionCapabilities(
+        concept_id=spec.concept_id or "",
+        short_name=spec.short_name or "",
+        processing_level="",
+        output_shape=spec.output_shape or "grid",
+        native_formats=frozenset(),
+        direct_s3=None,
+        services=[],
+    )
+
+
+def _default_cancel_provider(spec: RequestSpec) -> RetrievalProvider:
+    """Build the provider ``cancel_retrieval`` calls ``cancel`` on, from the
+    job's own durable spec — the same ``spec -> provider`` seam the worker
+    uses (:func:`earthdata_mcp.providers.build`), bound to a no-network
+    capabilities stub (see :func:`_cancel_capabilities`)."""
+    return _build_provider(spec, _cancel_capabilities(spec))
+
+
+def _provider_job_id_from_url(url: str | None) -> str | None:
+    """Recover a provider's job/task id from its stored ``provider_job_url``.
+
+    Harmony and AppEEARS both encode the id as the URL's last *path* segment
+    (``…/jobs/<uuid>?linktype=…`` / ``…/task/<task_id>``) — mirrors the
+    worker's own ``_job_id_from_url`` (``jobs/worker.py``), parsed explicitly
+    so a trailing query string never leaks into the id. OPeNDAP's
+    ``provider_job_url`` (newline-joined constraint URLs) is never passed
+    here — its ``cancel`` is a documented no-op the caller short-circuits to.
+    """
+    if not url:
+        return None
+    path = urlsplit(url).path
+    return path.rstrip("/").rsplit("/", 1)[-1] or None
+
+
+async def _attempt_provider_cancel(
+    *,
+    provider_name: str,
+    provider_job_url: str | None,
+    request_spec: dict,
+    job_handle: str,
+    provider_factory: CancelProviderFactory,
+) -> str:
+    """Best-effort, non-fatal provider-side cancel; returns the ``upstream`` outcome.
+
+    ``"unsupported"`` covers both OPeNDAP (a synchronous provider with no
+    durable upstream job) and a job that was cancelled before it was ever
+    submitted (no ``provider_job_url`` yet, e.g. a still-``pending`` job) — in
+    both cases there is genuinely nothing upstream to cancel, so the provider
+    is never even constructed. Any other failure (a malformed spec, or the
+    provider's own ``cancel`` raising) is logged and reported as
+    ``"error"`` — the local cancel has already committed and is never undone.
+    """
+    if provider_name == "opendap" or not provider_job_url:
+        return "unsupported"
+    try:
+        spec = RequestSpec.from_jsonb(request_spec)
+    except InvalidSpecError:
+        logger.exception(
+            "job %s: cannot parse request_spec for provider-side cancel", job_handle
+        )
+        return "error"
+    ref = JobRef(
+        provider=provider_name,
+        provider_job_id=_provider_job_id_from_url(provider_job_url),
+        provider_job_url=provider_job_url,
+        job_handle=job_handle,
+    )
+    try:
+        provider = provider_factory(spec)
+        await provider.cancel(ref)
+    except Exception:
+        logger.exception(
+            "job %s: provider-side cancel failed (provider=%s)", job_handle, provider_name
+        )
+        return "error"
+    return "requested"
+
+
 async def cancel_retrieval(
     job_handle: str,
     workspace_id: str = DEFAULT_WORKSPACE,
     *,
     store: WorkspaceStore | None = None,
     session_factory=None,
+    provider_factory: CancelProviderFactory | None = None,
 ) -> dict:
     """Cancel a cancellable job; a friendly non-cancelling response otherwise.
 
     Three outcomes, all returning ``{job_handle, status, cancelled, ...}``:
 
-    * A cancellable state (pending/submitted/running) is cancelled and
-      ``cancelled`` is ``True``.
+    * A cancellable state (pending/submitted/running) is flipped to
+      ``cancelled`` locally (``cancelled`` is ``True``) — the worker stops
+      polling/materializing, a real local resource release. A best-effort
+      provider-side cancel is then attempted (PRD 021) and never fails the
+      tool; the response carries ``upstream``: ``"requested"`` (issued to the
+      provider), ``"unsupported"`` (OPeNDAP, or a job never submitted
+      upstream — nothing to cancel there), or ``"error"`` (the provider
+      cancel raised — logged, non-fatal).
     * A non-terminal state with no legal edge to ``cancelled`` in the state
       machine — today only ``materializing`` (the result is already
       downloaded and being persisted) — is left untouched, and the response
@@ -400,10 +550,11 @@ async def cancel_retrieval(
       the raw ``illegal job state transition`` error the state machine would
       otherwise raise.
     * A terminal state (ready/failed/expired/cancelled) echoes as-is with
-      ``cancelled: False``: a job's state can change between when a caller
-      decides to cancel and when the call lands (e.g. it finishes or fails
-      first), so this is not an illegal request — the caller's intent
-      ("stop this job") is already satisfied.
+      ``cancelled: False`` and ``upstream: "already_terminal"``: a job's
+      state can change between when a caller decides to cancel and when the
+      call lands (e.g. it finishes or fails first), so this is not an
+      illegal request — the caller's intent ("stop this job") is already
+      satisfied, upstream included.
 
     A fourth outcome, a missing job, is likewise not an exception (PRD 014): a
     handle unknown to the workspace store, one owned by another workspace, or
@@ -416,6 +567,7 @@ async def cancel_retrieval(
     """
     store = store or _default_store()
     session_factory = session_factory or _default_session_factory()
+    provider_factory = provider_factory or _default_cancel_provider
 
     if handle_type_of(job_handle) is not HandleType.JOB:
         raise ValueError(f"expected a job_ handle, got {job_handle!r}")
@@ -442,7 +594,12 @@ async def cancel_retrieval(
             }
         current = JobState(job.state)
         if current in TERMINAL_STATES:
-            return {"job_handle": job_handle, "status": job.state, "cancelled": False}
+            return {
+                "job_handle": job_handle,
+                "status": job.state,
+                "cancelled": False,
+                "upstream": "already_terminal",
+            }
         if JobState.CANCELLED not in LEGAL_TRANSITIONS[current]:
             return {
                 "job_handle": job_handle,
@@ -452,8 +609,23 @@ async def cancel_retrieval(
             }
         crud.set_state(job, JobState.CANCELLED)
         await session.commit()
+        provider_name = job.provider
+        provider_job_url = job.provider_job_url
+        request_spec = job.request_spec
 
-    return {"job_handle": job_handle, "status": JobState.CANCELLED.value, "cancelled": True}
+    upstream = await _attempt_provider_cancel(
+        provider_name=provider_name,
+        provider_job_url=provider_job_url,
+        request_spec=request_spec,
+        job_handle=job_handle,
+        provider_factory=provider_factory,
+    )
+    return {
+        "job_handle": job_handle,
+        "status": JobState.CANCELLED.value,
+        "cancelled": True,
+        "upstream": upstream,
+    }
 
 
 # -- shared planning + persistence ----------------------------------------

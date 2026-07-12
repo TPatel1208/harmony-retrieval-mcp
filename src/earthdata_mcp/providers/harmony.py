@@ -32,6 +32,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import requests
+
 from earthdata_mcp.config import Settings, get_settings
 from earthdata_mcp.formats import NETCDF_FAMILY_FORMATS, sniff_format
 from earthdata_mcp.jobs.state import JobState
@@ -185,6 +187,42 @@ class HarmonyProvider:
         if self._on_progress is not None:
             self._on_progress(status)
         return status
+
+    async def cancel(self, job: JobRef) -> None:
+        """Best-effort Harmony cancel via harmony-py's ``client.cancel(job_id)``.
+
+        A missing/malformed job id (never actually submitted, or a test
+        fixture id) is a no-op — there is nothing upstream to cancel.
+        harmony-py raises a two-arg ``Exception(response.reason, message)``
+        for a 409 (job already in a terminal state — the only case its own
+        cancel() method special-cases) and ``requests.HTTPError`` for a 404
+        (unknown job id); both are exactly the "already-terminal or unknown"
+        cases the Protocol says must never raise, so both are logged and
+        swallowed here. Any other failure (auth, network, 5xx) propagates —
+        the caller (``cancel_retrieval``) treats it as non-fatal but reports it.
+        """
+        if not job.provider_job_id or not _UUID_RE.match(job.provider_job_id):
+            return
+        client = self._client()
+        await get_limiter("harmony").acquire()
+        try:
+            await asyncio.to_thread(client.cancel, job.provider_job_id)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                logger.info("Harmony cancel: job %s not found (already gone)", job.provider_job_id)
+                return
+            raise
+        except Exception as exc:
+            # harmony-py's own 409-conflict branch raises exactly this shape
+            # (see harmony.Client.cancel) — never any other exception's shape.
+            if type(exc) is Exception and len(exc.args) == 2:
+                logger.info(
+                    "Harmony cancel: job %s already in a terminal state (%s)",
+                    job.provider_job_id,
+                    exc.args[1],
+                )
+                return
+            raise
 
     async def materialize(self, job: JobRef) -> MaterializedResult:
         """Persist the finished job's result(s) through ``StorageBackend``.

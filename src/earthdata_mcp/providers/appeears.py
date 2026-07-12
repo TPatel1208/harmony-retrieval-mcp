@@ -174,6 +174,31 @@ class AppEEARSProvider:
             self._on_progress(status)
         return status
 
+    async def cancel(self, job: JobRef) -> None:
+        """Best-effort ``DELETE {base}/task/{task_id}`` (PLAN.md's AppEEARS API).
+
+        A missing task id is a no-op — there is nothing upstream to cancel. A
+        404 (already deleted/unknown) or 409 (AppEEARS refuses to delete a
+        task in a state it considers final) is exactly the "already-terminal
+        or unknown" case the Protocol says must never raise, so both are
+        logged and swallowed. Any other HTTP failure propagates — the caller
+        (``cancel_retrieval``) treats it as non-fatal but reports it.
+        """
+        if not job.provider_job_id:
+            return
+        await get_limiter(PROVIDER).acquire()
+        try:
+            await self._request("DELETE", f"{self._base}/task/{job.provider_job_id}")
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (404, 409):
+                logger.info(
+                    "AppEEARS cancel: task %s already gone or non-cancellable (%s)",
+                    job.provider_job_id,
+                    exc.response.status_code,
+                )
+                return
+            raise
+
     async def materialize(self, job: JobRef) -> MaterializedResult:
         """Download the task's CSV results and persist them **as Parquet**.
 

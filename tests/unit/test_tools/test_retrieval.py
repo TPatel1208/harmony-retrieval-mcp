@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import earthdata_mcp.tools.retrieval as _retrieval_module
-from earthdata_mcp.jobs.crud import get_job_by_handle
+from earthdata_mcp.jobs.crud import create_job, get_job_by_handle
 from earthdata_mcp.jobs.state import JobState
 from earthdata_mcp.providers._capabilities import (
     CollectionCapabilities,
@@ -1439,6 +1439,99 @@ async def test_get_status_cross_workspace_returns_not_found(
     )
 
 
+# -- get_retrieval_status: PRD 021 enrichment -------------------------------
+
+
+async def test_get_status_enriches_with_curated_request_spec_slice(
+    workspace_store, session_factory, workspace_id,
+) -> None:
+    """PRD 021: a curated, immutable slice of ``request_spec`` rides along on
+    ``get_retrieval_status`` — enough to say what a job pertains to without
+    resolving other handles. The raw ``opendap_urls`` list never crosses the
+    wire, and a field the spec doesn't carry (``aoi_bbox`` here — a global
+    time-series has none) is omitted entirely rather than emitted as null."""
+    job_handle = await workspace_store.put_handle(
+        workspace_id, HandleType.JOB, payload={"obs_handle": "obs_enrichment"}
+    )
+    spec = {
+        "concept_id": _CONCEPT_ID,
+        "short_name": "MOD13Q1",
+        "output_format": "application/netcdf4",
+        "output_shape": "grid",
+        "needs_bbox": False,
+        "needs_variable": True,
+        "needs_temporal": True,
+        "needs_point_sample": False,
+        "aoi_bbox": None,
+        "time_range": "2024-01-01T00:00:00Z/2024-03-31T00:00:00Z",
+        "variables": ["NDVI"],
+        "provider": "harmony",
+        "service_name": "l3-subsetter",
+        "opendap_urls": [
+            "https://opendap.earthdata.nasa.gov/g1.nc",
+            "https://opendap.earthdata.nasa.gov/g2.nc",
+        ],
+    }
+    async with session_factory() as session:
+        await create_job(
+            session,
+            job_id="job-enrichment-test",
+            job_handle=job_handle,
+            obs_handle="obs_enrichment",
+            provider="harmony",
+            request_spec=spec,
+        )
+
+    status = await get_retrieval_status(
+        job_handle, workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+
+    assert status["short_name"] == "MOD13Q1"
+    assert status["variables"] == ["NDVI"]
+    assert status["time_range"] == "2024-01-01T00:00:00Z/2024-03-31T00:00:00Z"
+    assert status["provider"] == "harmony"
+    assert status["output_format"] == "application/netcdf4"
+    assert status["granule_count"] == 2
+
+    # aoi_bbox is None in this spec (a global time-series) -- omitted, not null.
+    assert "aoi_bbox" not in status
+
+    # The raw opendap_urls list never crosses the wire.
+    assert "opendap_urls" not in status
+    assert "opendap_url" not in status
+
+
+async def test_get_status_omits_absent_enrichment_fields_entirely(
+    workspace_store, session_factory, workspace_id,
+) -> None:
+    """A spec that never set ``variables``/``provider`` (a legacy/minimal row)
+    omits those keys rather than emitting them as ``null`` — a consumer never
+    has to special-case a null field it wasn't expecting."""
+    job_handle = await workspace_store.put_handle(
+        workspace_id, HandleType.JOB, payload={"obs_handle": "obs_minimal"}
+    )
+    spec = {"concept_id": _CONCEPT_ID, "output_format": "application/netcdf4"}
+    async with session_factory() as session:
+        await create_job(
+            session,
+            job_id="job-minimal-spec-test",
+            job_handle=job_handle,
+            obs_handle="obs_minimal",
+            provider="harmony",
+            request_spec=spec,
+        )
+
+    status = await get_retrieval_status(
+        job_handle, workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+
+    for key in ("short_name", "variables", "aoi_bbox", "time_range", "provider", "granule_count"):
+        assert key not in status
+    assert status["output_format"] == "application/netcdf4"
+
+
 # -- cancel_retrieval ------------------------------------------------------
 
 
@@ -1464,6 +1557,10 @@ async def test_cancel_pending_job(
     grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
     workspace_id,
 ) -> None:
+    """A ``pending`` job was never submitted to its provider (``enqueue_fn`` is
+    mocked — the worker's ``submit_job`` never ran, so ``provider_job_url`` is
+    still unset). PRD 021: there is genuinely nothing upstream to cancel, so
+    ``upstream`` is "unsupported" and no provider is ever constructed."""
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
     out = await retrieve_data(
@@ -1477,6 +1574,7 @@ async def test_cancel_pending_job(
     )
     assert res["status"] == JobState.CANCELLED.value
     assert res["cancelled"] is True
+    assert res["upstream"] == "unsupported"
 
     async with session_factory() as session:
         job = await get_job_by_handle(session, out["job_handle"])
@@ -1529,7 +1627,10 @@ async def test_cancel_terminal_job_is_noop(
     """Cancelling an already-terminal job is a soft no-op, not a raised error:
     job state can change between when a caller decides to cancel and when the
     call lands (e.g. it just finished or failed), so the caller's intent
-    ("stop this job") is already satisfied — there is nothing illegal here."""
+    ("stop this job") is already satisfied — there is nothing illegal here.
+    PRD 021: this is exactly the "terminal-before-call" case, so the response
+    also carries ``upstream: "already_terminal"`` — no provider call is made,
+    the job simply already reached this state before ``cancel_retrieval`` ran."""
     ds = await _seed_dataset(workspace_store, workspace_id)
     aoi = await _seed_aoi(workspace_store, workspace_id)
     out = await retrieve_data(
@@ -1550,6 +1651,7 @@ async def test_cancel_terminal_job_is_noop(
         "job_handle": out["job_handle"],
         "status": terminal_state.value,
         "cancelled": False,
+        "upstream": "already_terminal",
     }
 
     # The job's actual state is untouched — cancelling "ready" must not flip it
@@ -1612,6 +1714,118 @@ async def test_cancel_orphan_handle_returns_distinct_not_found(
         store=workspace_store, session_factory=session_factory,
     )
     assert res["message"] != unknown_res["message"]
+
+
+# -- cancel_retrieval: provider-side cancel (PRD 021) -----------------------
+
+
+async def test_cancel_running_job_requests_provider_cancel(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """Once a job has actually been submitted (a ``provider_job_url`` is on the
+    row), cancelling it both flips local state to CANCELLED *and* attempts a
+    best-effort provider-side cancel via the injected ``provider_factory``."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+        job.state = JobState.RUNNING.value
+        job.provider_job_url = "https://harmony.earthdata.nasa.gov/jobs/abc-123"
+        await session.commit()
+
+    fake_provider = AsyncMock()
+
+    res = await cancel_retrieval(
+        out["job_handle"], workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+        provider_factory=lambda spec: fake_provider,
+    )
+
+    assert res["cancelled"] is True
+    assert res["status"] == JobState.CANCELLED.value
+    assert res["upstream"] == "requested"
+    fake_provider.cancel.assert_awaited_once()
+    ref = fake_provider.cancel.call_args.args[0]
+    assert ref.provider_job_id == "abc-123"
+    assert ref.provider == "harmony"
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    assert job.state == JobState.CANCELLED.value
+
+
+async def test_cancel_running_job_provider_error_is_non_fatal(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """A raising provider cancel never fails the tool: the local cancel has
+    already committed and stays committed, and the response reports
+    ``upstream: "error"`` instead of raising out of ``cancel_retrieval``."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+        job.state = JobState.RUNNING.value
+        job.provider_job_url = "https://harmony.earthdata.nasa.gov/jobs/abc-123"
+        await session.commit()
+
+    fake_provider = AsyncMock()
+    fake_provider.cancel.side_effect = RuntimeError("harmony unreachable")
+
+    res = await cancel_retrieval(
+        out["job_handle"], workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+        provider_factory=lambda spec: fake_provider,
+    )
+
+    assert res["cancelled"] is True
+    assert res["status"] == JobState.CANCELLED.value
+    assert res["upstream"] == "error"
+
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+    assert job.state == JobState.CANCELLED.value
+
+
+async def test_cancel_opendap_job_is_unsupported_upstream(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """OPeNDAP is synchronous — no durable upstream job — so cancelling a
+    running OPeNDAP job reports ``upstream: "unsupported"`` without ever
+    constructing a provider."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    out = await retrieve_data(
+        ds, aoi, _TIME, workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    async with session_factory() as session:
+        job = await get_job_by_handle(session, out["job_handle"])
+        job.state = JobState.RUNNING.value
+        job.provider = "opendap"
+        job.provider_job_url = "https://opendap.example/g1.dap.nc4?dap4.ce=x"
+        await session.commit()
+
+    def _must_not_be_called(spec):
+        raise AssertionError("opendap must never build a cancel provider")
+
+    res = await cancel_retrieval(
+        out["job_handle"], workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+        provider_factory=_must_not_be_called,
+    )
+    assert res["cancelled"] is True
+    assert res["upstream"] == "unsupported"
 
 
 # -- variable path resolution wired through planning -----------------------
