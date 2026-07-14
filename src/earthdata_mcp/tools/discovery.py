@@ -20,6 +20,7 @@ from earthdata_mcp.catalog.enrichment import enrich_collection
 from earthdata_mcp.catalog.kms import KMSCatalog
 from earthdata_mcp.db import create_engine, create_session_factory
 from earthdata_mcp.providers.cmr import CMRProvider
+from earthdata_mcp.providers.identity import parse_edl_token
 from earthdata_mcp.workspace.models import HandleType
 from earthdata_mcp.workspace.store import WorkspaceStore
 
@@ -59,6 +60,7 @@ async def search_datasets(
     query: str,
     filters: dict[str, Any] | None = None,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
@@ -68,8 +70,12 @@ async def search_datasets(
 
     Returns ``{"datasets": [{"handle", "summary"}], "count": n}``. ``filters`` is
     an optional dict of CMR collection-search params (see ``_ALLOWED_FILTERS``).
+    ``edl_token`` (PRD 022) makes the CMR query run as that identity (restricted
+    collections follow the caller's own entitlements); absent means today's
+    anonymous search, unchanged.
     """
-    cmr = cmr or CMRProvider()
+    identity = parse_edl_token(edl_token)
+    cmr = cmr or CMRProvider(edl_token=identity.token if identity else None)
     kms = kms or KMSCatalog()
     store = store or _default_store()
 

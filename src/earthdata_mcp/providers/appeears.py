@@ -91,6 +91,7 @@ class AppEEARSProvider:
         settings: Settings | None = None,
         timeout: float = 60.0,
         on_progress: object | None = None,
+        edl_token: str | None = None,
     ) -> None:
         self._caps = capabilities
         self._storage = storage
@@ -99,6 +100,11 @@ class AppEEARSProvider:
         self._timeout = timeout
         self._on_progress = on_progress
         self._appeears_token: str | None = None
+        # Per-call identity (PRD 022): when set, every request carries this
+        # bearer directly and the Basic-login flow below is never entered — a
+        # rejected per-call credential is a classified failure, never a silent
+        # re-login as the service account (identity substitution).
+        self._edl_token = edl_token
 
     # -- capability gate --------------------------------------------------
 
@@ -139,7 +145,9 @@ class AppEEARSProvider:
                 "AppEEARSProvider only handles point/area sample plans "
                 "(needs_point_sample); the router must not dispatch this here"
             )
-        if not (self._settings.edl_username and self._settings.edl_password):
+        if not self._edl_token and not (
+            self._settings.edl_username and self._settings.edl_password
+        ):
             raise ValueError(
                 "AppEEARS submission requires EDL credentials; "
                 "set EDL_USERNAME and EDL_PASSWORD environment variables"
@@ -352,11 +360,18 @@ class AppEEARSProvider:
     async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
         """Send an authenticated request; retry once on 401/403 after re-login.
 
+        With a per-call ``edl_token`` (PRD 022), that bearer rides every
+        request directly and a 401/403 is raised as a classified
+        :class:`~earthdata_mcp.providers.identity.CredentialError` — the
+        service-account re-login below must never quietly substitute the
+        server's identity for the caller's.
+
         ``follow_redirects=True`` is required: AppEEARS bundle file endpoints
         return 302 redirects to pre-signed S3/CloudFront URLs for the actual
         CSV download, so the client must follow them automatically.
         """
-        token = await self._ensure_token()
+        per_call = bool(self._edl_token)
+        token = self._edl_token if per_call else await self._ensure_token()
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {token}"
         async with httpx.AsyncClient(
@@ -364,6 +379,17 @@ class AppEEARSProvider:
         ) as client:
             response = await client.request(method, url, headers=headers, **kwargs)
             if response.status_code in (401, 403):
+                if per_call:
+                    from earthdata_mcp.providers.identity import (
+                        classify_http_response,
+                        parse_edl_token,
+                    )
+
+                    raise classify_http_response(
+                        response.status_code,
+                        response.text,
+                        identity=parse_edl_token(self._edl_token),
+                    )
                 self._appeears_token = None
                 token = await self._login()
                 headers["Authorization"] = f"Bearer {token}"

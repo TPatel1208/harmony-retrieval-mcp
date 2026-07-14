@@ -26,6 +26,7 @@ build lazy process defaults on first use, so importing this module — and
 from __future__ import annotations
 
 from earthdata_mcp.providers.cmr import CMRProvider
+from earthdata_mcp.providers.identity import parse_edl_token
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.tools.retrieval import _default_provenance
 from earthdata_mcp.workspace.handles import resolve_dataset
@@ -37,6 +38,7 @@ from earthdata_mcp.workspace.store import WorkspaceStore
 async def get_provenance(
     handle: str,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     provenance: ProvenanceStore | None = None,
@@ -58,7 +60,11 @@ async def get_provenance(
     emptiness to be misread as a bug. Returns ``{handle, ancestors:
     [{handle, depth}], events: [{event_type, detail, created_at}],
     resolved_handle?, note?}``.
+
+    ``edl_token`` (PRD 022) is accepted for surface uniformity and validated
+    at the boundary; this read touches only Postgres.
     """
+    parse_edl_token(edl_token)
     store = store or _default_store()
     provenance = provenance or _default_provenance()
 
@@ -99,6 +105,7 @@ async def get_provenance(
 async def cite_dataset(
     dataset_handle: str,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     cmr: CMRProvider | None = None,
@@ -110,8 +117,9 @@ async def cite_dataset(
     strings come from CMR's records, never hand-rolled. Graceful when a collection
     publishes no DOI or citations — empty fields, never an error.
     """
+    identity = parse_edl_token(edl_token)
     store = store or _default_store()
-    cmr = cmr or CMRProvider()
+    cmr = cmr or CMRProvider(edl_token=identity.token if identity else None)
 
     concept_id = await resolve_dataset(store, workspace_id, dataset_handle)
     citations = await cmr.get_citations(concept_id)

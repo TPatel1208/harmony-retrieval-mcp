@@ -89,6 +89,7 @@ class OPeNDAPProvider:
         storage: StorageBackend | None = None,
         settings: Settings | None = None,
         timeout: float = 300.0,
+        edl_token: str | None = None,
     ) -> None:
         self._caps = capabilities
         # The window's granule OPeNDAP base URLs (sans the .dap.nc4 suffix). In
@@ -120,6 +121,9 @@ class OPeNDAPProvider:
         self._storage = storage
         self._settings = settings or get_settings()
         self._timeout = timeout
+        # Per-call identity (PRD 022): a per-instance bearer that wins over the
+        # env token in _auth_headers — no process-env mutation, no earthaccess.
+        self._edl_token = edl_token
 
     # -- capability gate --------------------------------------------------
 
@@ -286,7 +290,7 @@ class OPeNDAPProvider:
             raise
 
     def _auth_headers(self) -> dict[str, str]:
-        token = self._settings.earthdata_token or None
+        token = self._edl_token or self._settings.earthdata_token or None
         return {"Authorization": f"Bearer {token}"} if token else {}
 
     def _storage_backend(self) -> StorageBackend:

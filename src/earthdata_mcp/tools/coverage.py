@@ -22,6 +22,7 @@ from __future__ import annotations
 from earthdata_mcp.config import Settings, get_settings
 from earthdata_mcp.providers.base import normalize_time_range
 from earthdata_mcp.providers.cmr import CMRProvider
+from earthdata_mcp.providers.identity import parse_edl_token
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.handles import resolve_aoi, resolve_dataset
 from earthdata_mcp.workspace.store import WorkspaceStore
@@ -57,6 +58,7 @@ async def check_coverage(
     aoi_handle: str,
     time_range: str,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
@@ -77,7 +79,8 @@ async def check_coverage(
     is rejected before any CMR call. Pass the literal ``"all"`` to query the
     whole archive deliberately — the response then carries ``all_time: true``.
     """
-    cmr = cmr or CMRProvider()
+    identity = parse_edl_token(edl_token)
+    cmr = cmr or CMRProvider(edl_token=identity.token if identity else None)
     store = store or _default_store()
     temporal, all_time = _coverage_time_window(time_range)
 
@@ -119,6 +122,7 @@ async def check_availability(
     aoi_handle: str,
     time_range: str,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
@@ -130,7 +134,8 @@ async def check_availability(
     is rejected before any CMR call. Pass the literal ``"all"`` to query the
     whole archive deliberately — the response then carries ``all_time: true``.
     """
-    cmr = cmr or CMRProvider()
+    identity = parse_edl_token(edl_token)
+    cmr = cmr or CMRProvider(edl_token=identity.token if identity else None)
     store = store or _default_store()
     temporal, all_time = _coverage_time_window(time_range)
 
@@ -156,6 +161,7 @@ async def inspect_granules(
     time_range: str,
     workspace_id: str = DEFAULT_WORKSPACE,
     limit: int = 10,
+    edl_token: str | None = None,
     *,
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
@@ -167,7 +173,8 @@ async def inspect_granules(
     is rejected before any CMR call. Pass the literal ``"all"`` to query the
     whole archive deliberately — the response then carries ``all_time: true``.
     """
-    cmr = cmr or CMRProvider()
+    identity = parse_edl_token(edl_token)
+    cmr = cmr or CMRProvider(edl_token=identity.token if identity else None)
     store = store or _default_store()
     temporal, all_time = _coverage_time_window(time_range)
 
@@ -195,6 +202,7 @@ async def estimate_retrieval_size(
     aoi_handle: str,
     time_range: str,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
@@ -222,7 +230,8 @@ async def estimate_retrieval_size(
     (and, being unbounded, is exactly the case this tool's size warning exists
     to catch).
     """
-    cmr = cmr or CMRProvider()
+    identity = parse_edl_token(edl_token)
+    cmr = cmr or CMRProvider(edl_token=identity.token if identity else None)
     store = store or _default_store()
     settings = settings or get_settings()
     temporal, all_time = _coverage_time_window(time_range)

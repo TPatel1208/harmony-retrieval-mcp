@@ -14,9 +14,10 @@ dependencies lazily, on first call, never at import.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from fastmcp import FastMCP
+from pydantic import Field
 from starlette.middleware import Middleware
 
 from earthdata_mcp.config import get_settings
@@ -36,12 +37,31 @@ from earthdata_mcp.tools import (
 
 mcp = FastMCP("earthdata-mcp")
 
+#: The uniform per-call identity parameter (PRD 022), advertised on every
+#: workspace-scoped tool's input schema so a consumer can feature-detect
+#: support at connect time. Consumer-supplied, never model-supplied (the
+#: consumer strips it from model-facing schemas, like ``workspace_id``);
+#: absent/empty means the server's environment credential — byte-for-byte
+#: today's behavior.
+EdlToken = Annotated[
+    str | None,
+    Field(
+        description=(
+            "Optional per-user Earthdata Login bearer token. Consumer-supplied, "
+            "never model-supplied. When present, this call (and any durable job "
+            "it spawns) authenticates to NASA as that token's identity; absent "
+            "means the server's environment credential."
+        )
+    ),
+]
+
 
 @mcp.tool
 async def search_datasets(
     query: str,
     filters: dict[str, Any] | None = None,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Search NASA Earthdata collections; mint a ``dataset_`` handle per result.
 
@@ -49,7 +69,7 @@ async def search_datasets(
     an optional dict of CMR collection-search params (e.g. ``temporal``,
     ``bounding_box``, ``provider``, ``limit``).
     """
-    return await discovery.search_datasets(query, filters, workspace_id)
+    return await discovery.search_datasets(query, filters, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -57,6 +77,7 @@ async def describe_dataset(
     dataset_handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
     detail: bool = False,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Resolve a ``dataset_`` handle to its metadata, variables, and advisory notes.
 
@@ -66,13 +87,14 @@ async def describe_dataset(
     core collection identification fields only). Pass ``detail=True`` for the
     full per-variable UMM-Var enrichment and the complete collection metadata.
     """
-    return await understanding.describe_dataset(dataset_handle, workspace_id, detail)
+    return await understanding.describe_dataset(dataset_handle, workspace_id, detail, edl_token=edl_token)
 
 
 @mcp.tool
 async def define_area_of_interest(
     location: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Define an area of interest and mint an ``aoi_`` handle.
 
@@ -88,7 +110,7 @@ async def define_area_of_interest(
     is ``{"type", "vertex_count"}`` (or ``None``); resolve the handle for the
     full geometry.
     """
-    return await area.define_area_of_interest(location, workspace_id)
+    return await area.define_area_of_interest(location, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -97,10 +119,11 @@ async def check_coverage(
     aoi_handle: str,
     time_range: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Check granule coverage for a dataset/AOI/time. Returns a count + sample granules."""
     return await coverage.check_coverage(
-        dataset_handle, aoi_handle, time_range, workspace_id
+        dataset_handle, aoi_handle, time_range, workspace_id, edl_token=edl_token
     )
 
 
@@ -110,10 +133,11 @@ async def check_availability(
     aoi_handle: str,
     time_range: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Fast count-only availability check — no granule data fetched."""
     return await coverage.check_availability(
-        dataset_handle, aoi_handle, time_range, workspace_id
+        dataset_handle, aoi_handle, time_range, workspace_id, edl_token=edl_token
     )
 
 
@@ -124,10 +148,11 @@ async def inspect_granules(
     time_range: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
     limit: int = 10,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Return granule records for a dataset/AOI/time (up to ``limit``, CMR-capped at 50)."""
     return await coverage.inspect_granules(
-        dataset_handle, aoi_handle, time_range, workspace_id, limit=limit
+        dataset_handle, aoi_handle, time_range, workspace_id, limit=limit, edl_token=edl_token
     )
 
 
@@ -137,10 +162,11 @@ async def estimate_retrieval_size(
     aoi_handle: str,
     time_range: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Estimate total retrieval size by sampling up to 50 granules' reported sizes."""
     return await coverage.estimate_retrieval_size(
-        dataset_handle, aoi_handle, time_range, workspace_id
+        dataset_handle, aoi_handle, time_range, workspace_id, edl_token=edl_token
     )
 
 
@@ -151,6 +177,7 @@ async def retrieve_data(
     time_range: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
     output_format: str | None = None,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Retrieve a dataset over an AOI + time window as a durable job.
 
@@ -159,7 +186,7 @@ async def retrieve_data(
     collection's shape (gridded → Zarr) unless ``output_format`` is given.
     """
     return await retrieval.retrieve_data(
-        dataset_handle, aoi_handle, time_range, workspace_id, output_format
+        dataset_handle, aoi_handle, time_range, workspace_id, output_format, edl_token=edl_token
     )
 
 
@@ -171,6 +198,7 @@ async def retrieve_subset(
     variables: list[str],
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
     output_format: str | None = None,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Retrieve a variable + bbox + temporal subset as a durable job.
 
@@ -179,7 +207,7 @@ async def retrieve_subset(
     OPeNDAP is the worker's runtime fallback. Returns the job/obs handles.
     """
     return await retrieval.retrieve_subset(
-        dataset_handle, aoi_handle, time_range, variables, workspace_id, output_format
+        dataset_handle, aoi_handle, time_range, variables, workspace_id, output_format, edl_token=edl_token
     )
 
 
@@ -192,6 +220,7 @@ async def retrieve_timeseries(
     output_format: str | None = None,
     aoi_handle: str | None = None,
     point_sample: bool = False,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Retrieve a variable time-series as a durable job; the AOI is optional.
 
@@ -205,7 +234,7 @@ async def retrieve_timeseries(
         workspace_id,
         output_format,
         aoi_handle,
-        point_sample,
+        point_sample, edl_token=edl_token
     )
 
 
@@ -213,6 +242,7 @@ async def retrieve_timeseries(
 async def get_retrieval_status(
     job_handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Read a retrieval job's durable state from Postgres (status/progress/error).
 
@@ -225,13 +255,14 @@ async def get_retrieval_status(
     ``{job_handle, status: "not_found", message}`` answer, not an error — a
     missing job is a valid answer to "what's this job's status?".
     """
-    return await retrieval.get_retrieval_status(job_handle, workspace_id)
+    return await retrieval.get_retrieval_status(job_handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
 async def cancel_retrieval(
     job_handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Cancel a non-terminal retrieval job.
 
@@ -254,7 +285,7 @@ async def cancel_retrieval(
     error: it returns ``{job_handle, status: "not_found", cancelled: False,
     message}`` — "stop this job" on a gone job is already satisfied.
     """
-    return await retrieval.cancel_retrieval(job_handle, workspace_id)
+    return await retrieval.cancel_retrieval(job_handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -264,6 +295,7 @@ async def preview_dataset(
     aoi_handle: str | None = None,
     layer: str | None = None,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Build a GIBS visual preview reference for a dataset; mint a ``preview_`` handle.
 
@@ -271,7 +303,7 @@ async def preview_dataset(
     made — ``gibs_url`` is a request the agent or a browser can fetch.
     """
     return await preview.preview_dataset(
-        dataset_handle, time_range, aoi_handle, layer, workspace_id
+        dataset_handle, time_range, aoi_handle, layer, workspace_id, edl_token=edl_token
     )
 
 
@@ -279,9 +311,10 @@ async def preview_dataset(
 async def summarize_dataset(
     handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Structural summary of a ``dataset_`` (metadata) or materialized ``obs_``/``cube_``."""
-    return await preview.summarize_dataset(handle, workspace_id)
+    return await preview.summarize_dataset(handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -289,9 +322,10 @@ async def inspect_statistics(
     handle: str,
     variables: list[str] | None = None,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Descriptive per-variable statistics (min/max/mean/std/count) over a result."""
-    return await preview.inspect_statistics(handle, variables, workspace_id)
+    return await preview.inspect_statistics(handle, variables, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -301,10 +335,11 @@ async def subset(
     variables: list[str] | None = None,
     time_range: str | None = None,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Spatial/variable/temporal subset of a materialized result → a ``cube_`` handle."""
     return await transform.subset(
-        source_handle, aoi_handle, variables, time_range, workspace_id
+        source_handle, aoi_handle, variables, time_range, workspace_id, edl_token=edl_token
     )
 
 
@@ -313,9 +348,10 @@ async def reproject(
     source_handle: str,
     crs: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Tag a gridded result with a target CRS → a ``cube_`` handle."""
-    return await transform.reproject(source_handle, crs, workspace_id)
+    return await transform.reproject(source_handle, crs, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -324,10 +360,11 @@ async def resample(
     time_freq: str | None = None,
     spatial_factor: int | None = None,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Temporal and/or spatial resampling of a gridded result → a ``cube_`` handle."""
     return await transform.resample(
-        source_handle, time_freq, spatial_factor, workspace_id
+        source_handle, time_freq, spatial_factor, workspace_id, edl_token=edl_token
     )
 
 
@@ -336,6 +373,7 @@ async def convert_format(
     source_handle: str,
     output_format: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Re-serialize a materialized result to a different media type → a ``cube_`` handle.
 
@@ -343,7 +381,7 @@ async def convert_format(
     their media-type spellings), case-insensitive. CSV requires a tabular (point)
     source; netCDF requires a gridded source — each raises a clear error otherwise.
     """
-    return await transform.convert_format(source_handle, output_format, workspace_id)
+    return await transform.convert_format(source_handle, output_format, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -351,15 +389,17 @@ async def align(
     source_handles: list[str],
     method: str = "outer",
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Align ≥2 gridded results to a common grid → a ``cube_`` handle + alignment report."""
-    return await transform.align(source_handles, method, workspace_id=workspace_id)
+    return await transform.align(source_handles, method, workspace_id=workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
 async def export_result(
     handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Resolve a materialized ``obs_``/``cube_`` handle to an openable URI.
 
@@ -373,13 +413,14 @@ async def export_result(
     instead of raising; an unknown or cross-workspace handle collapses to the
     same ``not_found`` answer so existence never leaks.
     """
-    return await export.export_result(handle, workspace_id)
+    return await export.export_result(handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
 async def rematerialize(
     handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Re-enqueue the durable job behind an evicted ``obs_`` handle.
 
@@ -393,13 +434,14 @@ async def rematerialize(
     ``cube_``) or an unknown/cross-workspace handle answers a structured
     ``{status: "not_found"}`` rather than raising.
     """
-    return await export.rematerialize(handle, workspace_id)
+    return await export.rematerialize(handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
 async def get_provenance(
     handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Return a handle's lineage: its ancestry graph (recursive CTE) and events.
 
@@ -413,13 +455,14 @@ async def get_provenance(
     resolved_handle?, note?}`` scoped to the workspace — lineage never crosses a
     workspace boundary.
     """
-    return await provenance.get_provenance(handle, workspace_id)
+    return await provenance.get_provenance(handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
 async def cite_dataset(
     dataset_handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Official DOI + formal citation strings for a ``dataset_`` handle.
 
@@ -427,13 +470,14 @@ async def cite_dataset(
     hand-rolled. Returns ``{handle, concept_id, doi, doi_authority,
     collection_citations, reference_citation_count}``.
     """
-    return await provenance.cite_dataset(dataset_handle, workspace_id)
+    return await provenance.cite_dataset(dataset_handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
 async def list_workspace(
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
     handle_type: str | None = None,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Re-enumerate a workspace's handles — for a consumer reconnecting after a
     restart or page reload, with no conversation history to replay them from.
@@ -443,7 +487,7 @@ async def list_workspace(
     created_at, summary}]}``, oldest first; ``summary`` is a small type-specific
     slice of the handle's payload, not the full payload.
     """
-    return await workspace.list_workspace(workspace_id, handle_type)
+    return await workspace.list_workspace(workspace_id, handle_type, edl_token=edl_token)
 
 
 def main() -> None:

@@ -40,3 +40,25 @@ async def test_align_forwards_workspace_id_by_keyword(monkeypatch) -> None:
     assert captured["snap_time_freq"] is None
     # The bug's mirror image: workspace_id falls back to the default instead.
     assert captured["workspace_id"] == "ws-123"
+
+
+# -- PRD 022: every workspace-scoped tool advertises optional edl_token ------
+
+
+async def test_every_workspace_scoped_tool_advertises_optional_edl_token() -> None:
+    """The consumer's deployment hinge (PRD 022): it feature-detects per-user
+    identity support from the advertised schemas, so ``edl_token`` must appear
+    on every tool that carries ``workspace_id`` — always optional (a hard
+    requirement would force lockstep deploys) and documented as
+    consumer-supplied."""
+    tools = await server.mcp.list_tools()
+    assert len(tools) >= 25
+
+    for tool in tools:
+        schema = tool.parameters
+        properties = schema.get("properties") or {}
+        assert "workspace_id" in properties, tool.name  # every tool is workspace-scoped
+        assert "edl_token" in properties, tool.name
+        assert "edl_token" not in (schema.get("required") or []), tool.name
+        description = properties["edl_token"].get("description", "")
+        assert "onsumer-supplied" in description, tool.name

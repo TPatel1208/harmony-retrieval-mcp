@@ -76,11 +76,21 @@ def _message_from_body(response: httpx.Response) -> str:
 class CMRProvider:
     """A ``MetadataProvider`` over CMR's public search API. Metadata only."""
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self, settings: Settings | None = None, *, edl_token: str | None = None
+    ) -> None:
         self._settings = settings or get_settings()
         self._cmr_base = self._settings.cmr_url.rstrip("/")
         self._harmony_base = self._settings.harmony_url.rstrip("/")
         self._headers = {"Client-Id": self._settings.cmr_client_id}
+        # Per-call identity (PRD 022): when set, every CMR query carries this
+        # bearer (restricted-collection visibility follows the caller's own
+        # entitlements) and the Harmony-capabilities/DMR fetches below prefer it
+        # over the env token. When absent, behavior is byte-for-byte today's:
+        # anonymous CMR search, env token for the Bearer-gated fetches.
+        self._edl_token = edl_token
+        if edl_token:
+            self._headers["Authorization"] = f"Bearer {edl_token.strip()}"
 
     def capabilities(self) -> ProviderCapabilities:
         """CMR is a **metadata-only** provider — it mints no retrieval formats.
@@ -414,7 +424,7 @@ class CMRProvider:
         url = f"{self._harmony_base}/capabilities"
         params = {"collectionid": concept_id, "format": "json"}
         headers: dict[str, str] = {}
-        token = self._settings.earthdata_token
+        token = self._edl_token or self._settings.earthdata_token
         if token:
             headers["Authorization"] = f"Bearer {token.strip()}"
         try:
@@ -442,7 +452,7 @@ class CMRProvider:
         """
         url = f"{opendap_url.rstrip('/')}.dmr.xml"
         headers: dict[str, str] = {}
-        token = self._settings.earthdata_token
+        token = self._edl_token or self._settings.earthdata_token
         if token:
             headers["Authorization"] = f"Bearer {token.strip()}"
         try:

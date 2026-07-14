@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, func, text
+from sqlalchemy import Boolean, DateTime, Integer, String, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -54,6 +54,12 @@ class Job(Base):
     last_polled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
+    # The per-call EDL credential this job runs under (PRD 022), Fernet-encrypted
+    # under the repo-private EARTHDATA_CREDENTIAL_KEY — written at enqueue when a
+    # token was supplied, decrypted by the worker per attempt, and nulled by
+    # ``crud.set_state`` the moment the job reaches any terminal state so tokens
+    # never accumulate at rest. NULL means the env-credential fallback.
+    credential_encrypted: Mapped[str | None] = mapped_column(String, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -62,20 +68,43 @@ class Job(Base):
     )
 
 
+class CollectionAccess(Base):
+    """Durable access-restriction memory per collection (PRD 022 cache scoping).
+
+    A EULA-classified failure observed for a collection marks it restricted
+    here, so future result-reuse/dedupe scoping decisions treat it as
+    restricted even when CMR's own metadata doesn't say so.
+    """
+
+    __tablename__ = "collection_access"
+
+    concept_id: Mapped[str] = mapped_column(String, primary_key=True)
+    restricted: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 async def create_jobs_schema(engine: AsyncEngine) -> None:
-    """Create the durable ``jobs`` table (idempotent).
+    """Create the durable ``jobs`` (+ ``collection_access``) tables (idempotent).
 
     Phase 6 owns the jobs table's creation, separate from the workspace schema so
     each is created from its own ``metadata``. ``create_all`` only creates a
     missing table — it never alters an existing one — so a column added to the
-    model after a table already exists (``last_polled_at``, PRD 012) needs its
-    own idempotent ``ADD COLUMN IF NOT EXISTS`` alongside it. One column doesn't
+    model after a table already exists (``last_polled_at``, PRD 012;
+    ``credential_encrypted``, PRD 022) needs its own idempotent
+    ``ADD COLUMN IF NOT EXISTS`` alongside it. A couple of columns don't
     warrant a migration framework.
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.execute(
             text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ")
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS credential_encrypted VARCHAR"
+            )
         )
 
 

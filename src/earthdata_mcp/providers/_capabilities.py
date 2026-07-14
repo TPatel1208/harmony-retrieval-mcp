@@ -78,6 +78,11 @@ class CollectionCapabilities:
     spatial_extent: tuple[float, float, float, float] | None = None
     capabilities_version: str = ""
     advisory: list[str] = field(default_factory=list)
+    #: CMR-reported access restriction (PRD 022 cache scoping): ``False`` means
+    #: the UMM-C record was read and carries no access/EULA constraint (result
+    #: reuse may cross identities); ``True`` means it does; ``None`` means the
+    #: record was unavailable — unknown scopes conservatively, per-identity.
+    access_restricted: bool | None = None
 
     def find_service(self, plan: RetrievalPlan) -> ServiceCapability | None:
         """A SINGLE service must satisfy the ENTIRE plan. Never union across services."""
@@ -123,6 +128,7 @@ class CollectionCapabilities:
             spatial_extent=layer1["spatial_extent"],
             capabilities_version=str(harmony_caps.get("capabilitiesVersion", "")),
             advisory=layer1["advisory"],
+            access_restricted=layer1["access_restricted"],
         )
 
 
@@ -173,6 +179,7 @@ def umm_c_layer(umm_c: dict) -> dict:
         "direct_s3": _direct_s3(umm_c),
         "advisory": _advisory(umm_c),
         "spatial_extent": _spatial_extent(umm_c),
+        "access_restricted": _access_restricted(umm_c),
     }
 
 
@@ -238,6 +245,26 @@ def _spatial_extent(
             lats = [float(p["Latitude"]) for p in points]
             return (min(lons), min(lats), max(lons), max(lats))
     return None
+
+
+def _access_restricted(umm_c: dict) -> bool | None:
+    """CMR's word on whether this collection's access is restricted (PRD 022).
+
+    ``True`` when UMM-C carries ``AccessConstraints``, EULA identifiers, or an
+    explicit ``FreeAndOpenData: false``; ``False`` when the record was read and
+    carries none of those; ``None`` (unknown) when there is no UMM-C record to
+    read — the conservative case cache scoping treats as restricted.
+    """
+    if not umm_c:
+        return None
+    if umm_c.get("AccessConstraints"):
+        return True
+    use = umm_c.get("UseConstraints") or {}
+    if use.get("EULAIdentifiers"):
+        return True
+    if use.get("FreeAndOpenData") is False:
+        return True
+    return False
 
 
 def _advisory(umm_c: dict) -> list[str]:

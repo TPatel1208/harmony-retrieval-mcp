@@ -35,7 +35,17 @@ from earthdata_mcp.jobs.models import Job
 from earthdata_mcp.jobs.state import TERMINAL_STATES, JobState
 from earthdata_mcp.providers.base import JobRef, RetrievalProvider
 from earthdata_mcp.providers.cmr import CMRProvider
+from earthdata_mcp.providers.identity import (
+    EULA_NOT_ACCEPTED,
+    CredentialError,
+    EDLIdentity,
+    TokenExpiredError,
+    classify_credential_failure,
+    decrypt_credential,
+    parse_edl_token,
+)
 from earthdata_mcp.providers.request_spec import InvalidSpecError, RequestSpec
+from earthdata_mcp.redaction import redact
 from earthdata_mcp.storage import get_storage_backend
 from earthdata_mcp.workspace.models import ProvenanceEventType
 from earthdata_mcp.workspace.provenance import ProvenanceStore
@@ -148,6 +158,7 @@ async def _fail_job(
     *,
     error_prefix: str | None = None,
     classification: str | None = None,
+    detail_extra: dict[str, Any] | None = None,
 ) -> None:
     """The one choke point every lifecycle task's exception handler routes
     through on its way to ``FAILED``: persists the stage- and provider-prefixed
@@ -163,8 +174,11 @@ async def _fail_job(
     ``"<stage>/<provider> failed"`` prefix for a branch (like the
     no-OPeNDAP-fallback case) that already has its own explanatory prefix to
     preserve verbatim. ``classification`` (PRD 002) tags the submit-failure
-    branch that led here (``invalid_request`` vs ``infrastructure``) so the
-    provenance trail explains *why* fallback was or wasn't attempted.
+    branch that led here (``invalid_request`` vs ``infrastructure``; since
+    PRD 022 also ``TOKEN_EXPIRED``/``TOKEN_INVALID``/``EULA_NOT_ACCEPTED``) so
+    the provenance trail explains *why* fallback was or wasn't attempted.
+    ``detail_extra`` merges extra keys (e.g. a EULA ``resolution_url``) into
+    the provenance detail.
     """
     message = _exc_message(exc)
     prefix = error_prefix if error_prefix is not None else f"{stage}/{spec.provider} failed"
@@ -182,6 +196,8 @@ async def _fail_job(
     }
     if classification is not None:
         detail["classification"] = classification
+    if detail_extra:
+        detail.update(detail_extra)
     await _record_event_safe(
         ctx, job_id, spec.workspace_id, spec.obs_handle, ProvenanceEventType.JOB_FAILED, detail
     )
@@ -217,11 +233,13 @@ def _exc_message(exc: BaseException) -> str:
     e.g. ``('Unprocessable Entity', 'Error: the requested combination of
     operations...')`` — a raw Python tuple leaking straight into a job's stored
     ``error`` and from there to the MCP client. Joining the args reads as one
-    sentence instead.
+    sentence instead. Redacted (PRD 022): a provider error echoing request
+    headers or arguments must never carry a registered credential into the
+    durable ``error`` column or the MCP client.
     """
     if len(exc.args) > 1:
-        return ": ".join(str(a) for a in exc.args)
-    return str(exc) or type(exc).__name__
+        return redact(": ".join(str(a) for a in exc.args))
+    return redact(str(exc) or type(exc).__name__)
 
 
 #: HTTP reason phrases (lowercased) harmony-py's ``_handle_error_response``
@@ -260,6 +278,92 @@ def _classify_submit_failure(exc: BaseException) -> str:
     return "infrastructure"
 
 
+# -- per-job credential (PRD 022) --------------------------------------------
+
+
+async def _load_job_identity(
+    ctx: dict[str, Any],
+    job_id: str,
+    spec: RequestSpec,
+    stage: str,
+    credential_encrypted: str | None,
+) -> EDLIdentity | None:
+    """Decrypt this attempt's per-job credential into an identity handle.
+
+    ``None`` means the env-credential fallback (no credential persisted). Any
+    failure — an undecryptable blob (key rotated away), a malformed token, or
+    a token that expired mid-job (EDL tokens live 60 days; a late retry is a
+    real path) — fails the job *here*, before any provider is built, with its
+    credential classification when it has one, and re-raises. The caller never
+    proceeds: a job started as one identity must terminate rather than
+    silently degrade to the service account (PRD 022 Further Notes).
+    """
+    if not credential_encrypted:
+        return None
+    try:
+        token = decrypt_credential(credential_encrypted)
+        identity = parse_edl_token(token)
+        if identity is not None and identity.is_expired():
+            raise TokenExpiredError(
+                "the job's stored credential has expired mid-job — renew the "
+                "token at Earthdata Login and retry the retrieval"
+            )
+        return identity
+    except BaseException as exc:
+        await _fail_job(
+            ctx,
+            job_id,
+            spec,
+            stage,
+            exc,
+            error_prefix="job credential unusable",
+            classification=getattr(exc, "classification", None),
+        )
+        raise
+
+
+async def _fail_classified_credential(
+    ctx: dict[str, Any],
+    job_id: str,
+    spec: RequestSpec,
+    stage: str,
+    credential_exc: CredentialError,
+) -> None:
+    """Terminate a job on a classified credential failure (PRD 022).
+
+    A EULA-classified failure additionally marks the collection restricted for
+    future cache/dedupe scoping decisions. Never triggers the OPeNDAP
+    fallback — the request isn't the problem, the identity's entitlements are,
+    and a different provider would just substitute the wrong identity.
+    """
+    detail_extra: dict[str, Any] | None = None
+    if credential_exc.classification == EULA_NOT_ACCEPTED:
+        await _mark_restricted_safe(ctx, spec.concept_id)
+        if credential_exc.resolution_url:
+            detail_extra = {"resolution_url": credential_exc.resolution_url}
+    await _fail_job(
+        ctx,
+        job_id,
+        spec,
+        stage,
+        credential_exc,
+        classification=credential_exc.classification,
+        detail_extra=detail_extra,
+    )
+
+
+async def _mark_restricted_safe(ctx: dict[str, Any], concept_id: str | None) -> None:
+    """Durably flag a collection restricted, without ever blocking the caller —
+    same log-and-swallow posture as :func:`_record_event_safe`."""
+    if not concept_id:
+        return
+    try:
+        async with _session_factory(ctx)() as session:
+            await crud.mark_collection_restricted(session, concept_id)
+    except Exception:
+        logger.exception("failed to mark collection %s restricted", concept_id)
+
+
 # -- lifecycle tasks --------------------------------------------------------
 
 
@@ -284,12 +388,22 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
         spec = await _load_spec_or_fail(session, job_id, job.request_spec)
         if spec is None:
             return
+        credential_encrypted = job.credential_encrypted
 
-    provider = await _load_provider(spec)
+    identity = await _load_job_identity(ctx, job_id, spec, "submit", credential_encrypted)
+    provider = await _load_provider(spec, edl_token=identity.token if identity else None)
     plan = spec.to_plan()
     try:
         ref = await provider.submit(plan)
     except Exception as exc:
+        # PRD 022: a credential failure is first-class and terminates the job —
+        # checked before the PRD 002 invalid/infrastructure split so an auth
+        # rejection can never be misread as infrastructure and trigger the
+        # OPeNDAP fallback under the wrong identity.
+        credential_exc = classify_credential_failure(exc, identity)
+        if credential_exc is not None:
+            await _fail_classified_credential(ctx, job_id, spec, "submit", credential_exc)
+            raise
         classification = _classify_submit_failure(exc) if spec.provider == "harmony" else None
         if spec.provider == "harmony" and classification == "infrastructure" and spec.opendap_urls:
             logger.warning(
@@ -397,8 +511,10 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
         if spec is None:
             return
         url = job.provider_job_url
+        credential_encrypted = job.credential_encrypted
 
-    provider = await _load_provider(spec)
+    identity = await _load_job_identity(ctx, job_id, spec, "poll", credential_encrypted)
+    provider = await _load_provider(spec, edl_token=identity.token if identity else None)
     ref = JobRef(
         provider=spec.provider,
         provider_job_id=_job_id_from_url(url),
@@ -407,7 +523,11 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
     try:
         status = await provider.poll(ref)
     except Exception as exc:
-        await _fail_job(ctx, job_id, spec, "poll", exc)
+        credential_exc = classify_credential_failure(exc, identity)
+        if credential_exc is not None:
+            await _fail_classified_credential(ctx, job_id, spec, "poll", credential_exc)
+        else:
+            await _fail_job(ctx, job_id, spec, "poll", exc)
         raise
 
     async with session_factory() as session:
@@ -443,8 +563,12 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
         if spec is None:
             return
         url = job.provider_job_url
+        credential_encrypted = job.credential_encrypted
 
-    provider = await _load_provider(spec)
+    identity = await _load_job_identity(
+        ctx, job_id, spec, "materialize", credential_encrypted
+    )
+    provider = await _load_provider(spec, edl_token=identity.token if identity else None)
     ref = JobRef(
         provider=spec.provider,
         provider_job_id=_job_id_from_url(url),
@@ -456,7 +580,17 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
     except BaseException as exc:
         # BaseException catches CancelledError (raised when Arq's job_timeout fires
         # inside asyncio.to_thread) which Exception alone does not.
-        await _fail_job(ctx, job_id, spec, "materialize", exc)
+        credential_exc = (
+            classify_credential_failure(exc, identity)
+            if isinstance(exc, Exception)
+            else None
+        )
+        if credential_exc is not None:
+            await _fail_classified_credential(
+                ctx, job_id, spec, "materialize", credential_exc
+            )
+        else:
+            await _fail_job(ctx, job_id, spec, "materialize", exc)
         raise
 
     # Resolve the pending obs_ handle to the durable storage key (not a URL).
@@ -616,7 +750,9 @@ def _apply_poll(job: Job, status: object) -> str | None:
     return "poll_job"
 
 
-async def _load_provider(spec: RequestSpec) -> RetrievalProvider:
+async def _load_provider(
+    spec: RequestSpec, edl_token: str | None = None
+) -> RetrievalProvider:
     """Fetch fresh capabilities and build this spec's retrieval provider.
 
     The worker owns no provider state — it reconstructs the right provider on
@@ -625,10 +761,12 @@ async def _load_provider(spec: RequestSpec) -> RetrievalProvider:
     blindly. ``providers.build`` owns the spec -> provider mapping itself
     (Harmony, AppEEARS point→Parquet, or OPeNDAP DAP4 subset); an unknown
     provider fails loud there — we never silently fall back to Harmony for a
-    job another provider planned.
+    job another provider planned. ``edl_token`` (PRD 022) is the job's own
+    decrypted per-call credential — threaded into the capabilities fetch and
+    the provider so every attempt runs as the caller's identity.
     """
-    caps = await CMRProvider().collection_capabilities(spec.concept_id)
-    return providers.build(spec, caps)
+    caps = await CMRProvider(edl_token=edl_token).collection_capabilities(spec.concept_id)
+    return providers.build(spec, caps, edl_token=edl_token)
 
 
 def _job_id_from_url(url: str | None) -> str | None:

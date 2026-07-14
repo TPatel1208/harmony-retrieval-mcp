@@ -8,6 +8,7 @@ other handle-resolving tool.
 
 from __future__ import annotations
 
+from earthdata_mcp.providers.identity import parse_edl_token
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.models import HandleType
 from earthdata_mcp.workspace.store import HandleRecord, WorkspaceStore
@@ -16,6 +17,7 @@ from earthdata_mcp.workspace.store import HandleRecord, WorkspaceStore
 async def list_workspace(
     workspace_id: str = DEFAULT_WORKSPACE,
     handle_type: str | None = None,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
 ) -> dict:
@@ -24,7 +26,11 @@ async def list_workspace(
     Returns ``{handles: [{handle, type, created_at, summary}]}``. ``summary`` is a
     small, type-specific slice of the handle's payload — enough to recognize the
     handle without resolving it.
+
+    ``edl_token`` (PRD 022) is accepted for surface uniformity and validated
+    at the boundary; this read touches only Postgres.
     """
+    parse_edl_token(edl_token)
     store = store or _default_store()
     records = await store.list_handles(
         workspace_id, HandleType(handle_type) if handle_type else None

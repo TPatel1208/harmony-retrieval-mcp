@@ -65,6 +65,12 @@ class Settings(BaseSettings):
     edl_username: str = ""
     edl_password: str = ""
     earthdata_token: str = ""
+    # Per-call credential encryption (PRD 022): the repo-private Fernet key the
+    # durable job row's encrypted-credential column is written under — explicitly
+    # a different key than any consumer holds. Comma-separate keys to rotate
+    # (MultiFernet: first key encrypts, all keys decrypt). Empty means per-call
+    # edl_token support is off; the env-credential path needs no key.
+    earthdata_credential_key: str = ""
 
     # Per-provider rate limiting ------------------
     # Token-bucket refill rate in requests/sec at each provider's HTTP boundary.

@@ -31,6 +31,7 @@ import pyarrow.compute as pc
 import xarray as xr
 
 from earthdata_mcp.providers.cmr import CMRProvider
+from earthdata_mcp.providers.identity import parse_edl_token
 from earthdata_mcp.storage import StorageBackend, get_storage_backend
 from earthdata_mcp.tools._dataio import open_result, open_result_lazy
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
@@ -121,6 +122,7 @@ async def preview_dataset(
     aoi_handle: str | None = None,
     layer: str | None = None,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     cmr: CMRProvider | None = None,
@@ -132,6 +134,7 @@ async def preview_dataset(
     made — the returned ``gibs_url`` is for the agent to fetch. The minted handle's
     payload stores the *re-constructible* GIBS spec (layer/bbox/time), not the URL.
     """
+    identity = parse_edl_token(edl_token)
     if handle_type_of(dataset_handle) is not HandleType.DATASET:
         raise ValueError(
             f"preview_dataset expects a dataset_ handle, got {dataset_handle!r}"
@@ -156,7 +159,7 @@ async def preview_dataset(
     else:
         concept_id = record.payload.get("concept_id")
         if concept_id:
-            _cmr = cmr or CMRProvider()
+            _cmr = cmr or CMRProvider(edl_token=identity.token if identity else None)
             cmr_layer, failure = await _discover_gibs_layer(concept_id, _cmr)
             if cmr_layer:
                 resolved_layer = cmr_layer
@@ -267,6 +270,7 @@ def _gibs_url(
 async def summarize_dataset(
     handle: str,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     storage: StorageBackend | None = None,
@@ -279,6 +283,7 @@ async def summarize_dataset(
     that exists but is not yet materialized returns ``status`` with a ``None`` summary
     rather than raising.
     """
+    parse_edl_token(edl_token)
     store = store or _default_store()
     htype = handle_type_of(handle)
 
@@ -390,6 +395,7 @@ async def inspect_statistics(
     handle: str,
     variables: list[str] | None = None,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     storage: StorageBackend | None = None,
@@ -400,6 +406,7 @@ async def inspect_statistics(
     is inspection, not analysis: no correlation, trend, anomaly, or hotspot — those
     are out of scope by PLAN.md rule.
     """
+    parse_edl_token(edl_token)
     store = store or _default_store()
     storage = storage or _default_storage()
 

@@ -114,6 +114,7 @@ class HarmonyProvider:
         settings: Settings | None = None,
         env: "harmony.Environment | None" = None,
         on_progress: Callable[[JobStatus], None] | None = None,
+        edl_token: str | None = None,
     ) -> None:
         self._caps = capabilities
         self._service_name_hint = service_name_hint
@@ -123,6 +124,11 @@ class HarmonyProvider:
         self._storage = storage
         self._env = env
         self._on_progress = on_progress
+        # Per-call identity (PRD 022): when set, the client is built with
+        # harmony-py's explicit ``token=`` argument (no process-env mutation)
+        # and cached per identity; when absent, the env-credential path below
+        # is byte-for-byte today's behavior.
+        self._edl_token = edl_token
 
     # -- capability gate --------------------------------------------------
 
@@ -344,12 +350,23 @@ class HarmonyProvider:
     # -- client / storage construction ------------------------------------
 
     def _client(self) -> "harmony.Client":
-        """Return the injected client, else build one from settings/EDL token."""
+        """Return the injected client, else build one from the per-call token
+        (cached per identity, PRD 022) or from settings/EDL env credentials."""
         if self._injected_client is not None:
             return self._injected_client
         import harmony
 
         env = self._env if self._env is not None else harmony.Environment.PROD
+        if self._edl_token:
+            from earthdata_mcp.providers.identity import get_token_session, parse_edl_token
+
+            identity = parse_edl_token(self._edl_token)
+            session = get_token_session(identity)
+            self._injected_client = session.client_for(
+                f"harmony:{getattr(env, 'name', env)}",
+                lambda: harmony.Client(token=identity.token, env=env),
+            )
+            return self._injected_client
         token = self._settings.earthdata_token or None
         if token:
             self._injected_client = harmony.Client(token=token, env=env)

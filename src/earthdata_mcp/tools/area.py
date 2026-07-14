@@ -38,6 +38,7 @@ from typing import Any
 
 import httpx
 
+from earthdata_mcp.providers.identity import parse_edl_token
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.models import HandleType
 from earthdata_mcp.workspace.store import WorkspaceStore
@@ -81,6 +82,7 @@ _WBD_STOPWORDS: frozenset[str] = frozenset({"river", "basin", "watershed", "regi
 async def define_area_of_interest(
     location: str | dict,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
 ) -> dict:
@@ -95,7 +97,12 @@ async def define_area_of_interest(
     AOI definition should not flood an agent's context. The durable handle
     payload still carries the full ``geojson`` for re-materialization; resolve
     the handle to get it back.
+
+    ``edl_token`` (PRD 022) is accepted for surface uniformity and validated
+    at the boundary; geocoding touches no NASA endpoint, so the identity is
+    not otherwise consulted.
     """
+    parse_edl_token(edl_token)
     store = store or _default_store()
 
     bbox, geojson, source, query = await _resolve_location(location)

@@ -18,7 +18,7 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from earthdata_mcp.jobs.models import Job
+from earthdata_mcp.jobs.models import CollectionAccess, Job
 from earthdata_mcp.jobs.state import (
     TERMINAL_STATES,
     JobState,
@@ -47,8 +47,14 @@ async def create_job(
     obs_handle: str | None,
     provider: str,
     request_spec: dict,
+    credential_encrypted: str | None = None,
 ) -> Job:
-    """Insert a fresh job in ``PENDING`` with its durable, re-materializable spec."""
+    """Insert a fresh job in ``PENDING`` with its durable, re-materializable spec.
+
+    ``credential_encrypted`` (PRD 022) is the per-call EDL credential the job
+    runs under, already Fernet-encrypted — never plaintext, never inside
+    ``request_spec`` (which flows to provenance edges and status enrichment).
+    """
     job = Job(
         job_id=job_id,
         job_handle=job_handle,
@@ -57,6 +63,7 @@ async def create_job(
         request_spec=request_spec,
         state=JobState.PENDING.value,
         progress=0,
+        credential_encrypted=credential_encrypted,
     )
     session.add(job)
     await session.commit()
@@ -121,6 +128,11 @@ def set_state(job: Job, new_state: JobState, **extra: object) -> None:
     job.state = JobState(new_state).value
     for key, value in extra.items():
         setattr(job, key, value)
+    # PRD 022: the persisted per-call credential exists for the job's
+    # operational life only — every transition funnels through here, so any
+    # terminal state (success, failure, cancel, expiry) erases it at rest.
+    if JobState(new_state) in TERMINAL_STATES:
+        job.credential_encrypted = None
 
 
 async def transition_state(
@@ -140,6 +152,29 @@ async def transition_state(
     set_state(job, new_state, **extra)
     await session.commit()
     return job
+
+
+async def mark_collection_restricted(session: AsyncSession, concept_id: str) -> None:
+    """Durably record that ``concept_id`` is access-restricted (PRD 022).
+
+    Written when a EULA-classified failure is observed for the collection, so
+    future dedupe/reuse scoping treats it as restricted even when CMR's own
+    metadata says nothing. Upsert + commit; idempotent.
+    """
+    existing = await session.get(CollectionAccess, concept_id)
+    if existing is None:
+        session.add(CollectionAccess(concept_id=concept_id, restricted=True))
+    else:
+        existing.restricted = True
+    await session.commit()
+
+
+async def collection_restriction(
+    session: AsyncSession, concept_id: str
+) -> bool | None:
+    """The durably-observed restriction flag for ``concept_id``, or ``None``."""
+    row = await session.get(CollectionAccess, concept_id)
+    return None if row is None else bool(row.restricted)
 
 
 def parse_expiration(value: str | datetime | None) -> datetime | None:

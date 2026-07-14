@@ -27,6 +27,7 @@ dependencies = [
     "arq>=0.26",
     "redis>=5.0",
     "PyYAML>=6.0",
+    "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]

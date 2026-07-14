@@ -30,6 +30,7 @@ import numpy as np
 import pyarrow as pa
 import xarray as xr
 
+from earthdata_mcp.providers.identity import parse_edl_token
 from earthdata_mcp.storage import StorageBackend, get_storage_backend
 from earthdata_mcp.tools._dataio import (
     PARQUET_MEDIA_TYPE,
@@ -81,12 +82,14 @@ async def subset(
     variables: list[str] | None = None,
     time_range: str | None = None,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     provenance: ProvenanceStore | None = None,
     storage: StorageBackend | None = None,
 ) -> dict:
     """Spatial/variable/temporal subset of a materialized result → a ``cube_``."""
+    parse_edl_token(edl_token)
     store, provenance, storage = _resolve_deps(store, provenance, storage)
     obj, _payload = await _load_source(source_handle, workspace_id, store, storage)
 
@@ -110,6 +113,7 @@ async def reproject(
     source_handle: str,
     crs: str,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     provenance: ProvenanceStore | None = None,
@@ -121,6 +125,7 @@ async def reproject(
     ``spatial_ref``), so the output records the transform regardless of whether
     ``rioxarray`` is available to write a formal CRS.
     """
+    parse_edl_token(edl_token)
     store, provenance, storage = _resolve_deps(store, provenance, storage)
     obj, _payload = await _load_source(source_handle, workspace_id, store, storage)
     if not isinstance(obj, xr.Dataset):
@@ -151,6 +156,7 @@ async def resample(
     time_freq: str | None = None,
     spatial_factor: int | None = None,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     provenance: ProvenanceStore | None = None,
@@ -159,6 +165,7 @@ async def resample(
     """Temporal (``time_freq``, e.g. ``"D"`` daily, ``"h"`` hourly, ``"ME"`` month-end)
     and/or spatial (integer ``spatial_factor`` coarsening) resampling of a gridded
     result → a ``cube_``."""
+    parse_edl_token(edl_token)
     store, provenance, storage = _resolve_deps(store, provenance, storage)
     obj, _payload = await _load_source(source_handle, workspace_id, store, storage)
     if not isinstance(obj, xr.Dataset):
@@ -221,6 +228,7 @@ async def convert_format(
     source_handle: str,
     output_format: str,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     provenance: ProvenanceStore | None = None,
@@ -233,6 +241,7 @@ async def convert_format(
     accepts bare names (``"csv"``, ``"netcdf"``, ``"parquet"``, ``"zarr"``) or their
     media-type spellings, case-insensitive — see ``_dataio.normalize_output_format``.
     """
+    parse_edl_token(edl_token)
     store, provenance, storage = _resolve_deps(store, provenance, storage)
     obj, _payload = await _load_source(source_handle, workspace_id, store, storage)
     canonical_format = normalize_output_format(output_format)
@@ -259,6 +268,7 @@ async def align(
     method: str = "outer",
     snap_time_freq: int | None = None,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     provenance: ProvenanceStore | None = None,
@@ -276,6 +286,7 @@ async def align(
     scan-center vs scan-start times): a 60-second snap collapses sub-second offsets
     without merging genuinely distinct scans.  ``None`` means no snapping.
     """
+    parse_edl_token(edl_token)
     if not source_handles or len(source_handles) < 2:
         raise ValueError("align needs at least two source handles")
     store, provenance, storage = _resolve_deps(store, provenance, storage)

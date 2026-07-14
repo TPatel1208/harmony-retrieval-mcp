@@ -351,6 +351,7 @@ def compute_request_signature(
     time_range: str | None,
     variables: tuple[str, ...],
     output_format: str,
+    identity_scope: str | None = None,
 ) -> str:
     """The canonical signature of a *request*, for ``retrieve_subset``'s
     exact-match reuse lookup (PRD 020) — deliberately distinct from
@@ -375,9 +376,19 @@ def compute_request_signature(
     order/repetition never matters. A strict subset of a wider time range (or
     of a wider variable list) is a deliberate miss — no containment
     reasoning here, exact match only.
+
+    ``identity_scope`` (PRD 022) is the credential-identity dimension: ``None``
+    for a collection CMR reports as unrestricted (cross-user reuse preserved —
+    the signature string is then byte-identical to the pre-PRD-022 form), or
+    the fetching identity's scope key (EDL username, or the service identity)
+    for a restricted/unknown collection, so bytes fetched under one user's
+    entitlements are never served to another.
     """
     aoi_str = ",".join(str(c) for c in bbox) if bbox is not None else ""
     canonical_time = TimeRange.from_cmr(time_range).to_cmr() if time_range else ""
     var_str = ",".join(sorted(set(variables)))
-    raw = ":".join([concept_id or "", aoi_str, canonical_time, var_str, output_format])
+    parts = [concept_id or "", aoi_str, canonical_time, var_str, output_format]
+    if identity_scope is not None:
+        parts.append(f"identity={identity_scope}")
+    raw = ":".join(parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]

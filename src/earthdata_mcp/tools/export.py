@@ -25,6 +25,7 @@ graph is left exactly as it was.
 from __future__ import annotations
 
 from earthdata_mcp.jobs import crud
+from earthdata_mcp.providers.identity import ensure_credential_key, parse_edl_token
 from earthdata_mcp.storage import StorageBackend, get_storage_backend
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.tools.retrieval import (
@@ -62,6 +63,7 @@ def _default_storage() -> StorageBackend:
 async def export_result(
     handle: str,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     storage: StorageBackend | None = None,
@@ -81,7 +83,12 @@ async def export_result(
     An unknown or cross-workspace handle collapses to the same ``not_found``
     answer so existence never leaks. A ``job_`` handle (or any non-``obs_``/
     ``cube_`` prefix) raises ``ValueError`` — a caller bug, not a missing result.
+
+    ``edl_token`` (PRD 022) is accepted for surface uniformity and validated at
+    the boundary; this read serves already-materialized local bytes, so the
+    identity is not otherwise consulted.
     """
+    parse_edl_token(edl_token)
     if handle_type_of(handle) not in (HandleType.OBS, HandleType.CUBE):
         raise ValueError(f"export_result expects an obs_ or cube_ handle, got {handle!r}")
     store = store or _default_store()
@@ -137,6 +144,7 @@ async def export_result(
 async def rematerialize(
     handle: str,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     provenance: ProvenanceStore | None = None,
@@ -158,7 +166,15 @@ async def rematerialize(
     message}``, matching the unknown/cross-workspace handle answer (PRD 014) so
     none of these cases raises. A ``job_`` handle (or any non-``obs_``/``cube_``
     prefix) raises ``ValueError`` — a caller bug, not a missing result.
+
+    ``edl_token`` (PRD 022) makes the replayed job run as that identity end to
+    end (persisted encrypted on the new job row). The original job's own
+    credential was erased at its terminal state, so without a fresh token the
+    replay runs as the service account, exactly like a fresh submission.
     """
+    identity = parse_edl_token(edl_token)
+    if identity is not None:
+        ensure_credential_key()
     if handle_type_of(handle) not in (HandleType.OBS, HandleType.CUBE):
         raise ValueError(f"rematerialize expects an obs_ or cube_ handle, got {handle!r}")
     store = store or _default_store()
@@ -206,4 +222,5 @@ async def rematerialize(
         provenance=provenance,
         session_factory=session_factory,
         enqueue_fn=enqueue_fn,
+        edl_token=identity.token if identity else None,
     )
