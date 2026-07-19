@@ -308,13 +308,14 @@ async def align(
 
     shapes_before = [{str(k): int(v) for k, v in d.sizes.items()} for d in datasets]
     aligned = xr.align(*datasets, join=method)
-    combined = xr.merge(aligned, compat="override")
+    combined, stacked_variables = _combine_aligned(aligned, source_handles)
     report = {
         "n_inputs": len(datasets),
         "method": method,
         "common_dims": {str(k): int(v) for k, v in combined.sizes.items()},
         "shapes_before": shapes_before,
         "shape_after": {str(k): int(v) for k, v in combined.sizes.items()},
+        "stacked_variables": stacked_variables,
     }
 
     spec = {
@@ -798,3 +799,41 @@ def _snap_time(ds: xr.Dataset, freq_ns: int) -> xr.Dataset:
     t = ds.time.values.astype("int64")
     snapped = (np.round(t / freq_ns) * freq_ns).astype("datetime64[ns]")
     return ds.assign_coords(time=snapped)
+
+
+def _combine_aligned(
+    aligned: tuple[xr.Dataset, ...], source_handles: list[str]
+) -> tuple[xr.Dataset, list[str]]:
+    """Combine >=2 grid-reconciled datasets (already run through ``xr.align``) into
+    one cube, returning ``(combined, stacked_variable_names)``.
+
+    A data-variable name present in *every* aligned input is genuinely ambiguous
+    once merged: plain ``xr.merge`` has to pick one dataset's values over the
+    other's wherever they'd collide, silently discarding the losing side under
+    ``compat="override"``. That is exactly what ``align`` was doing for two
+    retrievals of the *same* variable over two different time windows — the
+    shape tta-test's ``compare(mode="period")`` always requests — producing a
+    result with no way to recover side B at all.
+
+    Shared names are stacked along a new ``source`` dimension instead, labeled
+    with the input handles (via ``xr.concat``) so a caller can select a side by
+    handle rather than by fragile positional order. Names unique to one input
+    (this transform's original two-different-products use case, e.g. NDVI +
+    LST) merge onto the common grid exactly as before — there is nothing to
+    disambiguate there, since only one side ever supplies that name.
+    """
+    shared_names = set(aligned[0].data_vars)
+    for ds in aligned[1:]:
+        shared_names &= set(ds.data_vars)
+
+    if not shared_names:
+        return xr.merge(aligned, compat="override"), []
+
+    stacked_names = sorted(shared_names)
+    source_coord = xr.DataArray(list(source_handles), dims="source", name="source")
+    stacked = xr.Dataset(
+        {name: xr.concat([ds[name] for ds in aligned], dim=source_coord, join="exact") for name in stacked_names}
+    )
+    unique_parts = [ds.drop_vars(stacked_names, errors="ignore") for ds in aligned]
+    combined = xr.merge([stacked, *unique_parts], compat="override")
+    return combined, stacked_names

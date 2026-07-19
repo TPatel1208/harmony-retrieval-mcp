@@ -883,6 +883,49 @@ async def test_align_returns_cube_report_and_edge_per_source(
     assert {a, b} <= ancestors
 
 
+async def test_align_same_variable_two_periods_stacks_a_source_dimension(
+    workspace_store, provenance_store, local_backend, workspace_id
+):
+    """Regression: aligning two retrievals of the *same* variable (e.g. TEMPO NO2
+    on 2026-07-10 vs 2026-07-16 — tta-test's ``compare(mode="period")``) must not
+    silently merge them into one variable slot.
+
+    Before the fix, ``xr.merge(aligned, compat="override")`` picked the first
+    dataset's values wherever the two inputs shared a variable name, and produced
+    no ``source`` dimension at all — so a caller trying to split the two periods
+    back apart (tta-test's ``comparison_tools._split_aligned``, which requires a
+    ``source`` dim) got ``ValueError: Aligned result has no 'source' dimension``
+    on every single same-variable compare, and B's real data was discarded before
+    that error even fired.
+    """
+    a = _time_grid("no2", time_offset_ns=0)  # nominal day-1 scan times
+    # Day-2 scan times: entirely disjoint from day 1 (six days later, same hours).
+    b = _time_grid("no2", time_offset_ns=6 * 24 * 3_600 * 10**9)
+
+    handle_a = await _seed_cube(workspace_store, local_backend, workspace_id, a)
+    handle_b = await _seed_cube(workspace_store, local_backend, workspace_id, b)
+
+    out = await align(
+        [handle_a, handle_b], workspace_id=workspace_id,
+        **_deps(workspace_store, provenance_store, local_backend),
+    )
+
+    cube, _ = await _read_cube(workspace_store, local_backend, workspace_id, out["handle"])
+
+    assert "source" in cube.dims, f"expected a 'source' dimension, got dims={list(cube.dims)}"
+    assert cube.sizes["source"] == 2
+    assert list(cube["source"].values) == [handle_a, handle_b]
+
+    side_a = cube["no2"].sel(source=handle_a)
+    side_b = cube["no2"].sel(source=handle_b)
+    # Each side must still carry its OWN real values at its OWN times — neither
+    # side's data may have been silently discarded/overridden by the other's.
+    assert not bool(np.isnan(side_a.sel(time=a.time.values).values).any())
+    assert not bool(np.isnan(side_b.sel(time=b.time.values).values).any())
+    assert np.allclose(side_a.sel(time=a.time.values).values, a["no2"].values)
+    assert np.allclose(side_b.sel(time=b.time.values).values, b["no2"].values)
+
+
 async def test_align_requires_two_sources(
     workspace_store, provenance_store, local_backend, workspace_id
 ):
