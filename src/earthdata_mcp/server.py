@@ -502,6 +502,13 @@ def main() -> None:
             host=settings.mcp_host,
             port=settings.mcp_port,
             middleware=middleware,
+            # Uvicorn's default access logger crashes formatting the access line
+            # for sse_starlette's streamed responses (record.args is None on the
+            # final send() after a client disconnects mid-stream), which breaks
+            # the SSE connection and sends clients into a reconnect storm. Access
+            # logging brings no operational value here (structured app logs cover
+            # request handling); disabling it removes the crash entirely.
+            uvicorn_config={"access_log": False},
         )
     else:
         mcp.run()
