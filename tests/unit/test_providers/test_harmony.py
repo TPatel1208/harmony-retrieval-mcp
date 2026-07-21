@@ -514,3 +514,54 @@ async def test_materialize_mixed_bundle_gets_native_archive_type(
     )
 
     assert result.media_type == "application/x-native-archive+zip"
+
+
+@pytest.mark.asyncio
+async def test_materialize_bundle_never_slurps_granules_into_memory(
+    l2_caps, local_backend, tmp_path, monkeypatch
+) -> None:
+    """Regression (worker OOM): bundling used to build ``[(p.name, p.read_bytes())
+    for p in paths]`` and then zip that into a ``BytesIO`` — holding every granule
+    *and* the finished archive in RAM at once, ~2x the uncompressed bundle at peak.
+    A 50-granule TEMPO request OOM-killed the worker, and because a SIGKILL leaves
+    the row non-terminal, every restart resumed the job straight back into the same
+    kill. Members must stream from disk into the archive instead, so peak memory
+    stays flat in the granule count.
+    """
+    _HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+    members = {f"TEMPO_NO2_L3_S{i:03d}.nc4": _HDF5_MAGIC + b"g" * 512 for i in range(4)}
+    granules: set[Path] = set()
+    futures = []
+    for name, data in members.items():
+        path = tmp_path / name
+        path.write_bytes(data)
+        granules.add(path)
+        future = MagicMock()
+        future.result.return_value = str(path)
+        futures.append(future)
+    client = MagicMock()
+    client.download_all.return_value = iter(futures)
+
+    # Reading a whole granule into memory is the defect itself — make it fail loudly.
+    real_read_bytes = Path.read_bytes
+
+    def _no_whole_granule_reads(self: Path) -> bytes:
+        if self in granules:
+            raise AssertionError(
+                f"granule {self.name} was read whole into memory; stream it instead"
+            )
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _no_whole_granule_reads)
+
+    p = _provider(l2_caps, client=client, storage=local_backend)
+    result = await p.materialize(
+        JobRef(
+            provider="harmony", provider_job_id=_VALID_UUID, job_handle="job_stream"
+        )
+    )
+
+    # Streaming must not change the observable result.
+    assert result.media_type == "application/netcdf-bundle+zip"
+    assert result.extra["granule_count"] == 4
+    assert result.extra["uncompressed_bytes"] == sum(len(d) for d in members.values())

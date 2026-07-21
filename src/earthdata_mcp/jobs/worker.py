@@ -64,6 +64,30 @@ _RESUME_TASK: dict[JobState, str] = {
 _POLL_INTERVAL = 5
 
 
+def lifecycle_job_id(task: str, job_id: str) -> str:
+    """The arq job id used to resume ``job_id`` via ``task``.
+
+    Deterministic on purpose. ``enqueue_job`` with an explicit ``_job_id`` is a
+    no-op when a job with that id is already queued or running, so reclaiming the
+    same row twice cannot stack two copies of the same work.
+
+    This is what bounds :func:`startup`. Before it, every resume drew a fresh
+    random arq id, so a worker in a crash-loop left one more copy of each
+    non-terminal job behind per restart — observed live as 4 stuck jobs holding
+    20 in-flight arq entries, which saturated arq's concurrency slots and starved
+    every newly submitted retrieval. Two resumed copies of one job also raced each
+    other through the state guard, double-submitting it to the provider
+    (``IllegalTransition: submitted -> submitted``).
+
+    Only the reclaim path uses this. The lifecycle's own hand-offs
+    (``submit``→``poll``→``materialize``, and the self-chaining poll) keep fresh
+    ids: each is a distinct next step enqueued by the step before it, and pinning
+    the chained poll to a fixed id would make arq reject it as a duplicate of the
+    poll still running — stopping the chain dead.
+    """
+    return f"resume:{task}:{job_id}"
+
+
 # -- session factory --------------------------------------------------------
 
 
@@ -695,7 +719,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     for job_id, state in resumable:
         task = _RESUME_TASK.get(state)
         if task is not None:
-            await redis.enqueue_job(task, job_id)
+            await redis.enqueue_job(task, job_id, _job_id=lifecycle_job_id(task, job_id))
             logger.info("resuming job %s (%s) via %s", job_id, state.value, task)
 
     # PRD 015: converge a box restarted after heavy use below the cap without
@@ -790,10 +814,17 @@ class WorkerSettings:
     # Bounded retries (PRD 004): an unforeseen repeating crash degrades to a
     # logged dead task instead of retrying forever; the startup staleness sweep
     # then catches the job on the next reclaim pass.
+    # ``keep_result=0`` pairs with :func:`lifecycle_job_id`. Arq refuses an
+    # explicit ``_job_id`` that still has a *stored result*, not just a live job,
+    # so a retained result would make a finished resume attempt block the next one
+    # for the whole retention window — stranding a job that legitimately needs
+    # reclaiming again. Dropping the result narrows the dedupe to exactly the
+    # window we want ("already queued or running"). Nothing reads these results:
+    # the Postgres row is the source of truth, and each task returns None.
     functions = [
-        func(submit_job, max_tries=5),
-        func(poll_job, max_tries=5),
-        func(materialize_job, max_tries=5),
+        func(submit_job, max_tries=5, keep_result=0),
+        func(poll_job, max_tries=5, keep_result=0),
+        func(materialize_job, max_tries=5, keep_result=0),
         healthcheck,
     ]
     on_startup = startup

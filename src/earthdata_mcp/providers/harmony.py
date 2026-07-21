@@ -21,7 +21,6 @@ key (§4.4), and worker wiring are deliberately **not** built here.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import mimetypes
 import re
@@ -85,6 +84,19 @@ _NETCDF_BUNDLE_MEDIA_TYPE = "application/netcdf-bundle+zip"
 _HDF4_MEDIA_TYPE = "application/x-hdf4"
 _UNKNOWN_MEDIA_TYPE = "application/octet-stream"
 _NATIVE_ARCHIVE_MEDIA_TYPE = "application/x-native-archive+zip"
+
+#: Bytes to read off the front of a result file to classify it. ``sniff_format``
+#: only ever inspects leading magic numbers (the longest is 8 bytes), so a short
+#: header read answers exactly as well as the whole file — and lets a multi-GB
+#: granule be identified without ever being resident in memory.
+_MAGIC_PREFIX_BYTES = 16
+
+
+def _read_magic(path: Path) -> bytes:
+    """The leading bytes of ``path``, enough for :func:`sniff_format` to classify it."""
+    with path.open("rb") as fh:
+        return fh.read(_MAGIC_PREFIX_BYTES)
+
 
 # Harmony job status string -> our durable JobState (the durable state machine).
 _STATUS_MAP: dict[str, JobState] = {
@@ -240,50 +252,69 @@ class HarmonyProvider:
         :meth:`OPeNDAPProvider.materialize`, so one obs handle maps to one key and
         the whole request is materialized (not just the first granule);
         ``tools/_dataio`` concatenates the members on the time axis on read.
+
+        Everything moves **file-to-file**: granules are downloaded to a scratch
+        directory, zipped member-by-member into an archive on disk, and handed to
+        the backend with ``put_file``. Nothing here ever holds a whole granule (or
+        the whole bundle) in memory, so peak RSS stays flat in the granule count
+        instead of scaling with the result. That is not a micro-optimization: the
+        earlier read-everything-then-zip-in-RAM version needed ~2x the uncompressed
+        bundle and was OOM-killed by the kernel on a 50-granule TEMPO request —
+        and since a SIGKILL leaves the job row non-terminal, the worker resumed it
+        on restart straight back into the same kill.
         """
         client = self._client()
         storage = self._storage_backend()
-        files = await asyncio.to_thread(self._download_all, client, job)
         handle = job.job_handle or job.provider_job_id or "result"
 
-        if len(files) == 1:
-            name, data = files[0]
-            key = f"{PROVIDER}/{handle}/{name}"
-            await storage.put(key, data)
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = await asyncio.to_thread(self._download_all, client, job, tmp)
+
+            if len(paths) == 1:
+                path = paths[0]
+                key = f"{PROVIDER}/{handle}/{path.name}"
+                await storage.put_file(key, path)
+                return MaterializedResult(
+                    storage_key=key,
+                    media_type=self._media_type_for(path.name, _read_magic(path)),
+                    size_bytes=path.stat().st_size,
+                )
+
+            # Multiple granule outputs: bundle them so one obs handle maps to one key.
+            # Sniffed per-member: all netCDF-family -> today's bundle type; any
+            # HDF4/unknown member -> the whole bundle is a native archive (PRD 008 —
+            # a mixed bundle is never half-opened, so one bad member taints the lot).
+            # The archive is built beside the granules rather than in a BytesIO, and
+            # each member is sniffed from its leading bytes only.
+            bundle_path = Path(tmp) / "_bundle.nc.zip"
+            total = 0
+            formats: dict[str, int] = {}
+            def _write_bundle() -> None:
+                nonlocal total
+                with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for path in paths:
+                        total += path.stat().st_size
+                        detected = sniff_format(_read_magic(path))
+                        formats[detected] = formats.get(detected, 0) + 1
+                        zf.write(path, arcname=path.name)
+
+            await asyncio.to_thread(_write_bundle)
+            all_netcdf = all(fmt in NETCDF_FAMILY_FORMATS for fmt in formats)
+            media_type = (
+                _NETCDF_BUNDLE_MEDIA_TYPE if all_netcdf else _NATIVE_ARCHIVE_MEDIA_TYPE
+            )
+            key = f"{PROVIDER}/{handle}/result.nc.zip"
+            await storage.put_file(key, bundle_path)
             return MaterializedResult(
                 storage_key=key,
-                media_type=self._media_type_for(name, data),
-                size_bytes=len(data),
+                media_type=media_type,
+                size_bytes=bundle_path.stat().st_size,
+                extra={
+                    "granule_count": len(paths),
+                    "uncompressed_bytes": total,
+                    "detected_formats": formats,
+                },
             )
-
-        # Multiple granule outputs: bundle them so one obs handle maps to one key.
-        # Sniffed per-member: all netCDF-family -> today's bundle type; any
-        # HDF4/unknown member -> the whole bundle is a native archive (PRD 008 —
-        # a mixed bundle is never half-opened, so one bad member taints the lot).
-        buf = io.BytesIO()
-        total = 0
-        formats: dict[str, int] = {}
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for name, data in files:
-                total += len(data)
-                detected = sniff_format(data)
-                formats[detected] = formats.get(detected, 0) + 1
-                zf.writestr(name, data)
-        bundle = buf.getvalue()
-        all_netcdf = all(fmt in NETCDF_FAMILY_FORMATS for fmt in formats)
-        media_type = _NETCDF_BUNDLE_MEDIA_TYPE if all_netcdf else _NATIVE_ARCHIVE_MEDIA_TYPE
-        key = f"{PROVIDER}/{handle}/result.nc.zip"
-        await storage.put(key, bundle)
-        return MaterializedResult(
-            storage_key=key,
-            media_type=media_type,
-            size_bytes=len(bundle),
-            extra={
-                "granule_count": len(files),
-                "uncompressed_bytes": total,
-                "detected_formats": formats,
-            },
-        )
 
     # -- harmony-py request mapping (the only logic we own) ---------------
 
@@ -417,26 +448,28 @@ class HarmonyProvider:
 
     @staticmethod
     def _download_all(
-        client: "harmony.Client", job: JobRef
-    ) -> list[tuple[str, bytes]]:
-        """Download the job's result files; return ``(filename, bytes)`` for each.
+        client: "harmony.Client", job: JobRef, directory: str
+    ) -> list[Path]:
+        """Download the job's result files into ``directory``; return their paths.
 
         Every output file is kept (a Harmony job emits one per input granule), so a
         multi-granule request materializes in full rather than discarding all but the
         first — the caller bundles them when there is more than one.
+
+        Returns *paths*, never bytes: the caller owns ``directory``'s lifetime and
+        streams from these files, so a large result is never resident in memory.
         """
         if not job.provider_job_id or not _UUID_RE.match(job.provider_job_id):
             raise ValueError(
                 f"invalid Harmony job ID {job.provider_job_id!r}: expected UUID; "
                 "job was likely created by a test fixture"
             )
-        with tempfile.TemporaryDirectory() as tmp:
-            futures = list(
-                client.download_all(job.provider_job_id, directory=tmp, overwrite=True)
+        futures = list(
+            client.download_all(job.provider_job_id, directory=directory, overwrite=True)
+        )
+        paths = [Path(f.result()) for f in futures]
+        if not paths:
+            raise RuntimeError(
+                f"Harmony job {job.provider_job_id} produced no result files"
             )
-            paths = [Path(f.result()) for f in futures]
-            if not paths:
-                raise RuntimeError(
-                    f"Harmony job {job.provider_job_id} produced no result files"
-                )
-            return [(p.name, p.read_bytes()) for p in paths]
+        return paths
