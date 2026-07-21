@@ -490,26 +490,100 @@ async def list_workspace(
     return await workspace.list_workspace(workspace_id, handle_type, edl_token=edl_token)
 
 
+def _install_exit_debug() -> None:
+    """[MCP-EXIT-DEBUG] Temporary instrumentation to diagnose the earthdata-mcp
+    container's silent clean-exit-0 crash-restart loop (RestartCount>10). Prints
+    to stderr (flush=True) so it survives whatever logging config is active and
+    shows up in `docker logs`. Remove once the exit cause is identified.
+
+    Distinguishes the two hypotheses:
+      * a signal arrived (SIGTERM/SIGINT from Docker/compose/orchestrator) ->
+        the signal handler line fires, then uvicorn shuts down gracefully; and
+      * the process died from a fatal fault (segfault/abort in a C extension:
+        rasterio/GDAL/pyproj/numpy) -> faulthandler dumps all-thread tracebacks.
+    An unhandled Python exception out of mcp.run() is caught by main()'s wrapper.
+    """
+    import atexit
+    import faulthandler
+    import os
+    import signal
+    import sys
+
+    faulthandler.enable(all_threads=True)  # fatal C-level faults -> stderr traceback
+
+    # uvicorn installs its own asyncio signal handlers during startup, which
+    # replace any signal.signal()/faulthandler handler we set here — so a plain
+    # handler never fires. Patch uvicorn's handler *method* instead: it runs
+    # whenever uvicorn processes a shutdown signal, regardless of install order,
+    # and tells us WHICH signal (and the stack at that moment). If the organic
+    # exit sets should_exit without a signal, this never fires and we're left
+    # with main()'s "returned normally" — itself the finding (internal shutdown,
+    # not an external signal).
+    try:
+        import uvicorn
+
+        _orig_handle_exit = uvicorn.Server.handle_exit
+
+        def _logged_handle_exit(self, sig, frame):
+            try:
+                name = signal.Signals(sig).name
+            except (ValueError, TypeError):
+                name = str(sig)
+            print(f"[MCP-EXIT-DEBUG] uvicorn.handle_exit sig={sig} ({name}) pid={os.getpid()} — stack:",
+                  file=sys.stderr, flush=True)
+            faulthandler.dump_traceback(all_threads=True)
+            return _orig_handle_exit(self, sig, frame)
+
+        uvicorn.Server.handle_exit = _logged_handle_exit
+    except Exception as exc:  # pragma: no cover — best-effort instrumentation
+        print(f"[MCP-EXIT-DEBUG] could not patch uvicorn.handle_exit: {exc!r}",
+              file=sys.stderr, flush=True)
+
+    @atexit.register
+    def _on_exit():
+        print(f"[MCP-EXIT-DEBUG] interpreter exiting (pid={os.getpid()})",
+              file=sys.stderr, flush=True)
+
+    print(f"[MCP-EXIT-DEBUG] instrumentation armed (pid={os.getpid()})",
+          file=sys.stderr, flush=True)
+
+
 def main() -> None:
     """Run the MCP server: stdio by default, streamable HTTP when configured."""
+    import sys
+    import traceback
+
+    _install_exit_debug()  # [MCP-EXIT-DEBUG] remove once exit cause is found
     settings = get_settings()
     if settings.mcp_transport == "http":
         middleware = []
         if settings.mcp_token:
             middleware.append(Middleware(BearerTokenMiddleware, token=settings.mcp_token))
-        mcp.run(
-            transport="http",
-            host=settings.mcp_host,
-            port=settings.mcp_port,
-            middleware=middleware,
-            # Uvicorn's default access logger crashes formatting the access line
-            # for sse_starlette's streamed responses (record.args is None on the
-            # final send() after a client disconnects mid-stream), which breaks
-            # the SSE connection and sends clients into a reconnect storm. Access
-            # logging brings no operational value here (structured app logs cover
-            # request handling); disabling it removes the crash entirely.
-            uvicorn_config={"access_log": False},
-        )
+        try:
+            mcp.run(
+                transport="http",
+                host=settings.mcp_host,
+                port=settings.mcp_port,
+                middleware=middleware,
+                # Uvicorn's default access logger crashes formatting the access line
+                # for sse_starlette's streamed responses (record.args is None on the
+                # final send() after a client disconnects mid-stream), which breaks
+                # the SSE connection and sends clients into a reconnect storm. Access
+                # logging brings no operational value here (structured app logs cover
+                # request handling); disabling it removes the crash entirely.
+                uvicorn_config={"access_log": False},
+            )
+        except BaseException:  # [MCP-EXIT-DEBUG] capture any escape from the serve loop
+            print("[MCP-EXIT-DEBUG] mcp.run() raised — traceback follows:",
+                  file=sys.stderr, flush=True)
+            traceback.print_exc()
+            raise
+        else:
+            # [MCP-EXIT-DEBUG] normal return == uvicorn shut down gracefully
+            # (should_exit set — almost always a received signal). If no signal
+            # line was printed above, the serve loop returned on its own.
+            print("[MCP-EXIT-DEBUG] mcp.run() returned normally (graceful uvicorn shutdown)",
+                  file=sys.stderr, flush=True)
     else:
         mcp.run()
 
