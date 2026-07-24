@@ -19,6 +19,7 @@ the row.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
@@ -51,6 +52,30 @@ from earthdata_mcp.workspace.models import ProvenanceEventType
 from earthdata_mcp.workspace.provenance import ProvenanceStore
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_harmony_download_concurrency() -> None:
+    """Raise harmony-py's hardcoded 3-worker download thread pool.
+
+    harmony.config.Config.NUM_REQUESTS_WORKERS reads the env var live
+    (os.getenv) at every Client() construction — HarmonyProvider builds a
+    fresh Client per job (providers/harmony.py) — so setting this once here
+    raises download concurrency for every job in this process. setdefault so
+    an operator's own explicit NUM_REQUESTS_WORKERS (e.g. in .env/docker-
+    compose) still wins. Downloads already stream file-to-file (commit
+    9802d84), so raising this trades network parallelism for disk I/O and
+    open file descriptors, not RAM.
+
+    Called from :func:`startup` — not module scope — because get_settings()
+    is @lru_cache'd: calling it at import time would permanently freeze the
+    process-wide Settings singleton the instant anything merely imports this
+    module (a test importing it for an unrelated helper, e.g.), instead of
+    only when the worker actually starts.
+    """
+    os.environ.setdefault(
+        "NUM_REQUESTS_WORKERS", str(get_settings().retrieval_download_concurrency)
+    )
+
 
 # Which task resumes a job found in each non-terminal state on startup (§4.3).
 _RESUME_TASK: dict[JobState, str] = {
@@ -678,6 +703,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     checks happen once, in this same reclaim pass, so one worker restart
     converges existing debris to an honest terminal state.
     """
+    _configure_harmony_download_concurrency()
     session_factory = _session_factory(ctx)
     stale_before = datetime.now(timezone.utc) - timedelta(
         days=get_settings().job_stale_after_days

@@ -275,6 +275,178 @@ async def test_materialize_raises_without_constraint_url() -> None:
         await _provider().materialize(JobRef(provider="opendap"))
 
 
+@pytest.mark.asyncio
+async def test_materialize_does_not_corrupt_bytes_when_urls_collide_on_filename(
+    httpx_mock, local_backend
+) -> None:
+    """Two constraint URLs that differ only in their dap4.ce query string
+    (e.g. two variable subsets of the same granule) produce the same
+    _filename_from_url output. Fetches now run concurrently, so without a
+    position-unique on-disk name, both would stream into the identical
+    scratch file at once with no coordination -- this must not happen."""
+    import zipfile
+    from io import BytesIO
+
+    url1 = OPENDAP_URL + ".dap.nc4?dap4.ce=precipitation"
+    url2 = OPENDAP_URL + ".dap.nc4?dap4.ce=temperature"  # same path -> same filename
+    httpx_mock.add_response(url=url1, content=b"granule-precip")
+    httpx_mock.add_response(url=url2, content=b"granule-temp")
+
+    p = _provider(storage=local_backend)
+    ref = JobRef(
+        provider="opendap", provider_job_url=f"{url1}\n{url2}", job_handle="job_collide"
+    )
+
+    result = await p.materialize(ref)
+
+    assert result.extra["granule_count"] == 2
+    bundle = await local_backend.get(result.storage_key)
+    with zipfile.ZipFile(BytesIO(bundle)) as zf:
+        # Read by ZipInfo, not by name -- the two entries share an arcname
+        # (matching the old, merely-odd duplicate-entry outcome), so reading
+        # by name string would be ambiguous.
+        contents = [zf.read(info) for info in zf.infolist()]
+    assert sorted(contents) == sorted([b"granule-precip", b"granule-temp"])
+
+
+@pytest.mark.asyncio
+async def test_fetch_releases_concurrency_slot_during_retry_backoff(
+    httpx_mock, local_backend
+) -> None:
+    """A granule sitting in tenacity's retry backoff sleep must release its
+    concurrency-slot semaphore so a different, ready granule can use it --
+    not hold the slot idle for the whole ~2-8s backoff window."""
+    import time
+
+    import httpx
+
+    flaky_url = OPENDAP_URL + ".dap.nc4?dap4.ce=precipitation"
+    fast_url = (
+        "https://opendap.earthdata.nasa.gov/collections/C1-GES_DISC/granules/"
+        "GLDAS_NOAH025_3H.A20240101.0300.021.nc4.dap.nc4?dap4.ce=precipitation"
+    )
+    flaky_attempts: list[float] = []
+    fast_calls: list[float] = []
+
+    async def flaky_callback(request: httpx.Request) -> httpx.Response:
+        flaky_attempts.append(time.monotonic())
+        if len(flaky_attempts) == 1:
+            return httpx.Response(503)  # transient -> tenacity retries after ~2s backoff
+        return httpx.Response(200, content=b"granule-flaky")
+
+    async def fast_callback(request: httpx.Request) -> httpx.Response:
+        fast_calls.append(time.monotonic())
+        return httpx.Response(200, content=b"granule-fast")
+
+    httpx_mock.add_callback(flaky_callback, url=flaky_url, is_reusable=True)
+    httpx_mock.add_callback(fast_callback, url=fast_url)
+
+    # concurrency=1 makes the slot-contention observable: with only one slot,
+    # the fast granule can only run during a window the flaky one released.
+    settings = Settings(_env_file=None, earthdata_token="tok", retrieval_download_concurrency=1)
+    p = OPeNDAPProvider(_grid_caps(), storage=local_backend, settings=settings)
+    ref = JobRef(
+        provider="opendap", provider_job_url=f"{flaky_url}\n{fast_url}", job_handle="job_backoff"
+    )
+
+    await p.materialize(ref)
+
+    assert len(flaky_attempts) == 2
+    assert len(fast_calls) == 1
+    # The fast granule's request must land strictly between the flaky
+    # granule's first (failing) attempt and its retry -- proof the
+    # semaphore slot was released during the backoff sleep, not held idle.
+    assert flaky_attempts[0] < fast_calls[0] < flaky_attempts[1]
+
+
+@pytest.mark.asyncio
+async def test_materialize_bounds_concurrent_fetches_to_the_configured_setting(
+    httpx_mock, local_backend
+) -> None:
+    """Granule fetches must be bounded by ``retrieval_download_concurrency``,
+    not fired all at once — the point of the fix over the old unbounded
+    ``asyncio.gather``."""
+    import asyncio
+
+    import httpx
+
+    urls = [
+        f"{OPENDAP_URL}_{i}.dap.nc4?dap4.ce=precipitation" for i in range(6)
+    ]
+    active = 0
+    peak = 0
+    lock = asyncio.Lock()
+
+    async def callback(request: httpx.Request) -> httpx.Response:
+        nonlocal active, peak
+        async with lock:
+            active += 1
+            peak = max(peak, active)
+        await asyncio.sleep(0.05)
+        async with lock:
+            active -= 1
+        return httpx.Response(200, content=b"granule")
+
+    for url in urls:
+        httpx_mock.add_callback(callback, url=url)
+
+    settings = Settings(_env_file=None, earthdata_token="tok", retrieval_download_concurrency=2)
+    p = OPeNDAPProvider(_grid_caps(), storage=local_backend, settings=settings)
+    ref = JobRef(provider="opendap", provider_job_url="\n".join(urls), job_handle="job_conc")
+
+    result = await p.materialize(ref)
+
+    assert result.extra["granule_count"] == 6
+    assert peak <= 2
+
+
+@pytest.mark.asyncio
+async def test_materialize_cancels_other_fetches_on_first_failure_and_reraises_it_bare(
+    httpx_mock, local_backend
+) -> None:
+    """A failing granule must cancel its still-in-flight siblings (fail-fast,
+    via asyncio.TaskGroup) rather than letting them run to completion in the
+    background — and the exception that reaches the caller must be the bare
+    original type (httpx.HTTPStatusError here), not an ExceptionGroup, so
+    materialize_job's type-based error classification keeps working."""
+    import asyncio
+
+    import httpx
+
+    fail_url = OPENDAP_URL + ".dap.nc4?dap4.ce=precipitation"
+    slow_url = (
+        "https://opendap.earthdata.nasa.gov/collections/C1-GES_DISC/granules/"
+        "GLDAS_NOAH025_3H.A20240101.0300.021.nc4.dap.nc4?dap4.ce=precipitation"
+    )
+    slow_cancelled = False
+
+    async def fail_callback(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)  # not in the retryable set -> fails immediately
+
+    async def slow_callback(request: httpx.Request) -> httpx.Response:
+        nonlocal slow_cancelled
+        try:
+            await asyncio.sleep(2.0)
+        except asyncio.CancelledError:
+            slow_cancelled = True
+            raise
+        return httpx.Response(200, content=b"granule-slow")  # pragma: no cover
+
+    httpx_mock.add_callback(fail_callback, url=fail_url)
+    httpx_mock.add_callback(slow_callback, url=slow_url)
+
+    p = _provider(storage=local_backend)
+    ref = JobRef(
+        provider="opendap", provider_job_url=f"{fail_url}\n{slow_url}", job_handle="job_fail"
+    )
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await p.materialize(ref)
+
+    assert exc_info.value.response.status_code == 404
+    assert slow_cancelled is True
+
+
 # -- _resolve_from_cmr: variable path resolution ---------------------------
 
 

@@ -81,6 +81,15 @@ class Settings(BaseSettings):
     appeears_rate_per_sec: float = 10.0
     opendap_rate_per_sec: float = 10.0
 
+    # Concurrent in-flight granule downloads during materialize, shared by both
+    # providers: bounds OPeNDAPProvider's per-materialize asyncio.Semaphore
+    # (opendap/_runtime.py) and is exported as harmony-py's own NUM_REQUESTS_WORKERS
+    # env var (jobs/worker.py, read by harmony.Client at construction). Both
+    # providers stream granules straight to disk, so this trades network/decompress
+    # parallelism against disk I/O and open file descriptors, not RAM — raising it
+    # doesn't multiply peak memory the way concurrent in-RAM buffering would.
+    retrieval_download_concurrency: int = 6
+
     # MCP transport / bearer token (PRD 018) --------------------------------
     # stdio (default) requires being the consumer's child process; http is the
     # opt-in for a separate-container consumer (e.g. a second compose stack).
