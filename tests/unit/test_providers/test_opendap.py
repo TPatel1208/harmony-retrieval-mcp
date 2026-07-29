@@ -255,6 +255,10 @@ async def test_materialize_bundles_granules_into_one_zip(
     assert result.media_type == "application/netcdf-bundle+zip"
     assert result.storage_key == "opendap/job_abc/subset.nc.zip"
     assert result.extra["granule_count"] == 2
+    # PRD 023: the granules this run actually fetched, named by the granule URL
+    # itself — the DAP4 constraint is spec-derived and says nothing about which
+    # granules were resolved, so it is stripped.
+    assert result.extra["granule_ids"] == [OPENDAP_URL, url2.split(".dap.nc4")[0]]
 
     # The stored object is a zip carrying both granule subsets under granule names.
     bundle = await local_backend.get(result.storage_key)

@@ -60,6 +60,14 @@ class Job(Base):
     # ``crud.set_state`` the moment the job reaches any terminal state so tokens
     # never accumulate at rest. NULL means the env-credential fallback.
     credential_encrypted: Mapped[str | None] = mapped_column(String, default=None)
+    # What this job *actually* delivered (PRD 023) — the resolved granule ids,
+    # the provider that really ran, the realized service chain, and the
+    # ``content_digest`` over them. Written once, by the worker, at the
+    # transition into READY, never at planning time: this column's entire value
+    # is that it is an outcome and not an intent (``request_spec`` above is the
+    # intent). NULL for every handle materialized before this column existed —
+    # legacy records are absent, never backfilled.
+    materialization: Mapped[dict | None] = mapped_column(JSONB, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -92,9 +100,9 @@ async def create_jobs_schema(engine: AsyncEngine) -> None:
     each is created from its own ``metadata``. ``create_all`` only creates a
     missing table — it never alters an existing one — so a column added to the
     model after a table already exists (``last_polled_at``, PRD 012;
-    ``credential_encrypted``, PRD 022) needs its own idempotent
-    ``ADD COLUMN IF NOT EXISTS`` alongside it. A couple of columns don't
-    warrant a migration framework.
+    ``credential_encrypted``, PRD 022; ``materialization``, PRD 023) needs its
+    own idempotent ``ADD COLUMN IF NOT EXISTS`` alongside it. A couple of
+    columns don't warrant a migration framework.
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -105,6 +113,9 @@ async def create_jobs_schema(engine: AsyncEngine) -> None:
             text(
                 "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS credential_encrypted VARCHAR"
             )
+        )
+        await conn.execute(
+            text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS materialization JSONB")
         )
 
 

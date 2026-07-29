@@ -249,7 +249,10 @@ async def get_retrieval_status(
     Also carries a curated slice of what the job pertains to — ``short_name``,
     ``variables``, ``aoi_bbox``, ``time_range``, ``provider``,
     ``output_format``, and ``granule_count`` — whichever of those the job's
-    request actually set; never the raw internal spec.
+    request actually set; never the raw internal spec. ``granule_count`` is
+    accompanied by ``granule_count_source``: ``"materialized"`` once the job
+    has run (what it actually retrieved) or ``"planned"`` before that (a
+    planning-time tally no provider is obliged to honor).
 
     An unknown, cross-workspace, or orphaned ``job_`` handle is a structured
     ``{job_handle, status: "not_found", message}`` answer, not an error — a
@@ -408,6 +411,15 @@ async def export_result(
     locally, a presigned ``https://`` URL for an S3 backend — so open-by-scheme
     logic survives a move to hosted deployment unchanged. Exporting LRU-touches
     the handle so an actively-read result is never the first thing evicted.
+
+    A ready answer also carries ``content_digest`` — a stable identifier for
+    what this handle **actually** contains (the granules that were really
+    retrieved, the provider that really ran) — plus ``partial`` (true when the
+    provider named no granules, so the digest describes less than the whole
+    result) and ``granule_count``. Key a derived-artifact cache on
+    ``content_digest`` rather than on the handle alone: a rematerialization of
+    the same request can legitimately deliver different data. All three are
+    absent for a result materialized before this record existed.
 
     A pending or expired (evicted) handle answers ``{handle, status, message}``
     instead of raising; an unknown or cross-workspace handle collapses to the

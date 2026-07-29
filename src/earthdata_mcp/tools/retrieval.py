@@ -52,6 +52,7 @@ from earthdata_mcp.providers.base import (
 )
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.providers.harmony import HarmonyProvider
+from earthdata_mcp.providers.materialization import MaterializationRecord
 from earthdata_mcp.providers.identity import (
     EDLIdentity,
     decrypt_credential,
@@ -346,22 +347,33 @@ _ENRICHMENT_KEYS = (
 )
 
 
-def _status_enrichment(spec: dict) -> dict:
+def _status_enrichment(spec: dict, materialization: dict | None = None) -> dict:
     """Curate ``job.request_spec`` into what a job *pertains to* (PRD 021).
 
     A field absent from the spec (``None`` — the dataclass's own default for
     an optional field like ``aoi_bbox``/``time_range``) is omitted entirely
     rather than emitted as ``null``, so a consumer never has to distinguish
-    "not applicable to this job" from "not yet known." ``granule_count`` is
-    derived from ``opendap_urls`` (discovered at planning time for any
-    gridded/swath bbox request, regardless of which provider ultimately runs
-    it) — the only granule tally the durable spec carries; omitted when no
-    OPeNDAP URLs were discovered (e.g. an AppEEARS point-sample job).
+    "not applicable to this job" from "not yet known."
+
+    ``granule_count`` prefers the job's materialization record — what it
+    actually retrieved — and falls back to the ``opendap_urls`` tally
+    (discovered at planning time for any gridded/swath bbox request,
+    regardless of which provider ultimately runs it) for a job that has not
+    materialized, or materialized before that record existed. Since those are
+    different kinds of claim — an outcome versus a guess no provider was
+    obliged to honor — ``granule_count_source`` says which one was returned
+    (PRD 023 story 5). Both are omitted when neither is available: a job whose
+    provider names no granules and for which no OPeNDAP URLs were discovered
+    (an AppEEARS point sample) gets no tally rather than a fabricated zero.
     """
     enrichment = {key: spec[key] for key in _ENRICHMENT_KEYS if spec.get(key) is not None}
-    opendap_urls = spec.get("opendap_urls")
-    if opendap_urls:
-        enrichment["granule_count"] = len(opendap_urls)
+    record = MaterializationRecord.from_jsonb(materialization)
+    if record is not None and record.granule_ids is not None:
+        enrichment["granule_count"] = len(set(record.granule_ids))
+        enrichment["granule_count_source"] = "materialized"
+    elif spec.get("opendap_urls"):
+        enrichment["granule_count"] = len(spec["opendap_urls"])
+        enrichment["granule_count_source"] = "planned"
     return enrichment
 
 
@@ -438,7 +450,7 @@ async def get_retrieval_status(
             "submitted_at": job.created_at.isoformat(),
             "last_polled_at": (job.last_polled_at or job.updated_at).isoformat(),
             "provider_job_url": job.provider_job_url,
-            **_status_enrichment(job.request_spec),
+            **_status_enrichment(job.request_spec, job.materialization),
         }
 
 

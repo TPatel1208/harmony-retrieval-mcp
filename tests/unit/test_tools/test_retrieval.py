@@ -21,6 +21,7 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
 
@@ -32,6 +33,7 @@ from earthdata_mcp.providers._capabilities import (
     ServiceCapability,
 )
 from earthdata_mcp.providers.cmr import CMRProvider
+from earthdata_mcp.providers.materialization import MaterializationRecord
 from earthdata_mcp.tools.retrieval import (
     cancel_retrieval,
     get_retrieval_status,
@@ -1475,7 +1477,7 @@ async def test_get_status_enriches_with_curated_request_spec_slice(
     async with session_factory() as session:
         await create_job(
             session,
-            job_id="job-enrichment-test",
+            job_id=f"job-enrichment-{uuid4().hex}",
             job_handle=job_handle,
             obs_handle="obs_enrichment",
             provider="harmony",
@@ -1515,7 +1517,7 @@ async def test_get_status_omits_absent_enrichment_fields_entirely(
     async with session_factory() as session:
         await create_job(
             session,
-            job_id="job-minimal-spec-test",
+            job_id=f"job-minimal-spec-{uuid4().hex}",
             job_handle=job_handle,
             obs_handle="obs_minimal",
             provider="harmony",
@@ -2063,3 +2065,113 @@ async def test_retrieve_subset_cmr_error_falls_back_gracefully(
     # (PRD 009's never-guess rule).
     assert spec["coord_lat"] is None
     assert spec["coord_lon"] is None
+
+
+# -- get_retrieval_status: PRD 023 materialized granule tally ----------------
+
+
+async def _seed_job_with_materialization(
+    workspace_store, session_factory, workspace_id, *, materialization
+) -> str:
+    """A job whose spec discovered two OPeNDAP URLs at planning time."""
+    obs_handle = f"obs_{uuid4().hex[:16]}"
+    job_handle = await workspace_store.put_handle(
+        workspace_id, HandleType.JOB, payload={"obs_handle": obs_handle}
+    )
+    spec = {
+        "concept_id": _CONCEPT_ID,
+        "provider": "harmony",
+        "output_format": "application/netcdf4",
+        "opendap_urls": ["https://o/g1.nc", "https://o/g2.nc"],
+    }
+    async with session_factory() as session:
+        job = await create_job(
+            session,
+            job_id=uuid4().hex,
+            job_handle=job_handle,
+            obs_handle=obs_handle,
+            provider="harmony",
+            request_spec=spec,
+        )
+        job.materialization = materialization
+        await session.commit()
+    return job_handle
+
+
+async def test_get_status_reports_the_materialized_granule_count_when_known(
+    workspace_store, session_factory, workspace_id,
+) -> None:
+    """PRD 023 story 5: once the job has actually run, the tally is what it
+    retrieved — not the planning-time OPeNDAP guess no provider was obliged to
+    honor. Here Harmony resolved three granules where planning found two."""
+    record = MaterializationRecord(
+        granule_ids=("G1", "G2", "G3"),
+        provider_used="harmony",
+        service_chain=None,
+        output_format="application/netcdf4",
+    )
+    job_handle = await _seed_job_with_materialization(
+        workspace_store, session_factory, workspace_id, materialization=record.to_jsonb()
+    )
+
+    status = await get_retrieval_status(
+        job_handle, workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+
+    assert status["granule_count"] == 3
+    assert status["granule_count_source"] == "materialized"
+
+
+async def test_get_status_falls_back_to_the_planning_tally_without_a_record(
+    workspace_store, session_factory, workspace_id,
+) -> None:
+    """A job that hasn't materialized yet still answers, and says which tally
+    it returned so a consumer never reads a guess as an outcome."""
+    job_handle = await _seed_job_with_materialization(
+        workspace_store, session_factory, workspace_id, materialization=None
+    )
+
+    status = await get_retrieval_status(
+        job_handle, workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+
+    assert status["granule_count"] == 2
+    assert status["granule_count_source"] == "planned"
+
+
+async def test_get_status_omits_the_tally_for_a_partial_record(
+    workspace_store, session_factory, workspace_id,
+) -> None:
+    """An AppEEARS-style job names no granules and discovered no OPeNDAP URLs:
+    no tally is better than a fabricated zero."""
+    record = MaterializationRecord(
+        granule_ids=None,
+        provider_used="appeears",
+        service_chain=None,
+        output_format="application/x-parquet",
+    )
+    obs_handle = f"obs_{uuid4().hex[:16]}"
+    job_handle = await workspace_store.put_handle(
+        workspace_id, HandleType.JOB, payload={"obs_handle": obs_handle}
+    )
+    async with session_factory() as session:
+        job = await create_job(
+            session,
+            job_id=uuid4().hex,
+            job_handle=job_handle,
+            obs_handle=obs_handle,
+            provider="appeears",
+            request_spec={"concept_id": _CONCEPT_ID, "provider": "appeears"},
+        )
+        job.materialization = record.to_jsonb()
+        await session.commit()
+
+    status = await get_retrieval_status(
+        job_handle, workspace_id=workspace_id,
+        store=workspace_store, session_factory=session_factory,
+    )
+
+    assert "granule_count" not in status
+    assert "granule_count_source" not in status

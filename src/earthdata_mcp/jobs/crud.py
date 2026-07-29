@@ -105,6 +105,32 @@ async def get_job_by_obs_handle(session: AsyncSession, obs_handle: str) -> Job |
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+async def previous_materialization(
+    session: AsyncSession, obs_handle: str, *, before_job_id: str
+) -> dict | None:
+    """The most recent materialization record for ``obs_handle`` from an
+    *earlier* job than ``before_job_id``, or ``None`` (PRD 023).
+
+    An ``obs_`` handle keeps its identity across every replay while each replay
+    mints a fresh job row (see :func:`get_job_by_obs_handle`), so this is what
+    a materializing job compares itself against to notice that the same
+    persisted spec just delivered different data. ``None`` covers both the
+    first materialization of a handle and any earlier one that predates the
+    column — an absent record is never grounds to claim drift.
+    """
+    stmt = (
+        select(Job.materialization)
+        .where(
+            Job.obs_handle == obs_handle,
+            Job.job_id != before_job_id,
+            Job.materialization.is_not(None),
+        )
+        .order_by(Job.created_at.desc())
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalars().first()
+
+
 async def reclaim_non_terminal(session: AsyncSession) -> list[Job]:
     """Return every job not in a terminal state — the restart-resume work list.
 

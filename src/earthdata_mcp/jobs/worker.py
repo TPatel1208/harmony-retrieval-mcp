@@ -45,6 +45,7 @@ from earthdata_mcp.providers.identity import (
     decrypt_credential,
     parse_edl_token,
 )
+from earthdata_mcp.providers.materialization import MaterializationRecord
 from earthdata_mcp.providers.request_spec import InvalidSpecError, RequestSpec
 from earthdata_mcp.redaction import redact
 from earthdata_mcp.storage import get_storage_backend
@@ -401,6 +402,72 @@ async def _fail_classified_credential(
     )
 
 
+#: The named event an operator greps for when a replay stopped reproducing its
+#: original (PRD 023). Not a provenance edge: drift is an observation about an
+#: existing node, and this PRD only makes it observable — deciding what to do
+#: about a changed replay belongs to the consumer.
+_DRIFT_EVENT = "materialization-drift"
+
+
+def _delivered_projection(record: MaterializationRecord) -> dict[str, Any]:
+    """The delivered-content fields written onto the ``obs_`` handle payload
+    (PRD 023), read back by ``export_result._delivered_content``.
+
+    ``jobs.materialization`` stays the record's authoritative owner — drift
+    detection and status enrichment read it there. This is the read model:
+    the handle payload is what ``export_result`` resolves, and a consumer must
+    not need a second lookup to learn what its handle contains.
+    ``granule_count`` is omitted for a partial record so it never reads as
+    zero, matching the record's own absent-not-empty posture.
+    """
+    projection: dict[str, Any] = {
+        "content_digest": record.content_digest,
+        "partial": record.partial,
+    }
+    if record.granule_ids is not None:
+        projection["granule_count"] = len(set(record.granule_ids))
+    return projection
+
+
+async def _log_materialization_drift(
+    ctx: dict[str, Any],
+    job_id: str,
+    spec: RequestSpec,
+    record: MaterializationRecord,
+) -> None:
+    """Log :data:`_DRIFT_EVENT` when this materialization's digest differs from
+    the previous one for the same ``obs_`` handle (PRD 023).
+
+    This is the first time this server can observe upstream drift at all — an
+    NRT late-arrival, an unpinned Harmony submit that took a different chain, a
+    job that fell back to OPeNDAP — so it says so, with both digests and the
+    handle. Best-effort in the same log-and-swallow spirit as
+    :func:`_record_event_safe`: an observation must never be the reason a
+    materialization fails.
+    """
+    if not spec.obs_handle:
+        return
+    try:
+        async with _session_factory(ctx)() as session:
+            previous = await crud.previous_materialization(
+                session, spec.obs_handle, before_job_id=job_id
+            )
+    except Exception:
+        logger.exception("job %s: failed to read the previous materialization", job_id)
+        return
+
+    prior = MaterializationRecord.from_jsonb(previous)
+    if prior is None or prior.content_digest == record.content_digest:
+        return
+    logger.warning(
+        "%s: handle %s rematerialized to different content (was %s, now %s)",
+        _DRIFT_EVENT,
+        spec.obs_handle,
+        prior.content_digest,
+        record.content_digest,
+    )
+
+
 async def _mark_restricted_safe(ctx: dict[str, Any], concept_id: str | None) -> None:
     """Durably flag a collection restricted, without ever blocking the caller —
     same log-and-swallow posture as :func:`_record_event_safe`."""
@@ -642,6 +709,11 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
             await _fail_job(ctx, job_id, spec, "materialize", exc)
         raise
 
+    # What this run actually delivered (PRD 023) — built from the provider's own
+    # report, so it describes the outcome rather than replaying the intent.
+    record = MaterializationRecord.from_result(result, spec)
+    await _log_materialization_drift(ctx, job_id, spec, record)
+
     # Resolve the pending obs_ handle to the durable storage key (not a URL).
     if spec.obs_handle:
         from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
@@ -655,6 +727,11 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
                 "storage_key": result.storage_key,
                 "media_type": result.media_type,
                 "size_bytes": result.size_bytes,
+                # PRD 023: the delivered-content projection `export_result`
+                # serves. Written in the same call as the storage key it
+                # describes, so the two can never disagree about which
+                # materialization a consumer is looking at.
+                **_delivered_projection(record),
             },
         )
 
@@ -672,7 +749,13 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
         },
     )
     async with session_factory() as session:
-        await crud.transition_state(session, job_id, JobState.READY, progress=100)
+        await crud.transition_state(
+            session,
+            job_id,
+            JobState.READY,
+            progress=100,
+            materialization=record.to_jsonb(),
+        )
 
     await _sweep_eviction_safe(ctx, protected_handle=spec.obs_handle)
 

@@ -98,6 +98,18 @@ def _read_magic(path: Path) -> bytes:
         return fh.read(_MAGIC_PREFIX_BYTES)
 
 
+def _granule_ids(paths: list[Path]) -> list[str]:
+    """The delivered-content identifiers for a Harmony result (PRD 023).
+
+    A Harmony job emits **one output file per input granule**, and names each
+    after the granule it came from, so the output names are the identifiers
+    Harmony itself gives the granules it resolved server-side at submit time —
+    which is exactly what an unchanged spec does *not* pin down. Sorted, since
+    ``download_all``'s completion order is not meaningful.
+    """
+    return sorted(path.name for path in paths)
+
+
 # Harmony job status string -> our durable JobState (the durable state machine).
 _STATUS_MAP: dict[str, JobState] = {
     "accepted": JobState.SUBMITTED,
@@ -278,6 +290,7 @@ class HarmonyProvider:
                     storage_key=key,
                     media_type=self._media_type_for(path.name, _read_magic(path)),
                     size_bytes=path.stat().st_size,
+                    extra={"granule_ids": _granule_ids(paths)},
                 )
 
             # Multiple granule outputs: bundle them so one obs handle maps to one key.
@@ -313,6 +326,7 @@ class HarmonyProvider:
                     "granule_count": len(paths),
                     "uncompressed_bytes": total,
                     "detected_formats": formats,
+                    "granule_ids": _granule_ids(paths),
                 },
             )
 

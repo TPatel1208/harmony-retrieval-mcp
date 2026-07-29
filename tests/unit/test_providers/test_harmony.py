@@ -445,6 +445,9 @@ async def test_materialize_bundles_multiple_granules(
     assert result.media_type == "application/netcdf-bundle+zip"
     assert result.storage_key == "harmony/job_xyz/result.nc.zip"
     assert result.extra["granule_count"] == 3
+    # PRD 023: Harmony emits one output file per input granule, so the output
+    # names are the identifiers it gives the granules that actually went in.
+    assert result.extra["granule_ids"] == sorted(members)
     bundle = await local_backend.get(result.storage_key)
     with zipfile.ZipFile(io.BytesIO(bundle)) as zf:
         assert sorted(zf.namelist()) == sorted(members)

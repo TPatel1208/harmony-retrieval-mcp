@@ -229,7 +229,15 @@ class OPeNDAPProvider:
                 storage_key=key,
                 media_type=_NETCDF_BUNDLE_MEDIA_TYPE,
                 size_bytes=bundle_path.stat().st_size,
-                extra={"granule_count": len(urls), "uncompressed_bytes": total},
+                extra={
+                    "granule_count": len(urls),
+                    "uncompressed_bytes": total,
+                    # PRD 023: which granules this run actually fetched. The
+                    # DAP4 constraint is derived from the spec and would only
+                    # restate the intent, so it is stripped — what varies
+                    # between two runs of the same spec is the granule set.
+                    "granule_ids": [_granule_of(u) for u in urls],
+                },
             )
 
     # -- DAP4 request mapping (the only logic we own) ---------------------
@@ -399,6 +407,19 @@ def _is_transient_http_error(exc: BaseException) -> bool:
         isinstance(exc, httpx.HTTPStatusError)
         and exc.response.status_code in (429, 502, 503, 504)
     )
+
+
+def _granule_of(url: str) -> str:
+    """``…/GRANULE.nc4.dap.nc4?dap4.ce=…`` → ``…/GRANULE.nc4`` (PRD 023).
+
+    The delivered-content identifier for one OPeNDAP granule: the granule's own
+    endpoint, with this request's DAP4 constraint and the ``.dap.nc4`` response
+    suffix removed. CMR granule concept-ids aren't in hand here — the planner
+    persists endpoints, not ids — and the endpoint is the provider's own stable
+    identifier for the same thing.
+    """
+    base = url.split("?", 1)[0]
+    return base[: -len(_DAP4_SUFFIX)] if base.endswith(_DAP4_SUFFIX) else base
 
 
 def _filename_from_url(url: str) -> str:

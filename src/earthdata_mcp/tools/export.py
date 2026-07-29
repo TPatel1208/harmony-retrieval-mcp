@@ -84,6 +84,15 @@ async def export_result(
     answer so existence never leaks. A ``job_`` handle (or any non-``obs_``/
     ``cube_`` prefix) raises ``ValueError`` — a caller bug, not a missing result.
 
+    A ready answer additionally carries ``content_digest``/``partial`` — and
+    ``granule_count`` when the granules are named — describing what the job
+    behind the handle **actually delivered** (PRD 023), so a consumer can key a
+    derived-artifact cache on delivered bytes rather than on filesystem
+    metadata that changes on every replay. All three are omitted entirely for a
+    handle materialized before that record existed, and for a transform-derived
+    ``cube_`` with no job behind it: an absent digest is never fabricated or
+    backfilled.
+
     ``edl_token`` (PRD 022) is accepted for surface uniformity and validated at
     the boundary; this read serves already-materialized local bytes, so the
     identity is not otherwise consulted.
@@ -138,7 +147,33 @@ async def export_result(
         "media_type": payload["media_type"],
         "size_bytes": size_bytes,
         "rematerialize_hint": _REMATERIALIZE_HINT,
+        **_delivered_content(payload),
     }
+
+
+def _delivered_content(payload: dict) -> dict:
+    """The delivered-content fields a ready handle's payload carries, or ``{}``.
+
+    The worker projects these onto the ``obs_`` handle from the authoritative
+    ``jobs.materialization`` record, in the same ``update_handle`` write that
+    resolves ``storage_key``/``media_type``/``size_bytes`` — so this read stays
+    what it has always been (resolve one handle), and a projected digest can
+    never describe a different materialization than the ``storage_key`` beside
+    it.
+
+    Empty for a legacy handle, for a ``cube_`` with no job behind it, and for
+    anything materialized before PRD 023: the fields are absent, not null, and
+    are never fabricated or backfilled (story 7). ``granule_count`` is likewise
+    omitted for a partial record, so a consumer never reads "not reported" as
+    zero granules.
+    """
+    digest = payload.get("content_digest")
+    if not digest:
+        return {}
+    delivered: dict = {"content_digest": digest, "partial": bool(payload.get("partial"))}
+    if payload.get("granule_count") is not None:
+        delivered["granule_count"] = payload["granule_count"]
+    return delivered
 
 
 async def rematerialize(
