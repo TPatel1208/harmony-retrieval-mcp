@@ -13,7 +13,7 @@ returning so a crash mid-task never leaves an uncommitted transition.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -131,6 +131,34 @@ async def previous_materialization(
     return (await session.execute(stmt)).scalars().first()
 
 
+async def rebuild_costs(session: AsyncSession, obs_handles: list[str]) -> dict[str, float]:
+    """The measured build cost (seconds) of the latest job behind each handle.
+
+    One query for the whole eviction candidate set rather than one per handle —
+    a sweep runs after every materialization, so this read must not grow a
+    round-trip per cached result (PRD 024 story 7). Handles with no job row (a
+    transform-owned ``cube_``) and jobs that reached READY before the column
+    existed are simply absent from the mapping; the caller substitutes its
+    configured default rather than reading absent as zero.
+    """
+    if not obs_handles:
+        return {}
+    stmt = (
+        select(Job.obs_handle, Job.rebuild_cost_seconds)
+        .where(
+            Job.obs_handle.in_(obs_handles),
+            Job.rebuild_cost_seconds.is_not(None),
+        )
+        .order_by(Job.created_at.desc())
+    )
+    costs: dict[str, float] = {}
+    for obs_handle, cost in (await session.execute(stmt)).all():
+        # Ordered newest-first, so the first row seen for a handle is its latest
+        # job — the cost of the build that actually produced what is cached now.
+        costs.setdefault(obs_handle, float(cost))
+    return costs
+
+
 async def reclaim_non_terminal(session: AsyncSession) -> list[Job]:
     """Return every job not in a terminal state — the restart-resume work list.
 
@@ -154,11 +182,32 @@ def set_state(job: Job, new_state: JobState, **extra: object) -> None:
     job.state = JobState(new_state).value
     for key, value in extra.items():
         setattr(job, key, value)
+    # PRD 024: what this job cost to build, measured at the one moment it is
+    # knowable — every path to READY funnels through here, so the eviction
+    # score never has to reconstruct it later from a row that has since been
+    # updated. An explicit `extra` wins (a replay may carry the original cost).
+    if JobState(new_state) is JobState.READY and "rebuild_cost_seconds" not in extra:
+        job.rebuild_cost_seconds = _elapsed_since(job.created_at)
     # PRD 022: the persisted per-call credential exists for the job's
     # operational life only — every transition funnels through here, so any
     # terminal state (success, failure, cancel, expiry) erases it at rest.
     if JobState(new_state) in TERMINAL_STATES:
         job.credential_encrypted = None
+
+
+def _elapsed_since(created_at: datetime | None) -> float | None:
+    """Wall-clock seconds from ``created_at`` to now, or ``None`` if unknowable.
+
+    ``created_at`` is a server default, so it is only ``None`` for a job that has
+    never been flushed — in which case there is no elapsed time to report and an
+    absent cost (which the eviction score reads as "use the default") is the
+    honest answer, not a fabricated zero.
+    """
+    if created_at is None:
+        return None
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return max((datetime.now(timezone.utc) - created_at).total_seconds(), 0.0)
 
 
 async def transition_state(

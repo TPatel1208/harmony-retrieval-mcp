@@ -29,6 +29,7 @@ from earthdata_mcp.tools import (
     export,
     preview,
     provenance,
+    retention,
     retrieval,
     transform,
     understanding,
@@ -447,6 +448,32 @@ async def rematerialize(
     ``{status: "not_found"}`` rather than raising.
     """
     return await export.rematerialize(handle, workspace_id, edl_token=edl_token)
+
+
+@mcp.tool
+async def pin_result(
+    handle: str,
+    pinned: bool = True,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
+) -> dict:
+    """Exempt a materialized ``obs_``/``cube_`` handle from cache eviction, or clear it.
+
+    Pin a result you will come back to: the materialization cache evicts by
+    value — biggest reclaim for the least rebuild cost, least-recently-read
+    first — and a pinned result is never selected, so unrelated work in the same
+    workspace cannot evict it. The pin is durable and survives a restart.
+
+    Returns ``{handle, status, pinned, pinned_bytes, pinned_bytes_max}``.
+    ``status`` is ``"refused"`` when the pin would put the workspace past its
+    pinned-bytes ceiling — the pin is *not* applied, and ``message`` says by how
+    much. An evicted handle answers ``{status: "expired"}``: rematerialize it
+    first, then pin it. An unknown or cross-workspace handle answers
+    ``{status: "not_found"}`` rather than raising.
+
+    Pass ``pinned=False`` to unpin; that is always allowed.
+    """
+    return await retention.pin_result(handle, pinned, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool

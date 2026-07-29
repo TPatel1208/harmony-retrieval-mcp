@@ -43,8 +43,24 @@ class Settings(BaseSettings):
     s3_direct_enabled: bool = False
     # Root for the local filesystem backend.
     earthdata_data_dir: str = "./data"
-    # Materialization cache eviction cap (bytes); default ~5 GiB
-    earthdata_cache_max_bytes: int = 5 * 1024**3
+    # Materialization cache eviction cap (bytes); default ~50 GiB. Raised from
+    # 5 GiB with PRD 024: a single Harmony result can be gigabytes, and a
+    # research box has disk. The cap is what bounds the cache; *what* it evicts
+    # when it is reached is the eviction score's job (jobs/eviction.py).
+    earthdata_cache_max_bytes: int = 50 * 1024**3
+    # Ceiling on bytes any one workspace may hold pinned (PRD 024). Pinned
+    # results are exempt from cap-driven eviction, so this is what stops pinning
+    # from being a way to monopolise a shared cache. Default ~10 GiB.
+    earthdata_pinned_bytes_max_per_workspace: int = 10 * 1024**3
+    # Build cost assumed for a result whose job never recorded one (a legacy row,
+    # or a transform-derived cube_ with no job). Deliberately non-zero: zero cost
+    # makes a result infinitely evictable, which would purge exactly the oldest
+    # and most established data first.
+    earthdata_rebuild_cost_default_seconds: float = 60.0
+    # How often orphan-blob reclamation runs. It is debris cleanup, not admission
+    # control, so it no longer runs on every materialization — listing every blob
+    # under four prefixes is O(cache) and belongs on a timer. Default 1 hour.
+    earthdata_orphan_sweep_interval_seconds: float = 3600.0
     # estimate_retrieval_size warns when the extrapolated total exceeds this
     # (MB); default ~10 GB — the gate the tool's docstring promises.
     size_warning_threshold_mb: float = 10 * 1024

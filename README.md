@@ -198,7 +198,10 @@ All settings come from environment variables (loaded from `.env` by Compose). Se
 | `REDIS_URL` | `redis://redis:6379/0` | Arq worker broker (set by Compose). |
 | `EARTHDATA_STORAGE` | `local` | `local` or `s3://bucket/prefix`. |
 | `EARTHDATA_DATA_DIR` | `/data` (Compose) / `./data` | Local materialization root (Zarr/Parquet land here). |
-| `EARTHDATA_CACHE_MAX_BYTES` | `5368709120` (~5 GiB) | Materialization cache eviction cap. |
+| `EARTHDATA_CACHE_MAX_BYTES` | `53687091200` (~50 GiB) | Materialization cache eviction cap. |
+| `EARTHDATA_PINNED_BYTES_MAX_PER_WORKSPACE` | `10737418240` (~10 GiB) | Ceiling on bytes one workspace may hold pinned (`pin_result`). |
+| `EARTHDATA_REBUILD_COST_DEFAULT_SECONDS` | `60` | Build cost assumed when a result's job never recorded one. |
+| `EARTHDATA_ORPHAN_SWEEP_INTERVAL_SECONDS` | `3600` | How often orphan-blob reclamation runs. |
 | `LOG_LEVEL` | `INFO` | Logging verbosity. |
 | `EARTHDATA_MCP_TRANSPORT` | `stdio` | `stdio` or `http` (streamable HTTP). See "Running the MCP server" above. |
 | `EARTHDATA_MCP_HOST` / `EARTHDATA_MCP_PORT` | `0.0.0.0` / `8765` | Bind address for `http` transport. |
@@ -266,7 +269,10 @@ Retrieval     retrieve_data · retrieve_subset · retrieve_timeseries ·
               get_retrieval_status · cancel_retrieval
 Preview       preview_dataset · summarize_dataset · inspect_statistics
 Transform     subset · reproject · resample · convert_format · align
+Egress        export_result · rematerialize
+Retention     pin_result
 Provenance    get_provenance · cite_dataset
+Workspace     list_workspace
 ```
 
 No analysis tools (correlation, trend, anomaly, hotspot, risk, narrative) — by

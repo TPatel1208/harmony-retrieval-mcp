@@ -59,7 +59,13 @@ def _summarize(handle_type: HandleType, payload: dict) -> dict:
     if handle_type is HandleType.AOI:
         return {"source": payload.get("source"), "bbox": payload.get("bbox")}
     if handle_type in (HandleType.OBS, HandleType.CUBE):
-        return {"status": payload.get("status"), "media_type": payload.get("media_type")}
+        return {
+            "status": payload.get("status"),
+            "media_type": payload.get("media_type"),
+            # PRD 024 story 4: a pin is only useful if it is visible — "why is
+            # this still here" and "why is this gone" both need an answer.
+            "pinned": bool(payload.get("pinned")),
+        }
     if handle_type is HandleType.JOB:
         return {
             "dataset_handle": payload.get("dataset_handle"),

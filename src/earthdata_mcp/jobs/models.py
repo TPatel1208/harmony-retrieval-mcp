@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, func, text
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -68,6 +68,14 @@ class Job(Base):
     # intent). NULL for every handle materialized before this column existed —
     # legacy records are absent, never backfilled.
     materialization: Mapped[dict | None] = mapped_column(JSONB, default=None)
+    # What this job cost to build, in wall-clock seconds from creation to READY
+    # (PRD 024) — stamped once by ``crud.set_state`` at that transition. The
+    # materialization cache evicts by value density, so it needs to know what it
+    # would be throwing away: a fifteen-minute Harmony result and a three-second
+    # OPeNDAP subset of the same size are not the same loss. NULL for every job
+    # that reached READY before this column existed; the eviction score
+    # substitutes a configured default rather than treating absent as free.
+    rebuild_cost_seconds: Mapped[float | None] = mapped_column(Float, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -116,6 +124,12 @@ async def create_jobs_schema(engine: AsyncEngine) -> None:
         )
         await conn.execute(
             text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS materialization JSONB")
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS "
+                "rebuild_cost_seconds DOUBLE PRECISION"
+            )
         )
 
 

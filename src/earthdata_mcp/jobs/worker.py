@@ -151,8 +151,13 @@ def _eviction(ctx: dict[str, Any]) -> EvictionService:
     """
     service = ctx.get("eviction")
     if service is None:
+        settings = get_settings()
         service = EvictionService(
-            _session_factory(ctx), get_storage_backend(), get_settings().earthdata_cache_max_bytes
+            _session_factory(ctx),
+            get_storage_backend(),
+            settings.earthdata_cache_max_bytes,
+            default_rebuild_cost_seconds=settings.earthdata_rebuild_cost_default_seconds,
+            orphan_sweep_interval_seconds=settings.earthdata_orphan_sweep_interval_seconds,
         )
         ctx["eviction"] = service
     return service

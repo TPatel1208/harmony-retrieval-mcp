@@ -91,6 +91,15 @@ class Handle(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    # When this handle was last *used* — written only by ``touch_handle`` (PRD
+    # 024). ``updated_at`` cannot answer this: it also moves on every status
+    # write, so a job transitioning to READY looks identical to a consumer
+    # reading the result. The eviction score needs the difference. NULL for a
+    # handle nobody has read since the column existed; the score falls back to
+    # ``updated_at``, so behavior is unchanged until reads start recording.
+    last_accessed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
 
 
 class ProvenanceEdge(Base):
