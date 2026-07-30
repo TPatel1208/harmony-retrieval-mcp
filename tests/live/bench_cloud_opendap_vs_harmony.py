@@ -32,7 +32,7 @@ from earthdata_mcp.jobs.state import JobState
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.providers.harmony import HarmonyProvider
 from earthdata_mcp.providers.opendap import OPeNDAPProvider, _resolve_from_cmr
-from earthdata_mcp.tools.retrieval import _opendap_url_of
+from earthdata_mcp.providers.opendap._planning import _opendap_url_of
 
 NETCDF = "application/x-netcdf"
 _GRANULE_CAP = 24          # bound OPeNDAP bundle + Harmony window for comparable cost
@@ -173,7 +173,7 @@ async def _run_case(cmr: CMRProvider, case: Case) -> list[Outcome]:
         limit=_GRANULE_CAP,
     )
     urls = [u for u in (_opendap_url_of(g) for g in granules) if u]
-    coord_lat, coord_lon, resolved = await _resolve_from_cmr(
+    coord_lat, coord_lon, _coord_time, resolved = await _resolve_from_cmr(
         cmr, concept_id, case.variables
     )
 
