@@ -7,6 +7,7 @@ as files under a configured data root.
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
 
 from earthdata_mcp.storage.backend import StatResult, StorageBackend
@@ -37,6 +38,21 @@ class LocalFilesystemBackend(StorageBackend):
             path.write_bytes(data)
 
         await asyncio.to_thread(_write)
+
+    async def put_file(self, key: str, path: Path) -> None:
+        """Copy ``path`` into the store chunk-by-chunk, never buffering it whole.
+
+        Overrides the base implementation (which reads the file into bytes) so a
+        multi-GB granule bundle costs one copy buffer instead of its full size.
+        ``copyfile`` also lets the OS use a fast copy path where it has one.
+        """
+
+        def _copy() -> None:
+            dest = self._path(key)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, dest)
+
+        await asyncio.to_thread(_copy)
 
     async def get(self, key: str) -> bytes:
         def _read() -> bytes:

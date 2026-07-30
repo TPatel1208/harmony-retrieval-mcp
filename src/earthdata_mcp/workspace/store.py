@@ -48,6 +48,8 @@ class HandleRecord:
     payload: dict
     created_at: datetime
     updated_at: datetime
+    #: When the handle was last read (``touch_handle``), or ``None`` if never.
+    last_accessed_at: datetime | None = None
 
 
 async def create_schema(engine: AsyncEngine) -> None:
@@ -58,6 +60,11 @@ async def create_schema(engine: AsyncEngine) -> None:
     uniqueness guarantee behind :meth:`WorkspaceStore.put_handle_unique_signature`
     (PRD 020 story 6: two concurrent identical ``retrieve_subset`` calls must
     collapse onto one job, not just usually collapse onto one).
+
+    ``create_all`` only creates a missing table — it never alters an existing
+    one — so a column added after the table exists (``last_accessed_at``, PRD
+    024) needs its own idempotent ``ADD COLUMN IF NOT EXISTS`` here, matching
+    ``jobs/models.py``'s convention.
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -67,6 +74,9 @@ async def create_schema(engine: AsyncEngine) -> None:
                 "ON handles (workspace_id, (payload->>'signature')) "
                 "WHERE handle_type = 'obs' AND payload ? 'signature'"
             )
+        )
+        await conn.execute(
+            text("ALTER TABLE handles ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMPTZ")
         )
 
 
@@ -199,12 +209,14 @@ class WorkspaceStore:
             return _to_record(row)
 
     async def touch_handle(self, workspace_id: str, handle: str) -> None:
-        """Bump ``handle``'s ``updated_at`` to now, without touching its payload.
+        """Record that ``handle`` was just *used*, without touching its payload.
 
-        The materialization cache's LRU eviction (PRD 015) orders candidates by
-        ``updated_at``; ``export_result`` (PRD 017) calls this so a result a
-        consumer is actively reading is never the first evicted. Same isolation
-        contract as :meth:`get_handle`.
+        This is the sole writer of ``last_accessed_at``, and that exclusivity is
+        the point (PRD 024): the eviction score reads it precisely because
+        ``updated_at`` cannot tell a consumer's read apart from the worker's own
+        status write. ``export_result`` (PRD 017) calls this so a result someone
+        is actively reading is never the first evicted. Same isolation contract
+        as :meth:`get_handle`.
         """
         async with self._session_factory() as session:
             row = await session.get(Handle, handle)
@@ -214,7 +226,7 @@ class WorkspaceStore:
                 raise CrossWorkspaceError(
                     f"handle {handle!r} is not owned by workspace {workspace_id!r}"
                 )
-            row.updated_at = func.now()
+            row.last_accessed_at = func.now()
             await session.commit()
 
     async def find_handle_by_payload_value(
@@ -268,4 +280,5 @@ def _to_record(row: Handle) -> HandleRecord:
         payload=dict(row.payload or {}),
         created_at=row.created_at,
         updated_at=row.updated_at,
+        last_accessed_at=row.last_accessed_at,
     )

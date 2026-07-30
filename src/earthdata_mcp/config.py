@@ -43,11 +43,49 @@ class Settings(BaseSettings):
     s3_direct_enabled: bool = False
     # Root for the local filesystem backend.
     earthdata_data_dir: str = "./data"
-    # Materialization cache eviction cap (bytes); default ~5 GiB
-    earthdata_cache_max_bytes: int = 5 * 1024**3
+    # Materialization cache eviction cap (bytes); default ~50 GiB. Raised from
+    # 5 GiB with PRD 024: a single Harmony result can be gigabytes, and a
+    # research box has disk. The cap is what bounds the cache; *what* it evicts
+    # when it is reached is the eviction score's job (jobs/eviction.py).
+    earthdata_cache_max_bytes: int = 50 * 1024**3
+    # Ceiling on bytes any one workspace may hold pinned (PRD 024). Pinned
+    # results are exempt from cap-driven eviction, so this is what stops pinning
+    # from being a way to monopolise a shared cache. Default ~10 GiB.
+    earthdata_pinned_bytes_max_per_workspace: int = 10 * 1024**3
+    # Build cost assumed for a result whose job never recorded one (a legacy row,
+    # or a transform-derived cube_ with no job). Deliberately non-zero: zero cost
+    # makes a result infinitely evictable, which would purge exactly the oldest
+    # and most established data first.
+    earthdata_rebuild_cost_default_seconds: float = 60.0
+    # How often orphan-blob reclamation runs. It is debris cleanup, not admission
+    # control, so it no longer runs on every materialization — listing every blob
+    # under four prefixes is O(cache) and belongs on a timer. Default 1 hour.
+    earthdata_orphan_sweep_interval_seconds: float = 3600.0
     # estimate_retrieval_size warns when the extrapolated total exceeds this
     # (MB); default ~10 GB — the gate the tool's docstring promises.
     size_warning_threshold_mb: float = 10 * 1024
+
+    # Adjacent-granule prefetch (PRD 025) ----------------------------------
+    # Ships OFF, and that is the decision, not an oversight: prefetching spends
+    # provider quota, worker capacity and cache bytes on data nobody has asked
+    # for. Turn it on, then read `prefetch-hit` over `prefetch-issued` out of the
+    # logs — the feature earns its default by measurement, not by argument.
+    earthdata_prefetch_enabled: bool = False
+    # Ceiling on what one speculative retrieval may be estimated to cost, in
+    # bytes. Deliberately far below `size_warning_threshold_mb` above: a guess is
+    # not allowed to cost what a request a researcher actually made can. Default
+    # ~2 GiB.
+    earthdata_prefetch_max_bytes: int = 2 * 1024**3
+    # How many speculative jobs one workspace may be issued per rolling day —
+    # the backstop that keeps a long sequential exploration from turning into an
+    # unbounded quota spend even though prefetch itself never chains.
+    earthdata_prefetch_budget_per_workspace_per_day: int = 24
+    # How far in the past a predicted window must already end before it is
+    # prefetchable. This stands in for the collection's *latency*: UMM-C gives no
+    # per-collection latency we can trust, and prefetching a window upstream has
+    # not finished filling buys a partial result that gets re-fetched the moment
+    # the rest lands — spending quota twice for one window. Default 48 hours.
+    earthdata_prefetch_min_window_age_hours: float = 48.0
     # Worker startup reclaim (PRD 004): a non-terminal job older than this is
     # failed as stale instead of re-enqueued forever. Generous by default — real
     # Harmony/AppEEARS jobs can legitimately run for hours.
@@ -65,6 +103,12 @@ class Settings(BaseSettings):
     edl_username: str = ""
     edl_password: str = ""
     earthdata_token: str = ""
+    # Per-call credential encryption (PRD 022): the repo-private Fernet key the
+    # durable job row's encrypted-credential column is written under — explicitly
+    # a different key than any consumer holds. Comma-separate keys to rotate
+    # (MultiFernet: first key encrypts, all keys decrypt). Empty means per-call
+    # edl_token support is off; the env-credential path needs no key.
+    earthdata_credential_key: str = ""
 
     # Per-provider rate limiting ------------------
     # Token-bucket refill rate in requests/sec at each provider's HTTP boundary.
@@ -74,6 +118,15 @@ class Settings(BaseSettings):
     harmony_rate_per_sec: float = 10.0
     appeears_rate_per_sec: float = 10.0
     opendap_rate_per_sec: float = 10.0
+
+    # Concurrent in-flight granule downloads during materialize, shared by both
+    # providers: bounds OPeNDAPProvider's per-materialize asyncio.Semaphore
+    # (opendap/_runtime.py) and is exported as harmony-py's own NUM_REQUESTS_WORKERS
+    # env var (jobs/worker.py, read by harmony.Client at construction). Both
+    # providers stream granules straight to disk, so this trades network/decompress
+    # parallelism against disk I/O and open file descriptors, not RAM — raising it
+    # doesn't multiply peak memory the way concurrent in-RAM buffering would.
+    retrieval_download_concurrency: int = 6
 
     # MCP transport / bearer token (PRD 018) --------------------------------
     # stdio (default) requires being the consumer's child process; http is the

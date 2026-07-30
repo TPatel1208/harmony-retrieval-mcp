@@ -22,7 +22,7 @@ import pytest
 from earthdata_mcp.jobs import crud
 from earthdata_mcp.jobs.models import Job
 from earthdata_mcp.jobs.state import JobState
-from earthdata_mcp.jobs.worker import startup
+from earthdata_mcp.jobs.worker import lifecycle_job_id, startup
 
 
 async def _seed_job(session_factory, state: JobState) -> str:
@@ -64,7 +64,7 @@ async def test_startup_reclaims_pending(session_factory) -> None:
 
     await startup(ctx)
 
-    ctx["redis"].enqueue_job.assert_any_await("submit_job", job_id)
+    assert ("submit_job", job_id) in _enqueued(ctx["redis"])
 
 
 async def test_startup_reclaims_submitted(session_factory) -> None:
@@ -73,7 +73,7 @@ async def test_startup_reclaims_submitted(session_factory) -> None:
 
     await startup(ctx)
 
-    ctx["redis"].enqueue_job.assert_any_await("poll_job", job_id)
+    assert ("poll_job", job_id) in _enqueued(ctx["redis"])
 
 
 async def test_startup_reclaims_running(session_factory) -> None:
@@ -82,7 +82,7 @@ async def test_startup_reclaims_running(session_factory) -> None:
 
     await startup(ctx)
 
-    ctx["redis"].enqueue_job.assert_any_await("poll_job", job_id)
+    assert ("poll_job", job_id) in _enqueued(ctx["redis"])
 
 
 async def test_startup_reclaims_materializing(session_factory) -> None:
@@ -91,7 +91,7 @@ async def test_startup_reclaims_materializing(session_factory) -> None:
 
     await startup(ctx)
 
-    ctx["redis"].enqueue_job.assert_any_await("materialize_job", job_id)
+    assert ("materialize_job", job_id) in _enqueued(ctx["redis"])
 
 
 async def test_startup_resumes_pending_with_correct_task_only(session_factory) -> None:
@@ -207,7 +207,37 @@ async def test_startup_still_reenqueues_valid_recent_job(session_factory) -> Non
 
     await startup(ctx)
 
-    ctx["redis"].enqueue_job.assert_any_await("poll_job", job_id)
+    assert ("poll_job", job_id) in _enqueued(ctx["redis"])
     async with session_factory() as session:
         job = await crud.get_job(session, job_id)
     assert job.state == JobState.SUBMITTED.value
+
+
+# -- idempotent re-enqueue: a restart never multiplies in-flight copies ----
+
+
+async def test_startup_resume_uses_a_stable_arq_job_id(session_factory) -> None:
+    """Two reclaim passes enqueue the *same* arq job id for the same job.
+
+    Regression (live wedge): every ``enqueue_job`` used a fresh random arq id, so
+    a crash-looping worker left one more copy of each non-terminal job queued per
+    restart — 4 stuck jobs became 20 in-flight arq entries, which filled arq's
+    default 10 concurrency slots and starved every new submit/poll. Passing a
+    deterministic ``_job_id`` makes the re-enqueue idempotent: arq drops the
+    duplicate instead of stacking it.
+    """
+    job_id = await _seed_job(session_factory, JobState.MATERIALIZING)
+    ctx = _ctx(session_factory)
+
+    await startup(ctx)
+    await startup(ctx)
+
+    mine = [
+        call
+        for call in ctx["redis"].enqueue_job.await_args_list
+        if call.args[1:] == (job_id,)
+    ]
+    assert len(mine) == 2, "both passes should attempt the resume"
+    assert {call.kwargs.get("_job_id") for call in mine} == {
+        lifecycle_job_id("materialize_job", job_id)
+    }

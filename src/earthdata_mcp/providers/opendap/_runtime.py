@@ -31,9 +31,10 @@ in the provider — the read path understands netCDF directly.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
+import tempfile
 import zipfile
+from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -89,6 +90,7 @@ class OPeNDAPProvider:
         storage: StorageBackend | None = None,
         settings: Settings | None = None,
         timeout: float = 300.0,
+        edl_token: str | None = None,
     ) -> None:
         self._caps = capabilities
         # The window's granule OPeNDAP base URLs (sans the .dap.nc4 suffix). In
@@ -120,6 +122,9 @@ class OPeNDAPProvider:
         self._storage = storage
         self._settings = settings or get_settings()
         self._timeout = timeout
+        # Per-call identity (PRD 022): a per-instance bearer that wins over the
+        # env token in _auth_headers — no process-env mutation, no earthaccess.
+        self._edl_token = edl_token
 
     # -- capability gate --------------------------------------------------
 
@@ -164,6 +169,13 @@ class OPeNDAPProvider:
         """OPeNDAP is synchronous — the subset is ready as soon as it is built."""
         return JobStatus(state=JobState.READY, progress=100)
 
+    async def cancel(self, job: JobRef) -> None:
+        """Documented no-op (PRD 021): OPeNDAP is synchronous — each granule fetch
+        completes (or fails) within a single ``materialize`` call, so there is no
+        durable upstream job for a provider-side cancel to reach. Present only to
+        satisfy the ``RetrievalProvider`` Protocol uniformly."""
+        return None
+
     async def materialize(self, job: JobRef) -> MaterializedResult:
         """Fetch each DAP4 subset off the JobRef and persist them as one zip bundle.
 
@@ -173,6 +185,14 @@ class OPeNDAPProvider:
         bundled into a single :class:`StorageBackend` object so one obs handle maps to
         one key, matching how every other provider stores one result; ``tools/_dataio``
         opens the bundle and concatenates the granules on read.
+
+        Every granule streams straight to a scratch file on disk
+        (:meth:`_fetch_all`) and the zip is built member-by-member from those
+        files — mirrors
+        :meth:`~earthdata_mcp.providers.harmony.HarmonyProvider.materialize`
+        (fixed by commit 9802d84 after an in-RAM-bundled 50-granule Harmony
+        request OOM-killed the process): nothing here ever holds a whole
+        granule, let alone the whole bundle, in memory.
         """
         joined = job.provider_job_url
         if not joined:
@@ -181,26 +201,44 @@ class OPeNDAPProvider:
                 "provider_job_url (the durable coordinate, PLAN.md §4.5)"
             )
         urls = [u for u in joined.split(_URL_SEP) if u]
-        # Fetch all granules concurrently; order is preserved by asyncio.gather.
-        chunks = await asyncio.gather(*[self._fetch(u) for u in urls])
-        buf = io.BytesIO()
-        total = 0
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for url, data in zip(urls, chunks):
-                total += len(data)
-                zf.writestr(_filename_from_url(url), data)
-        bundle = buf.getvalue()
 
-        storage = self._storage_backend()
-        handle = job.job_handle or "result"
-        key = f"{PROVIDER}/{handle}/subset.nc.zip"
-        await storage.put(key, bundle)
-        return MaterializedResult(
-            storage_key=key,
-            media_type=_NETCDF_BUNDLE_MEDIA_TYPE,
-            size_bytes=len(bundle),
-            extra={"granule_count": len(urls), "uncompressed_bytes": total},
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fetched = await self._fetch_all(urls, Path(tmp))
+
+            bundle_path = Path(tmp) / "_bundle.nc.zip"
+            total = 0
+
+            def _write_bundle() -> None:
+                nonlocal total
+                with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for path, arcname in fetched:
+                        total += path.stat().st_size
+                        zf.write(path, arcname=arcname)
+
+            # Off the event loop, same as HarmonyProvider.materialize's own
+            # disk-based bundle build — ZIP_DEFLATED compression is CPU-bound
+            # and would otherwise block every other concurrent task/job in
+            # this worker process for its duration.
+            await asyncio.to_thread(_write_bundle)
+
+            storage = self._storage_backend()
+            handle = job.job_handle or "result"
+            key = f"{PROVIDER}/{handle}/subset.nc.zip"
+            await storage.put_file(key, bundle_path)
+            return MaterializedResult(
+                storage_key=key,
+                media_type=_NETCDF_BUNDLE_MEDIA_TYPE,
+                size_bytes=bundle_path.stat().st_size,
+                extra={
+                    "granule_count": len(urls),
+                    "uncompressed_bytes": total,
+                    # PRD 023: which granules this run actually fetched. The
+                    # DAP4 constraint is derived from the spec and would only
+                    # restate the intent, so it is stripped — what varies
+                    # between two runs of the same spec is the granule set.
+                    "granule_ids": [_granule_of(u) for u in urls],
+                },
+            )
 
     # -- DAP4 request mapping (the only logic we own) ---------------------
 
@@ -231,13 +269,77 @@ class OPeNDAPProvider:
 
     # -- HTTP / storage construction --------------------------------------
 
-    async def _fetch(self, url: str) -> bytes:
-        """GET the DAP4 subset bytes (Bearer-authenticated when a token is set).
+    async def _fetch_all(self, urls: list[str], dest_dir: Path) -> list[tuple[Path, str]]:
+        """Fetch every URL to a file under ``dest_dir``, concurrently.
+
+        Returns ``(disk_path, arcname)`` pairs, in ``urls`` order. ``disk_path``
+        is unique by *position*, never by the granule's own name — two URLs
+        whose ``_filename_from_url`` collide (a duplicate/overlapping CMR
+        result, or two granules that both fall through to the same fallback
+        name) would otherwise both stream into the identical on-disk path at
+        once with no coordination, silently corrupting one or both. This is a
+        real risk specifically because fetches run *concurrently* here — the
+        old code only ever built the zip (via an in-memory ``zf.writestr``
+        keyed by name) sequentially, after every fetch had already finished, so
+        a name collision there just produced two same-named zip members rather
+        than interleaved bytes on disk. ``arcname`` (the plain granule name)
+        is what a caller building the zip should use instead, so a genuine
+        collision still reproduces that old, merely-odd outcome.
+
+        Bounded by ``retrieval_download_concurrency`` — a semaphore local to
+        this call, deliberately not process-wide (cross-job concurrency across
+        simultaneous retrievals is a separate, unaddressed question) — and
+        fail-fast: the first granule to error cancels every other in-flight
+        fetch via :class:`asyncio.TaskGroup`, instead of letting them run to
+        completion in the background the way a plain ``asyncio.gather`` would.
+
+        ``TaskGroup`` wraps whatever failed in an ``ExceptionGroup``. Every
+        exception in it is logged here (so a second, concurrent failure is
+        never silently dropped) and only the first is re-raised bare — matching
+        the old sequential ``asyncio.gather``'s "first exception wins" shape, so
+        ``materialize_job``'s credential/error classification (which switches on
+        the caught exception's own type) keeps working unchanged. A cancellation
+        reaching in from *outside* this call (e.g. Arq's job_timeout firing
+        mid-fetch) is a pure ``BaseExceptionGroup`` of ``CancelledError`` and
+        is intentionally left unwrapped — that shape already reaches
+        ``materialize_job``'s ``except BaseException`` handler correctly.
+        """
+        sem = asyncio.Semaphore(self._settings.retrieval_download_concurrency)
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tasks = [
+                    tg.create_task(self._fetch_to_file(url, dest_dir, sem, index))
+                    for index, url in enumerate(urls)
+                ]
+        except* Exception as eg:
+            for exc in eg.exceptions:
+                logger.error("OPeNDAP granule fetch failed: %s", exc, exc_info=exc)
+            raise eg.exceptions[0] from None
+        return [t.result() for t in tasks]
+
+    async def _fetch_to_file(
+        self, url: str, dest_dir: Path, sem: asyncio.Semaphore, index: int
+    ) -> tuple[Path, str]:
+        """Stream one DAP4 subset straight to a file under ``dest_dir``; return
+        ``(disk_path, arcname)`` — see :meth:`_fetch_all` for why the two names
+        differ.
 
         Retries up to 3× on transient 5xx / 429 with exponential backoff (2 s,
-        4 s, 8 s). A persistent 503 after all retries surfaces a message that
-        names the direct-download alternative so the caller is not left guessing.
+        4 s, 8 s). Both the concurrency semaphore and the HTTP client are
+        scoped to a single attempt — acquired/constructed fresh inside the
+        retried function, not around the whole retry loop — so a granule
+        sitting in backoff sleep releases its concurrency slot for another
+        pending granule instead of holding it idle for up to ~14s across
+        retries, and every attempt gets an isolated connection/cookie jar
+        instead of reusing whatever a failed attempt left behind (relevant
+        given EDL's redirect-based SSO can set session cookies). Each attempt
+        reopens the destination file in ``"wb"`` (truncating any partial write
+        from a prior attempt), so a retry never appends onto a half-written
+        file. A persistent 503 after all retries surfaces a message that names
+        the direct-download alternative so the caller is not left guessing.
         """
+        arcname = _filename_from_url(url)
+        dest = dest_dir / f"{index:04d}_{arcname}"
         await get_limiter(PROVIDER).acquire()
 
         @tenacity.retry(
@@ -246,28 +348,30 @@ class OPeNDAPProvider:
             stop=tenacity.stop_after_attempt(4),
             reraise=True,
         )
-        async def _do_get() -> bytes:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.get(
-                    url, headers=self._auth_headers(), follow_redirects=True
-                )
-                try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code in (502, 503, 504, 429):
+        async def _do_get() -> None:
+            async with sem, httpx.AsyncClient(timeout=self._timeout) as client:
+                async with client.stream(
+                    "GET", url, headers=self._auth_headers(), follow_redirects=True
+                ) as response:
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code in (502, 503, 504, 429):
+                            raise
+                        if exc.response.status_code == 503:
+                            raise RuntimeError(
+                                f"OPeNDAP server returned 503 for {url!r} — the DAP4 "
+                                "endpoint for this collection appears persistently "
+                                "unavailable. Consider direct HTTPS/S3 download of the "
+                                "full granule file and subsetting locally."
+                            ) from exc
                         raise
-                    if exc.response.status_code == 503:
-                        raise RuntimeError(
-                            f"OPeNDAP server returned 503 for {url!r} — the DAP4 "
-                            "endpoint for this collection appears persistently "
-                            "unavailable. Consider direct HTTPS/S3 download of the "
-                            "full granule file and subsetting locally."
-                        ) from exc
-                    raise
-                return response.content
+                    with open(dest, "wb") as f:
+                        async for chunk in response.aiter_bytes():
+                            f.write(chunk)
 
         try:
-            return await _do_get()
+            await _do_get()
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in (502, 503, 504):
                 raise RuntimeError(
@@ -277,9 +381,10 @@ class OPeNDAPProvider:
                     "download of the full granule file and subsetting locally."
                 ) from exc
             raise
+        return dest, arcname
 
     def _auth_headers(self) -> dict[str, str]:
-        token = self._settings.earthdata_token or None
+        token = self._edl_token or self._settings.earthdata_token or None
         return {"Authorization": f"Bearer {token}"} if token else {}
 
     def _storage_backend(self) -> StorageBackend:
@@ -302,6 +407,19 @@ def _is_transient_http_error(exc: BaseException) -> bool:
         isinstance(exc, httpx.HTTPStatusError)
         and exc.response.status_code in (429, 502, 503, 504)
     )
+
+
+def _granule_of(url: str) -> str:
+    """``…/GRANULE.nc4.dap.nc4?dap4.ce=…`` → ``…/GRANULE.nc4`` (PRD 023).
+
+    The delivered-content identifier for one OPeNDAP granule: the granule's own
+    endpoint, with this request's DAP4 constraint and the ``.dap.nc4`` response
+    suffix removed. CMR granule concept-ids aren't in hand here — the planner
+    persists endpoints, not ids — and the endpoint is the provider's own stable
+    identifier for the same thing.
+    """
+    base = url.split("?", 1)[0]
+    return base[: -len(_DAP4_SUFFIX)] if base.endswith(_DAP4_SUFFIX) else base
 
 
 def _filename_from_url(url: str) -> str:

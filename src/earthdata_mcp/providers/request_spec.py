@@ -23,14 +23,19 @@ time range and the resolved variable names, so both are threaded in directly.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from earthdata_mcp.providers._capabilities import CollectionCapabilities
 from earthdata_mcp.providers.base import AOI, RetrievalPlan, TimeRange, TransformSpec
 from earthdata_mcp.providers.opendap import AxisGeometry, VarDimPlan
 from earthdata_mcp.providers.router import RoutingDecision
 
-__all__ = ["InvalidSpecError", "RequestSpec", "compute_request_signature"]
+__all__ = [
+    "InvalidSpecError",
+    "RequestSpec",
+    "compute_cache_key",
+    "compute_request_signature",
+]
 
 _DEFAULT_FORMAT = "application/netcdf4"
 
@@ -117,7 +122,7 @@ class RequestSpec:
             if variables is not None
             else (plan.transform.variables if plan.transform else ())
         )
-        key = _compute_cache_key(
+        key = compute_cache_key(
             short_name=caps.short_name,
             output_format=plan.output_format,
             bbox=bbox,
@@ -257,6 +262,37 @@ class RequestSpec:
         """The materialization cache key computed at :meth:`from_plan` time."""
         return self.cache_key_value
 
+    # -- derivation ------------------------------------------------------------
+
+    def for_time_range(self, time_range: str) -> RequestSpec:
+        """This same ask, over a different time window (PRD 025).
+
+        Three fields are about the *window* rather than about the ask, and all
+        three are cleared rather than carried:
+
+        * ``opendap_urls`` — granule URLs discovered for the old window.
+          Carrying them over would fetch the old window's granules and file
+          them under the new window's signature, which is the one way
+          speculation could corrupt the cache instead of merely wasting it.
+        * ``job_handle``/``obs_handle`` — a derived spec belongs to whatever job
+          its caller mints for it, never to the job it was derived from.
+        * ``cache_key_value`` — :func:`compute_cache_key` folds in the service
+          *capabilities version*, which the spec does not persist, so a derived
+          spec cannot honestly reconstruct it. The caller recomputes it once it
+          has fresh capabilities in hand.
+
+        Coordinate names, axis geometry and the var-dims plan describe the
+        collection's *grid*, not one window's granules, so they survive.
+        """
+        return replace(
+            self,
+            time_range=time_range,
+            opendap_urls=(),
+            job_handle="",
+            obs_handle="",
+            cache_key_value="",
+        )
+
 
 # -- axis-geometry / var-dims (de)serialization ------------------------------
 
@@ -314,7 +350,7 @@ def _expansions_from_jsonb(data: dict | None) -> dict[str, tuple[str, ...]]:
 # -- cache key -----------------------------------------------------------
 
 
-def _compute_cache_key(
+def compute_cache_key(
     *,
     short_name: str | None,
     output_format: str,
@@ -351,10 +387,11 @@ def compute_request_signature(
     time_range: str | None,
     variables: tuple[str, ...],
     output_format: str,
+    identity_scope: str | None = None,
 ) -> str:
     """The canonical signature of a *request*, for ``retrieve_subset``'s
     exact-match reuse lookup (PRD 020) — deliberately distinct from
-    :func:`_compute_cache_key` above.
+    :func:`compute_cache_key` above.
 
     ``cache_key`` is a materialization identity: it folds in ``service_name``
     and ``service_version``, i.e. *how* the request was routed, and (today)
@@ -375,9 +412,19 @@ def compute_request_signature(
     order/repetition never matters. A strict subset of a wider time range (or
     of a wider variable list) is a deliberate miss — no containment
     reasoning here, exact match only.
+
+    ``identity_scope`` (PRD 022) is the credential-identity dimension: ``None``
+    for a collection CMR reports as unrestricted (cross-user reuse preserved —
+    the signature string is then byte-identical to the pre-PRD-022 form), or
+    the fetching identity's scope key (EDL username, or the service identity)
+    for a restricted/unknown collection, so bytes fetched under one user's
+    entitlements are never served to another.
     """
     aoi_str = ",".join(str(c) for c in bbox) if bbox is not None else ""
     canonical_time = TimeRange.from_cmr(time_range).to_cmr() if time_range else ""
     var_str = ",".join(sorted(set(variables)))
-    raw = ":".join([concept_id or "", aoi_str, canonical_time, var_str, output_format])
+    parts = [concept_id or "", aoi_str, canonical_time, var_str, output_format]
+    if identity_scope is not None:
+        parts.append(f"identity={identity_scope}")
+    raw = ":".join(parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]

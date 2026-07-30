@@ -129,21 +129,37 @@ async def test_update_handle_cross_workspace_denied(
 # --- touch_handle ----------------------------------------------------------
 
 
-async def test_touch_handle_bumps_updated_at_without_changing_payload(
+async def test_touch_handle_records_the_read_without_changing_payload(
     workspace_store: WorkspaceStore, workspace_id: str
 ) -> None:
-    """PRD 017: ``export_result`` LRU-touches a materialized result so it is
-    never the first evicted — the payload must survive untouched."""
+    """PRD 017: ``export_result`` touches a materialized result so it is never
+    the first evicted — the payload must survive untouched. PRD 024: what the
+    touch records is ``last_accessed_at``, which nothing else writes, so the
+    eviction score can tell a genuine read from a status write."""
     handle = await workspace_store.put_handle(
         workspace_id, HandleType.OBS, {"status": "ready", "storage_key": "x/g.nc"}
     )
-    before = (await workspace_store.get_handle(workspace_id, handle)).updated_at
+    assert (await workspace_store.get_handle(workspace_id, handle)).last_accessed_at is None
 
     await workspace_store.touch_handle(workspace_id, handle)
 
     record = await workspace_store.get_handle(workspace_id, handle)
-    assert record.updated_at > before
+    assert record.last_accessed_at is not None
     assert record.payload == {"status": "ready", "storage_key": "x/g.nc"}
+
+
+async def test_a_status_write_does_not_record_an_access(
+    workspace_store: WorkspaceStore, workspace_id: str
+) -> None:
+    """``update_handle`` bumps ``updated_at`` — that is what "row changed" means
+    — but it must not claim anyone read the result (PRD 024)."""
+    handle = await workspace_store.put_handle(
+        workspace_id, HandleType.OBS, {"status": "pending"}
+    )
+
+    await workspace_store.update_handle(workspace_id, handle, {"status": "ready"})
+
+    assert (await workspace_store.get_handle(workspace_id, handle)).last_accessed_at is None
 
 
 async def test_touch_handle_cross_workspace_denied(

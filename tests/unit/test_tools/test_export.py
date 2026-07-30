@@ -18,6 +18,7 @@ from sqlalchemy import update
 from earthdata_mcp.jobs import crud
 from earthdata_mcp.jobs.models import Job
 from earthdata_mcp.jobs.state import JobState
+from earthdata_mcp.providers.materialization import MaterializationRecord
 from earthdata_mcp.tools.export import export_result, rematerialize
 from earthdata_mcp.workspace.models import Handle, HandleType, mint_handle
 
@@ -40,7 +41,9 @@ async def _seed_obs(
     return handle, key
 
 
-async def _seed_job_for_obs(session_factory, workspace_id, obs_handle, request_spec=None) -> Job:
+async def _seed_job_for_obs(
+    session_factory, workspace_id, obs_handle, request_spec=None, materialization=None
+) -> Job:
     job_id = uuid4().hex
     spec = request_spec or {
         "concept_id": "C1-X",
@@ -57,6 +60,7 @@ async def _seed_job_for_obs(session_factory, workspace_id, obs_handle, request_s
             request_spec=spec,
             state=JobState.READY.value,
             progress=100,
+            materialization=materialization,
         )
         session.add(job)
         await session.commit()
@@ -290,3 +294,87 @@ async def test_rematerialize_rejects_job_handle(workspace_store, workspace_id) -
     job_handle = mint_handle(HandleType.JOB)
     with pytest.raises(ValueError, match="obs_ or cube_"):
         await rematerialize(job_handle, workspace_id=workspace_id, store=workspace_store)
+
+
+# -- delivered-content identity (PRD 023) --------------------------------------
+
+
+async def _seed_delivered_obs(workspace_store, local_backend, workspace_id, record):
+    """A ready obs_ handle carrying the delivered-content projection the worker
+    writes alongside its storage key (``jobs/worker._delivered_projection``)."""
+    data, key = b"hello world", f"harmony/{workspace_id}/{uuid4().hex}.nc"
+    await local_backend.put(key, data)
+    payload = {
+        "status": "ready",
+        "storage_key": key,
+        "media_type": "application/x-netcdf",
+        "size_bytes": len(data),
+        "content_digest": record.content_digest,
+        "partial": record.partial,
+    }
+    if record.granule_ids is not None:
+        payload["granule_count"] = len(set(record.granule_ids))
+    return await workspace_store.put_handle(workspace_id, HandleType.OBS, payload)
+
+
+async def test_export_result_exposes_the_materialized_content_digest(
+    workspace_store, local_backend, workspace_id,
+) -> None:
+    """PRD 023 story 1: a consumer keying a derived-artifact cache gets an
+    identifier for what the handle actually contains — and a granule tally that
+    is an outcome, not the planning-time guess the spec carries."""
+    record = MaterializationRecord(
+        granule_ids=("G1", "G2", "G3"),
+        provider_used="opendap",
+        service_chain=None,
+        output_format="application/netcdf4",
+    )
+    handle = await _seed_delivered_obs(workspace_store, local_backend, workspace_id, record)
+
+    out = await export_result(
+        handle, workspace_id=workspace_id, store=workspace_store, storage=local_backend,
+    )
+
+    assert out["content_digest"] == record.content_digest
+    assert out["granule_count"] == 3
+    assert out["partial"] is False
+
+
+async def test_export_result_omits_the_digest_for_a_legacy_handle(
+    workspace_store, local_backend, workspace_id,
+) -> None:
+    """PRD 023 story 7: a handle materialized before this PRD has no record —
+    the fields are simply absent, never fabricated or backfilled, and every
+    pre-existing field is byte-identical."""
+    handle, _key = await _seed_obs(workspace_store, local_backend, workspace_id)
+
+    out = await export_result(
+        handle, workspace_id=workspace_id, store=workspace_store, storage=local_backend,
+    )
+
+    assert set(out) == {
+        "handle", "status", "storage_uri", "media_type", "size_bytes", "rematerialize_hint",
+    }
+
+
+async def test_export_result_flags_a_partial_digest_as_untrustworthy(
+    workspace_store, local_backend, workspace_id,
+) -> None:
+    """An AppEEARS point sample names no granules: the digest is still stable,
+    but a consumer must be able to decline to trust it — and must never see a
+    granule_count of 0 standing in for "not reported"."""
+    record = MaterializationRecord(
+        granule_ids=None,
+        provider_used="appeears",
+        service_chain=None,
+        output_format="application/x-parquet",
+    )
+    handle = await _seed_delivered_obs(workspace_store, local_backend, workspace_id, record)
+
+    out = await export_result(
+        handle, workspace_id=workspace_id, store=workspace_store, storage=local_backend,
+    )
+
+    assert out["content_digest"] == record.content_digest
+    assert out["partial"] is True
+    assert "granule_count" not in out

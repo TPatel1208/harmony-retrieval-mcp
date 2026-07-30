@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from earthdata_mcp.redaction import redact_obj
 from earthdata_mcp.workspace.models import (
     ProvenanceEdge,
     ProvenanceEvent,
@@ -94,8 +95,10 @@ class ProvenanceStore:
 
         The edge carries the durable, re-materializable ``request_spec`` and the
         ``granule_ids`` consumed — not a staged-output URL. A spec that smuggles
-        a URL in as its source of truth is rejected.
+        a URL in as its source of truth is rejected. Redacted before persisting
+        (PRD 022): a provenance record must never carry a registered credential.
         """
+        request_spec = redact_obj(request_spec)
         _reject_url_spec(request_spec)
         async with self._session_factory() as session:
             session.add(
@@ -116,14 +119,19 @@ class ProvenanceStore:
         event_type: ProvenanceEventType,
         detail: dict | None = None,
     ) -> None:
-        """Record a first-class lineage event against ``handle``."""
+        """Record a first-class lineage event against ``handle``.
+
+        ``detail`` is scrubbed through the redaction chokepoint first (PRD 022):
+        the job trail is one of the observability surfaces a per-call credential
+        must never reach, and every trail write funnels through here.
+        """
         async with self._session_factory() as session:
             session.add(
                 ProvenanceEvent(
                     workspace_id=workspace_id,
                     handle=handle,
                     event_type=ProvenanceEventType(event_type).value,
-                    detail=detail or {},
+                    detail=redact_obj(detail or {}),
                 )
             )
             await session.commit()

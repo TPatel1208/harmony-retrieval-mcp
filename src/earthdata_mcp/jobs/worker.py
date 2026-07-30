@@ -19,6 +19,7 @@ the row.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
@@ -35,12 +36,48 @@ from earthdata_mcp.jobs.models import Job
 from earthdata_mcp.jobs.state import TERMINAL_STATES, JobState
 from earthdata_mcp.providers.base import JobRef, RetrievalProvider
 from earthdata_mcp.providers.cmr import CMRProvider
+from earthdata_mcp.providers.identity import (
+    EULA_NOT_ACCEPTED,
+    CredentialError,
+    EDLIdentity,
+    TokenExpiredError,
+    classify_credential_failure,
+    decrypt_credential,
+    parse_edl_token,
+)
+from earthdata_mcp.jobs.prefetch import PrefetchService
+from earthdata_mcp.providers.materialization import MaterializationRecord
 from earthdata_mcp.providers.request_spec import InvalidSpecError, RequestSpec
+from earthdata_mcp.redaction import redact
 from earthdata_mcp.storage import get_storage_backend
 from earthdata_mcp.workspace.models import ProvenanceEventType
 from earthdata_mcp.workspace.provenance import ProvenanceStore
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_harmony_download_concurrency() -> None:
+    """Raise harmony-py's hardcoded 3-worker download thread pool.
+
+    harmony.config.Config.NUM_REQUESTS_WORKERS reads the env var live
+    (os.getenv) at every Client() construction — HarmonyProvider builds a
+    fresh Client per job (providers/harmony.py) — so setting this once here
+    raises download concurrency for every job in this process. setdefault so
+    an operator's own explicit NUM_REQUESTS_WORKERS (e.g. in .env/docker-
+    compose) still wins. Downloads already stream file-to-file (commit
+    9802d84), so raising this trades network parallelism for disk I/O and
+    open file descriptors, not RAM.
+
+    Called from :func:`startup` — not module scope — because get_settings()
+    is @lru_cache'd: calling it at import time would permanently freeze the
+    process-wide Settings singleton the instant anything merely imports this
+    module (a test importing it for an unrelated helper, e.g.), instead of
+    only when the worker actually starts.
+    """
+    os.environ.setdefault(
+        "NUM_REQUESTS_WORKERS", str(get_settings().retrieval_download_concurrency)
+    )
+
 
 # Which task resumes a job found in each non-terminal state on startup (§4.3).
 _RESUME_TASK: dict[JobState, str] = {
@@ -52,6 +89,30 @@ _RESUME_TASK: dict[JobState, str] = {
 
 # Delay (seconds) before the next poll while a job is still running.
 _POLL_INTERVAL = 5
+
+
+def lifecycle_job_id(task: str, job_id: str) -> str:
+    """The arq job id used to resume ``job_id`` via ``task``.
+
+    Deterministic on purpose. ``enqueue_job`` with an explicit ``_job_id`` is a
+    no-op when a job with that id is already queued or running, so reclaiming the
+    same row twice cannot stack two copies of the same work.
+
+    This is what bounds :func:`startup`. Before it, every resume drew a fresh
+    random arq id, so a worker in a crash-loop left one more copy of each
+    non-terminal job behind per restart — observed live as 4 stuck jobs holding
+    20 in-flight arq entries, which saturated arq's concurrency slots and starved
+    every newly submitted retrieval. Two resumed copies of one job also raced each
+    other through the state guard, double-submitting it to the provider
+    (``IllegalTransition: submitted -> submitted``).
+
+    Only the reclaim path uses this. The lifecycle's own hand-offs
+    (``submit``→``poll``→``materialize``, and the self-chaining poll) keep fresh
+    ids: each is a distinct next step enqueued by the step before it, and pinning
+    the chained poll to a fixed id would make arq reject it as a duplicate of the
+    poll still running — stopping the chain dead.
+    """
+    return f"resume:{task}:{job_id}"
 
 
 # -- session factory --------------------------------------------------------
@@ -91,11 +152,59 @@ def _eviction(ctx: dict[str, Any]) -> EvictionService:
     """
     service = ctx.get("eviction")
     if service is None:
+        settings = get_settings()
         service = EvictionService(
-            _session_factory(ctx), get_storage_backend(), get_settings().earthdata_cache_max_bytes
+            _session_factory(ctx),
+            get_storage_backend(),
+            settings.earthdata_cache_max_bytes,
+            default_rebuild_cost_seconds=settings.earthdata_rebuild_cost_default_seconds,
+            orphan_sweep_interval_seconds=settings.earthdata_orphan_sweep_interval_seconds,
         )
         ctx["eviction"] = service
     return service
+
+
+def _prefetch(ctx: dict[str, Any]) -> PrefetchService:
+    """Return the ctx-cached :class:`PrefetchService`, building it once.
+
+    Mirrors :func:`_eviction`'s ctx-caching convention (PRD 025). Enqueues
+    through this worker's own Redis connection, so a speculative job rides the
+    ordinary durable job queue and is never an in-memory background task.
+    """
+    service = ctx.get("prefetch")
+    if service is None:
+        service = PrefetchService(
+            _session_factory(ctx),
+            provenance=_provenance(ctx),
+            enqueue_fn=ctx["redis"].enqueue_job,
+        )
+        ctx["prefetch"] = service
+    return service
+
+
+async def _maybe_prefetch_safe(
+    ctx: dict[str, Any],
+    spec: RequestSpec,
+    *,
+    speculative_origin: bool,
+    size_bytes: int | None,
+    credential_encrypted: str | None,
+) -> None:
+    """Ask for a prefetch without ever letting it block the caller (PRD 025):
+    same log-and-swallow convention as :func:`_sweep_eviction_safe`. Speculation
+    is optional; the retrieval it followed is not, and a guess must never be the
+    reason a real materialization fails.
+    """
+    try:
+        decision = await _prefetch(ctx).maybe_prefetch(
+            spec,
+            speculative_origin=speculative_origin,
+            size_bytes=size_bytes,
+            credential_encrypted=credential_encrypted,
+        )
+        logger.debug("prefetch decision for %s: %s", spec.obs_handle, decision.reason)
+    except Exception:
+        logger.exception("prefetch evaluation failed")
 
 
 async def _sweep_eviction_safe(ctx: dict[str, Any], *, protected_handle: str | None) -> None:
@@ -148,6 +257,7 @@ async def _fail_job(
     *,
     error_prefix: str | None = None,
     classification: str | None = None,
+    detail_extra: dict[str, Any] | None = None,
 ) -> None:
     """The one choke point every lifecycle task's exception handler routes
     through on its way to ``FAILED``: persists the stage- and provider-prefixed
@@ -163,8 +273,11 @@ async def _fail_job(
     ``"<stage>/<provider> failed"`` prefix for a branch (like the
     no-OPeNDAP-fallback case) that already has its own explanatory prefix to
     preserve verbatim. ``classification`` (PRD 002) tags the submit-failure
-    branch that led here (``invalid_request`` vs ``infrastructure``) so the
-    provenance trail explains *why* fallback was or wasn't attempted.
+    branch that led here (``invalid_request`` vs ``infrastructure``; since
+    PRD 022 also ``TOKEN_EXPIRED``/``TOKEN_INVALID``/``EULA_NOT_ACCEPTED``) so
+    the provenance trail explains *why* fallback was or wasn't attempted.
+    ``detail_extra`` merges extra keys (e.g. a EULA ``resolution_url``) into
+    the provenance detail.
     """
     message = _exc_message(exc)
     prefix = error_prefix if error_prefix is not None else f"{stage}/{spec.provider} failed"
@@ -182,6 +295,8 @@ async def _fail_job(
     }
     if classification is not None:
         detail["classification"] = classification
+    if detail_extra:
+        detail.update(detail_extra)
     await _record_event_safe(
         ctx, job_id, spec.workspace_id, spec.obs_handle, ProvenanceEventType.JOB_FAILED, detail
     )
@@ -217,11 +332,13 @@ def _exc_message(exc: BaseException) -> str:
     e.g. ``('Unprocessable Entity', 'Error: the requested combination of
     operations...')`` — a raw Python tuple leaking straight into a job's stored
     ``error`` and from there to the MCP client. Joining the args reads as one
-    sentence instead.
+    sentence instead. Redacted (PRD 022): a provider error echoing request
+    headers or arguments must never carry a registered credential into the
+    durable ``error`` column or the MCP client.
     """
     if len(exc.args) > 1:
-        return ": ".join(str(a) for a in exc.args)
-    return str(exc) or type(exc).__name__
+        return redact(": ".join(str(a) for a in exc.args))
+    return redact(str(exc) or type(exc).__name__)
 
 
 #: HTTP reason phrases (lowercased) harmony-py's ``_handle_error_response``
@@ -260,6 +377,158 @@ def _classify_submit_failure(exc: BaseException) -> str:
     return "infrastructure"
 
 
+# -- per-job credential (PRD 022) --------------------------------------------
+
+
+async def _load_job_identity(
+    ctx: dict[str, Any],
+    job_id: str,
+    spec: RequestSpec,
+    stage: str,
+    credential_encrypted: str | None,
+) -> EDLIdentity | None:
+    """Decrypt this attempt's per-job credential into an identity handle.
+
+    ``None`` means the env-credential fallback (no credential persisted). Any
+    failure — an undecryptable blob (key rotated away), a malformed token, or
+    a token that expired mid-job (EDL tokens live 60 days; a late retry is a
+    real path) — fails the job *here*, before any provider is built, with its
+    credential classification when it has one, and re-raises. The caller never
+    proceeds: a job started as one identity must terminate rather than
+    silently degrade to the service account (PRD 022 Further Notes).
+    """
+    if not credential_encrypted:
+        return None
+    try:
+        token = decrypt_credential(credential_encrypted)
+        identity = parse_edl_token(token)
+        if identity is not None and identity.is_expired():
+            raise TokenExpiredError(
+                "the job's stored credential has expired mid-job — renew the "
+                "token at Earthdata Login and retry the retrieval"
+            )
+        return identity
+    except BaseException as exc:
+        await _fail_job(
+            ctx,
+            job_id,
+            spec,
+            stage,
+            exc,
+            error_prefix="job credential unusable",
+            classification=getattr(exc, "classification", None),
+        )
+        raise
+
+
+async def _fail_classified_credential(
+    ctx: dict[str, Any],
+    job_id: str,
+    spec: RequestSpec,
+    stage: str,
+    credential_exc: CredentialError,
+) -> None:
+    """Terminate a job on a classified credential failure (PRD 022).
+
+    A EULA-classified failure additionally marks the collection restricted for
+    future cache/dedupe scoping decisions. Never triggers the OPeNDAP
+    fallback — the request isn't the problem, the identity's entitlements are,
+    and a different provider would just substitute the wrong identity.
+    """
+    detail_extra: dict[str, Any] | None = None
+    if credential_exc.classification == EULA_NOT_ACCEPTED:
+        await _mark_restricted_safe(ctx, spec.concept_id)
+        if credential_exc.resolution_url:
+            detail_extra = {"resolution_url": credential_exc.resolution_url}
+    await _fail_job(
+        ctx,
+        job_id,
+        spec,
+        stage,
+        credential_exc,
+        classification=credential_exc.classification,
+        detail_extra=detail_extra,
+    )
+
+
+#: The named event an operator greps for when a replay stopped reproducing its
+#: original (PRD 023). Not a provenance edge: drift is an observation about an
+#: existing node, and this PRD only makes it observable — deciding what to do
+#: about a changed replay belongs to the consumer.
+_DRIFT_EVENT = "materialization-drift"
+
+
+def _delivered_projection(record: MaterializationRecord) -> dict[str, Any]:
+    """The delivered-content fields written onto the ``obs_`` handle payload
+    (PRD 023), read back by ``export_result._delivered_content``.
+
+    ``jobs.materialization`` stays the record's authoritative owner — drift
+    detection and status enrichment read it there. This is the read model:
+    the handle payload is what ``export_result`` resolves, and a consumer must
+    not need a second lookup to learn what its handle contains.
+    ``granule_count`` is omitted for a partial record so it never reads as
+    zero, matching the record's own absent-not-empty posture.
+    """
+    projection: dict[str, Any] = {
+        "content_digest": record.content_digest,
+        "partial": record.partial,
+    }
+    if record.granule_ids is not None:
+        projection["granule_count"] = len(set(record.granule_ids))
+    return projection
+
+
+async def _log_materialization_drift(
+    ctx: dict[str, Any],
+    job_id: str,
+    spec: RequestSpec,
+    record: MaterializationRecord,
+) -> None:
+    """Log :data:`_DRIFT_EVENT` when this materialization's digest differs from
+    the previous one for the same ``obs_`` handle (PRD 023).
+
+    This is the first time this server can observe upstream drift at all — an
+    NRT late-arrival, an unpinned Harmony submit that took a different chain, a
+    job that fell back to OPeNDAP — so it says so, with both digests and the
+    handle. Best-effort in the same log-and-swallow spirit as
+    :func:`_record_event_safe`: an observation must never be the reason a
+    materialization fails.
+    """
+    if not spec.obs_handle:
+        return
+    try:
+        async with _session_factory(ctx)() as session:
+            previous = await crud.previous_materialization(
+                session, spec.obs_handle, before_job_id=job_id
+            )
+    except Exception:
+        logger.exception("job %s: failed to read the previous materialization", job_id)
+        return
+
+    prior = MaterializationRecord.from_jsonb(previous)
+    if prior is None or prior.content_digest == record.content_digest:
+        return
+    logger.warning(
+        "%s: handle %s rematerialized to different content (was %s, now %s)",
+        _DRIFT_EVENT,
+        spec.obs_handle,
+        prior.content_digest,
+        record.content_digest,
+    )
+
+
+async def _mark_restricted_safe(ctx: dict[str, Any], concept_id: str | None) -> None:
+    """Durably flag a collection restricted, without ever blocking the caller —
+    same log-and-swallow posture as :func:`_record_event_safe`."""
+    if not concept_id:
+        return
+    try:
+        async with _session_factory(ctx)() as session:
+            await crud.mark_collection_restricted(session, concept_id)
+    except Exception:
+        logger.exception("failed to mark collection %s restricted", concept_id)
+
+
 # -- lifecycle tasks --------------------------------------------------------
 
 
@@ -284,12 +553,22 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
         spec = await _load_spec_or_fail(session, job_id, job.request_spec)
         if spec is None:
             return
+        credential_encrypted = job.credential_encrypted
 
-    provider = await _load_provider(spec)
+    identity = await _load_job_identity(ctx, job_id, spec, "submit", credential_encrypted)
+    provider = await _load_provider(spec, edl_token=identity.token if identity else None)
     plan = spec.to_plan()
     try:
         ref = await provider.submit(plan)
     except Exception as exc:
+        # PRD 022: a credential failure is first-class and terminates the job —
+        # checked before the PRD 002 invalid/infrastructure split so an auth
+        # rejection can never be misread as infrastructure and trigger the
+        # OPeNDAP fallback under the wrong identity.
+        credential_exc = classify_credential_failure(exc, identity)
+        if credential_exc is not None:
+            await _fail_classified_credential(ctx, job_id, spec, "submit", credential_exc)
+            raise
         classification = _classify_submit_failure(exc) if spec.provider == "harmony" else None
         if spec.provider == "harmony" and classification == "infrastructure" and spec.opendap_urls:
             logger.warning(
@@ -397,8 +676,10 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
         if spec is None:
             return
         url = job.provider_job_url
+        credential_encrypted = job.credential_encrypted
 
-    provider = await _load_provider(spec)
+    identity = await _load_job_identity(ctx, job_id, spec, "poll", credential_encrypted)
+    provider = await _load_provider(spec, edl_token=identity.token if identity else None)
     ref = JobRef(
         provider=spec.provider,
         provider_job_id=_job_id_from_url(url),
@@ -407,7 +688,11 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
     try:
         status = await provider.poll(ref)
     except Exception as exc:
-        await _fail_job(ctx, job_id, spec, "poll", exc)
+        credential_exc = classify_credential_failure(exc, identity)
+        if credential_exc is not None:
+            await _fail_classified_credential(ctx, job_id, spec, "poll", credential_exc)
+        else:
+            await _fail_job(ctx, job_id, spec, "poll", exc)
         raise
 
     async with session_factory() as session:
@@ -432,7 +717,8 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
 
     Once ``READY``, runs the cache eviction sweep (PRD 015) with this job's own
     result protected — a retrieval can never evict its own output before it's
-    read. The sweep is best-effort: it never fails the materialization.
+    read — and then asks whether to warm the next contiguous window (PRD 025).
+    Both are best-effort: neither ever fails the materialization.
     """
     session_factory = _session_factory(ctx)
     async with session_factory() as session:
@@ -443,8 +729,16 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
         if spec is None:
             return
         url = job.provider_job_url
+        credential_encrypted = job.credential_encrypted
+        # Read here, before the READY transition below erases the credential
+        # (crud.set_state) — a prefetch has to inherit the identity this job ran
+        # as, and this is the last moment it is knowable (PRD 025).
+        speculative_origin = bool(job.speculative)
 
-    provider = await _load_provider(spec)
+    identity = await _load_job_identity(
+        ctx, job_id, spec, "materialize", credential_encrypted
+    )
+    provider = await _load_provider(spec, edl_token=identity.token if identity else None)
     ref = JobRef(
         provider=spec.provider,
         provider_job_id=_job_id_from_url(url),
@@ -456,8 +750,23 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
     except BaseException as exc:
         # BaseException catches CancelledError (raised when Arq's job_timeout fires
         # inside asyncio.to_thread) which Exception alone does not.
-        await _fail_job(ctx, job_id, spec, "materialize", exc)
+        credential_exc = (
+            classify_credential_failure(exc, identity)
+            if isinstance(exc, Exception)
+            else None
+        )
+        if credential_exc is not None:
+            await _fail_classified_credential(
+                ctx, job_id, spec, "materialize", credential_exc
+            )
+        else:
+            await _fail_job(ctx, job_id, spec, "materialize", exc)
         raise
+
+    # What this run actually delivered (PRD 023) — built from the provider's own
+    # report, so it describes the outcome rather than replaying the intent.
+    record = MaterializationRecord.from_result(result, spec)
+    await _log_materialization_drift(ctx, job_id, spec, record)
 
     # Resolve the pending obs_ handle to the durable storage key (not a URL).
     if spec.obs_handle:
@@ -472,6 +781,11 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
                 "storage_key": result.storage_key,
                 "media_type": result.media_type,
                 "size_bytes": result.size_bytes,
+                # PRD 023: the delivered-content projection `export_result`
+                # serves. Written in the same call as the storage key it
+                # describes, so the two can never disagree about which
+                # materialization a consumer is looking at.
+                **_delivered_projection(record),
             },
         )
 
@@ -489,9 +803,27 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
         },
     )
     async with session_factory() as session:
-        await crud.transition_state(session, job_id, JobState.READY, progress=100)
+        await crud.transition_state(
+            session,
+            job_id,
+            JobState.READY,
+            progress=100,
+            materialization=record.to_jsonb(),
+        )
 
     await _sweep_eviction_safe(ctx, protected_handle=spec.obs_handle)
+
+    # PRD 025: sequential exploration is predictable, so warm the next window —
+    # after the sweep, so a speculative job is never admitted into a cache this
+    # very materialization has just put over its cap. Off by default; refused
+    # unless every gate in ``jobs/prefetch.py`` passes; never chains.
+    await _maybe_prefetch_safe(
+        ctx,
+        spec,
+        speculative_origin=speculative_origin,
+        size_bytes=result.size_bytes,
+        credential_encrypted=credential_encrypted,
+    )
 
 
 async def healthcheck(ctx: dict[str, Any]) -> str:
@@ -520,6 +852,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     checks happen once, in this same reclaim pass, so one worker restart
     converges existing debris to an honest terminal state.
     """
+    _configure_harmony_download_concurrency()
     session_factory = _session_factory(ctx)
     stale_before = datetime.now(timezone.utc) - timedelta(
         days=get_settings().job_stale_after_days
@@ -561,7 +894,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     for job_id, state in resumable:
         task = _RESUME_TASK.get(state)
         if task is not None:
-            await redis.enqueue_job(task, job_id)
+            await redis.enqueue_job(task, job_id, _job_id=lifecycle_job_id(task, job_id))
             logger.info("resuming job %s (%s) via %s", job_id, state.value, task)
 
     # PRD 015: converge a box restarted after heavy use below the cap without
@@ -616,7 +949,9 @@ def _apply_poll(job: Job, status: object) -> str | None:
     return "poll_job"
 
 
-async def _load_provider(spec: RequestSpec) -> RetrievalProvider:
+async def _load_provider(
+    spec: RequestSpec, edl_token: str | None = None
+) -> RetrievalProvider:
     """Fetch fresh capabilities and build this spec's retrieval provider.
 
     The worker owns no provider state — it reconstructs the right provider on
@@ -625,10 +960,12 @@ async def _load_provider(spec: RequestSpec) -> RetrievalProvider:
     blindly. ``providers.build`` owns the spec -> provider mapping itself
     (Harmony, AppEEARS point→Parquet, or OPeNDAP DAP4 subset); an unknown
     provider fails loud there — we never silently fall back to Harmony for a
-    job another provider planned.
+    job another provider planned. ``edl_token`` (PRD 022) is the job's own
+    decrypted per-call credential — threaded into the capabilities fetch and
+    the provider so every attempt runs as the caller's identity.
     """
-    caps = await CMRProvider().collection_capabilities(spec.concept_id)
-    return providers.build(spec, caps)
+    caps = await CMRProvider(edl_token=edl_token).collection_capabilities(spec.concept_id)
+    return providers.build(spec, caps, edl_token=edl_token)
 
 
 def _job_id_from_url(url: str | None) -> str | None:
@@ -652,10 +989,17 @@ class WorkerSettings:
     # Bounded retries (PRD 004): an unforeseen repeating crash degrades to a
     # logged dead task instead of retrying forever; the startup staleness sweep
     # then catches the job on the next reclaim pass.
+    # ``keep_result=0`` pairs with :func:`lifecycle_job_id`. Arq refuses an
+    # explicit ``_job_id`` that still has a *stored result*, not just a live job,
+    # so a retained result would make a finished resume attempt block the next one
+    # for the whole retention window — stranding a job that legitimately needs
+    # reclaiming again. Dropping the result narrows the dedupe to exactly the
+    # window we want ("already queued or running"). Nothing reads these results:
+    # the Postgres row is the source of truth, and each task returns None.
     functions = [
-        func(submit_job, max_tries=5),
-        func(poll_job, max_tries=5),
-        func(materialize_job, max_tries=5),
+        func(submit_job, max_tries=5, keep_result=0),
+        func(poll_job, max_tries=5, keep_result=0),
+        func(materialize_job, max_tries=5, keep_result=0),
         healthcheck,
     ]
     on_startup = startup

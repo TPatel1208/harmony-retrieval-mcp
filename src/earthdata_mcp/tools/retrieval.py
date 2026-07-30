@@ -29,23 +29,39 @@ reusing an exact match instead of enqueueing a duplicate job.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from earthdata_mcp.config import get_settings
 from earthdata_mcp.db import create_engine, create_session_factory
 from earthdata_mcp.jobs import crud
+from earthdata_mcp.jobs.prefetch import PREFETCH_HIT
 from earthdata_mcp.jobs.state import LEGAL_TRANSITIONS, TERMINAL_STATES, JobState
+from earthdata_mcp.providers import build as _build_provider
+from earthdata_mcp.providers._capabilities import CollectionCapabilities
 from earthdata_mcp.providers.appeears import AppEEARSProvider
 from earthdata_mcp.providers.base import (
     AOI,
+    JobRef,
     RetrievalPlan,
+    RetrievalProvider,
     TimeRange,
     TransformSpec,
     normalize_time_range,
 )
 from earthdata_mcp.providers.cmr import CMRProvider
 from earthdata_mcp.providers.harmony import HarmonyProvider
+from earthdata_mcp.providers.materialization import MaterializationRecord
+from earthdata_mcp.providers.identity import (
+    EDLIdentity,
+    decrypt_credential,
+    encrypt_credential,
+    ensure_credential_key,
+    parse_edl_token,
+    service_identity_scope,
+)
 from earthdata_mcp.providers.opendap import (
     AxisGeometry,
     OPeNDAPProvider,
@@ -54,7 +70,11 @@ from earthdata_mcp.providers.opendap import (
     validate_variables,
 )
 from earthdata_mcp.jobs.models import Job
-from earthdata_mcp.providers.request_spec import RequestSpec, compute_request_signature
+from earthdata_mcp.providers.request_spec import (
+    InvalidSpecError,
+    RequestSpec,
+    compute_request_signature,
+)
 from earthdata_mcp.providers.router import Router
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
 from earthdata_mcp.workspace.handles import resolve_aoi, resolve_dataset
@@ -67,9 +87,17 @@ from earthdata_mcp.workspace.store import (
     WorkspaceStore,
 )
 
+logger = logging.getLogger(__name__)
+
 #: An ``enqueue_fn`` enqueues ``(task_name, *args)`` onto the worker queue. The
 #: default wraps an Arq pool; tests inject an ``AsyncMock`` so no Redis is needed.
 EnqueueFn = Callable[..., Awaitable[object]]
+
+#: A ``provider_factory`` builds the ``RetrievalProvider`` ``cancel_retrieval`` calls
+#: ``cancel`` on, from the job's own durable spec. The default (``_default_cancel_provider``)
+#: never re-fetches CMR capabilities (PRD 021: cancel must stay fast); tests inject a
+#: fake provider instead of a real Harmony/AppEEARS client.
+CancelProviderFactory = Callable[[RequestSpec], RetrievalProvider]
 
 #: Default output media type per result shape (§4.4 format-by-shape).
 #:
@@ -158,6 +186,7 @@ async def retrieve_data(
     time_range: str,
     workspace_id: str = DEFAULT_WORKSPACE,
     output_format: str | None = None,
+    edl_token: str | None = None,
     *,
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
@@ -184,6 +213,7 @@ async def retrieve_data(
         variables=(),
         workspace_id=workspace_id,
         output_format=output_format,
+        edl_token=edl_token,
         needs_bbox=True,
         needs_variable=False,
         needs_temporal=True,
@@ -203,6 +233,7 @@ async def retrieve_subset(
     variables: list[str],
     workspace_id: str = DEFAULT_WORKSPACE,
     output_format: str | None = None,
+    edl_token: str | None = None,
     *,
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
@@ -238,6 +269,7 @@ async def retrieve_subset(
         variables=tuple(variables or ()),
         workspace_id=workspace_id,
         output_format=output_format,
+        edl_token=edl_token,
         needs_bbox=True,
         needs_variable=True,
         needs_temporal=True,
@@ -259,6 +291,7 @@ async def retrieve_timeseries(
     output_format: str | None = None,
     aoi_handle: str | None = None,
     point_sample: bool = False,
+    edl_token: str | None = None,
     *,
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
@@ -289,6 +322,7 @@ async def retrieve_timeseries(
         variables=tuple(variables or ()),
         workspace_id=workspace_id,
         output_format=output_format,
+        edl_token=edl_token,
         needs_bbox=aoi_handle is not None and not point_sample,
         needs_variable=True,
         needs_temporal=True,
@@ -301,9 +335,53 @@ async def retrieve_timeseries(
     )
 
 
+#: The curated slice of ``request_spec`` :func:`get_retrieval_status` projects
+#: (PRD 021). Never the raw spec: ``opendap_urls`` alone can carry dozens of
+#: URLs and must not cross the wire.
+_ENRICHMENT_KEYS = (
+    "short_name",
+    "variables",
+    "aoi_bbox",
+    "time_range",
+    "provider",
+    "output_format",
+)
+
+
+def _status_enrichment(spec: dict, materialization: dict | None = None) -> dict:
+    """Curate ``job.request_spec`` into what a job *pertains to* (PRD 021).
+
+    A field absent from the spec (``None`` — the dataclass's own default for
+    an optional field like ``aoi_bbox``/``time_range``) is omitted entirely
+    rather than emitted as ``null``, so a consumer never has to distinguish
+    "not applicable to this job" from "not yet known."
+
+    ``granule_count`` prefers the job's materialization record — what it
+    actually retrieved — and falls back to the ``opendap_urls`` tally
+    (discovered at planning time for any gridded/swath bbox request,
+    regardless of which provider ultimately runs it) for a job that has not
+    materialized, or materialized before that record existed. Since those are
+    different kinds of claim — an outcome versus a guess no provider was
+    obliged to honor — ``granule_count_source`` says which one was returned
+    (PRD 023 story 5). Both are omitted when neither is available: a job whose
+    provider names no granules and for which no OPeNDAP URLs were discovered
+    (an AppEEARS point sample) gets no tally rather than a fabricated zero.
+    """
+    enrichment = {key: spec[key] for key in _ENRICHMENT_KEYS if spec.get(key) is not None}
+    record = MaterializationRecord.from_jsonb(materialization)
+    if record is not None and record.granule_ids is not None:
+        enrichment["granule_count"] = len(set(record.granule_ids))
+        enrichment["granule_count_source"] = "materialized"
+    elif spec.get("opendap_urls"):
+        enrichment["granule_count"] = len(spec["opendap_urls"])
+        enrichment["granule_count_source"] = "planned"
+    return enrichment
+
+
 async def get_retrieval_status(
     job_handle: str,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     session_factory=None,
@@ -313,10 +391,14 @@ async def get_retrieval_status(
     Resolves the ``job_`` handle within the workspace first, then reads the
     durable row. Returns
     ``{job_handle, obs_handle, status, progress, phase, message, error,
-    submitted_at, last_polled_at, provider_job_url}``. ``phase`` is a
-    qualitative, provider-agnostic label derived from the durable state (PRD
-    007) — the signal a caller falls back to when ``progress`` is 0 but the job
-    is not actually stalled (e.g. an AppEEARS job still queued at the
+    submitted_at, last_polled_at, provider_job_url}`` plus a curated slice of
+    the already-loaded ``request_spec`` — ``short_name``, ``variables``,
+    ``aoi_bbox``, ``time_range``, ``provider``, ``output_format``, and
+    ``granule_count`` (PRD 021, see :func:`_status_enrichment`) — so a caller
+    can tell what a job pertains to without resolving other handles. ``phase``
+    is a qualitative, provider-agnostic label derived from the durable state
+    (PRD 007) — the signal a caller falls back to when ``progress`` is 0 but
+    the job is not actually stalled (e.g. an AppEEARS job still queued at the
     provider). ``message`` is whatever status text the provider reported on
     the last poll, when any.
 
@@ -327,7 +409,12 @@ async def get_retrieval_status(
     first two are byte-identical so handle existence never leaks across a
     workspace boundary. A malformed handle (anything not prefixed ``job_``)
     still raises ``ValueError``: that is a caller bug, not a missing job.
+
+    ``edl_token`` (PRD 022) is accepted for surface uniformity and validated
+    at the boundary; this read touches only Postgres, so the identity is not
+    otherwise consulted.
     """
+    parse_edl_token(edl_token)
     store = store or _default_store()
     session_factory = session_factory or _default_session_factory()
 
@@ -364,6 +451,7 @@ async def get_retrieval_status(
             "submitted_at": job.created_at.isoformat(),
             "last_polled_at": (job.last_polled_at or job.updated_at).isoformat(),
             "provider_job_url": job.provider_job_url,
+            **_status_enrichment(job.request_spec, job.materialization),
         }
 
 
@@ -380,19 +468,118 @@ _NON_CANCELLABLE_NOTE = (
 )
 
 
+def _cancel_capabilities(spec: RequestSpec) -> CollectionCapabilities:
+    """A capabilities stub good enough to construct a cancel-only provider.
+
+    ``cancel`` touches no capability-gated logic (``find_service`` and
+    friends, used only by ``can_handle``/``submit``) — it only needs the
+    provider constructor's required identity fields, so this never re-fetches
+    from CMR. A provider-side cancel must stay fast and must not block the
+    tool on a network round-trip nothing here actually needs.
+    """
+    return CollectionCapabilities(
+        concept_id=spec.concept_id or "",
+        short_name=spec.short_name or "",
+        processing_level="",
+        output_shape=spec.output_shape or "grid",
+        native_formats=frozenset(),
+        direct_s3=None,
+        services=[],
+    )
+
+
+def _default_cancel_provider(
+    spec: RequestSpec, *, edl_token: str | None = None
+) -> RetrievalProvider:
+    """Build the provider ``cancel_retrieval`` calls ``cancel`` on, from the
+    job's own durable spec — the same ``spec -> provider`` seam the worker
+    uses (:func:`earthdata_mcp.providers.build`), bound to a no-network
+    capabilities stub (see :func:`_cancel_capabilities`). ``edl_token``
+    (PRD 022) makes the upstream cancel authenticate as the job's identity."""
+    return _build_provider(spec, _cancel_capabilities(spec), edl_token=edl_token)
+
+
+def _provider_job_id_from_url(url: str | None) -> str | None:
+    """Recover a provider's job/task id from its stored ``provider_job_url``.
+
+    Harmony and AppEEARS both encode the id as the URL's last *path* segment
+    (``…/jobs/<uuid>?linktype=…`` / ``…/task/<task_id>``) — mirrors the
+    worker's own ``_job_id_from_url`` (``jobs/worker.py``), parsed explicitly
+    so a trailing query string never leaks into the id. OPeNDAP's
+    ``provider_job_url`` (newline-joined constraint URLs) is never passed
+    here — its ``cancel`` is a documented no-op the caller short-circuits to.
+    """
+    if not url:
+        return None
+    path = urlsplit(url).path
+    return path.rstrip("/").rsplit("/", 1)[-1] or None
+
+
+async def _attempt_provider_cancel(
+    *,
+    provider_name: str,
+    provider_job_url: str | None,
+    request_spec: dict,
+    job_handle: str,
+    provider_factory: CancelProviderFactory,
+) -> str:
+    """Best-effort, non-fatal provider-side cancel; returns the ``upstream`` outcome.
+
+    ``"unsupported"`` covers both OPeNDAP (a synchronous provider with no
+    durable upstream job) and a job that was cancelled before it was ever
+    submitted (no ``provider_job_url`` yet, e.g. a still-``pending`` job) — in
+    both cases there is genuinely nothing upstream to cancel, so the provider
+    is never even constructed. Any other failure (a malformed spec, or the
+    provider's own ``cancel`` raising) is logged and reported as
+    ``"error"`` — the local cancel has already committed and is never undone.
+    """
+    if provider_name == "opendap" or not provider_job_url:
+        return "unsupported"
+    try:
+        spec = RequestSpec.from_jsonb(request_spec)
+    except InvalidSpecError:
+        logger.exception(
+            "job %s: cannot parse request_spec for provider-side cancel", job_handle
+        )
+        return "error"
+    ref = JobRef(
+        provider=provider_name,
+        provider_job_id=_provider_job_id_from_url(provider_job_url),
+        provider_job_url=provider_job_url,
+        job_handle=job_handle,
+    )
+    try:
+        provider = provider_factory(spec)
+        await provider.cancel(ref)
+    except Exception:
+        logger.exception(
+            "job %s: provider-side cancel failed (provider=%s)", job_handle, provider_name
+        )
+        return "error"
+    return "requested"
+
+
 async def cancel_retrieval(
     job_handle: str,
     workspace_id: str = DEFAULT_WORKSPACE,
+    edl_token: str | None = None,
     *,
     store: WorkspaceStore | None = None,
     session_factory=None,
+    provider_factory: CancelProviderFactory | None = None,
 ) -> dict:
     """Cancel a cancellable job; a friendly non-cancelling response otherwise.
 
     Three outcomes, all returning ``{job_handle, status, cancelled, ...}``:
 
-    * A cancellable state (pending/submitted/running) is cancelled and
-      ``cancelled`` is ``True``.
+    * A cancellable state (pending/submitted/running) is flipped to
+      ``cancelled`` locally (``cancelled`` is ``True``) — the worker stops
+      polling/materializing, a real local resource release. A best-effort
+      provider-side cancel is then attempted (PRD 021) and never fails the
+      tool; the response carries ``upstream``: ``"requested"`` (issued to the
+      provider), ``"unsupported"`` (OPeNDAP, or a job never submitted
+      upstream — nothing to cancel there), or ``"error"`` (the provider
+      cancel raised — logged, non-fatal).
     * A non-terminal state with no legal edge to ``cancelled`` in the state
       machine — today only ``materializing`` (the result is already
       downloaded and being persisted) — is left untouched, and the response
@@ -400,10 +587,11 @@ async def cancel_retrieval(
       the raw ``illegal job state transition`` error the state machine would
       otherwise raise.
     * A terminal state (ready/failed/expired/cancelled) echoes as-is with
-      ``cancelled: False``: a job's state can change between when a caller
-      decides to cancel and when the call lands (e.g. it finishes or fails
-      first), so this is not an illegal request — the caller's intent
-      ("stop this job") is already satisfied.
+      ``cancelled: False`` and ``upstream: "already_terminal"``: a job's
+      state can change between when a caller decides to cancel and when the
+      call lands (e.g. it finishes or fails first), so this is not an
+      illegal request — the caller's intent ("stop this job") is already
+      satisfied, upstream included.
 
     A fourth outcome, a missing job, is likewise not an exception (PRD 014): a
     handle unknown to the workspace store, one owned by another workspace, or
@@ -413,7 +601,13 @@ async def cancel_retrieval(
     byte-identical so handle existence never leaks across a workspace
     boundary. A malformed handle (anything not prefixed ``job_``) still
     raises ``ValueError``.
+
+    ``edl_token`` (PRD 022): the provider-side cancel authenticates as the
+    per-call identity when one is supplied, else as the identity persisted
+    (encrypted) on the job row — the identity the job has been running as —
+    and only then as the env credential.
     """
+    identity = parse_edl_token(edl_token)
     store = store or _default_store()
     session_factory = session_factory or _default_session_factory()
 
@@ -442,7 +636,12 @@ async def cancel_retrieval(
             }
         current = JobState(job.state)
         if current in TERMINAL_STATES:
-            return {"job_handle": job_handle, "status": job.state, "cancelled": False}
+            return {
+                "job_handle": job_handle,
+                "status": job.state,
+                "cancelled": False,
+                "upstream": "already_terminal",
+            }
         if JobState.CANCELLED not in LEGAL_TRANSITIONS[current]:
             return {
                 "job_handle": job_handle,
@@ -450,10 +649,46 @@ async def cancel_retrieval(
                 "cancelled": False,
                 "note": _NON_CANCELLABLE_NOTE.format(state=current.value),
             }
+        # Read the persisted per-job credential BEFORE the transition below:
+        # set_state erases it the moment the job goes terminal (PRD 022), and
+        # the provider-side cancel still needs to authenticate as that identity.
+        credential_encrypted = job.credential_encrypted
         crud.set_state(job, JobState.CANCELLED)
         await session.commit()
+        provider_name = job.provider
+        provider_job_url = job.provider_job_url
+        request_spec = job.request_spec
 
-    return {"job_handle": job_handle, "status": JobState.CANCELLED.value, "cancelled": True}
+    cancel_token = identity.token if identity is not None else None
+    if cancel_token is None and credential_encrypted:
+        try:
+            cancel_token = decrypt_credential(credential_encrypted)
+        except Exception:
+            # The local cancel has already committed; an undecryptable stored
+            # credential must not fail the tool — the provider cancel simply
+            # proceeds without a per-call identity (and may report "error").
+            logger.exception(
+                "job %s: cannot decrypt stored credential for provider cancel",
+                job_handle,
+            )
+    if provider_factory is None:
+        provider_factory = lambda spec: _default_cancel_provider(  # noqa: E731
+            spec, edl_token=cancel_token
+        )
+
+    upstream = await _attempt_provider_cancel(
+        provider_name=provider_name,
+        provider_job_url=provider_job_url,
+        request_spec=request_spec,
+        job_handle=job_handle,
+        provider_factory=provider_factory,
+    )
+    return {
+        "job_handle": job_handle,
+        "status": JobState.CANCELLED.value,
+        "cancelled": True,
+        "upstream": upstream,
+    }
 
 
 # -- shared planning + persistence ----------------------------------------
@@ -477,6 +712,7 @@ async def _submit_retrieval(
     session_factory,
     enqueue_fn: EnqueueFn | None,
     dedupe: bool = False,
+    edl_token: str | None = None,
 ) -> dict:
     """Plan → persist a durable job → enqueue. The shared core of the three
     ``retrieve_*`` tools.
@@ -491,12 +727,27 @@ async def _submit_retrieval(
     the OPeNDAP granule search, routing, and any handle/job creation.
     ``retrieve_data``/``retrieve_timeseries`` leave this ``False`` and are
     unaffected.
+
+    ``edl_token`` (PRD 022) is the caller's per-user EDL credential. Parsed
+    once here — before any handle, row, or network call — into an opaque
+    :class:`EDLIdentity` (a malformed/expired paste fails fast with its
+    classification), threaded through every NASA-facing planning call, and
+    persisted Fernet-encrypted on the job row so the durable worker keeps
+    acting as this identity for the job's whole life. Absent means the
+    env-credential path, byte-for-byte today's behavior.
     """
+    # Parse the per-call identity first (PRD 022): a bad token must fail before
+    # any handle or job row exists, and a supplied token needs the repo-private
+    # encryption key or the durable job could never authenticate later.
+    identity = parse_edl_token(edl_token)
+    if identity is not None:
+        ensure_credential_key()
+
     # allow_open=False: TimeRange.from_cmr below needs both bounds to build a
     # closed range, unlike the coverage tools' open-range-friendly grammar.
     time_range = normalize_time_range(time_range, allow_open=False)
 
-    cmr = cmr or CMRProvider()
+    cmr = cmr or CMRProvider(edl_token=identity.token if identity else None)
     store = store or _default_store()
     provenance = provenance or _default_provenance()
     session_factory = session_factory or _default_session_factory()
@@ -520,12 +771,16 @@ async def _submit_retrieval(
 
     signature = None
     if dedupe:
+        identity_scope = await _reuse_identity_scope(
+            caps, concept_id, identity, session_factory
+        )
         signature = compute_request_signature(
             concept_id=concept_id,
             bbox=bbox,
             time_range=time_range,
             variables=variables,
             output_format=fmt,
+            identity_scope=identity_scope,
         )
         reused = await _check_reuse(
             store=store,
@@ -534,6 +789,7 @@ async def _submit_retrieval(
             enqueue_fn=enqueue_fn,
             workspace_id=workspace_id,
             signature=signature,
+            edl_token=identity.token if identity else None,
         )
         if reused is not None:
             return reused
@@ -623,7 +879,9 @@ async def _submit_retrieval(
     decision = Router(
         caps,
         harmony=harmony_provider,
-        appeears=AppEEARSProvider(caps),
+        # The planning-time catalog fail-fast below does a real AppEEARS lookup,
+        # so the per-call identity rides it too (PRD 022).
+        appeears=AppEEARSProvider(caps, edl_token=identity.token if identity else None),
         opendap=opendap_provider,
     ).route(plan)
 
@@ -663,6 +921,7 @@ async def _submit_retrieval(
                 enqueue_fn=enqueue_fn,
                 workspace_id=workspace_id,
                 signature=signature,
+                edl_token=identity.token if identity else None,
             )
             if reused is not None:
                 return reused
@@ -720,6 +979,12 @@ async def _submit_retrieval(
             obs_handle=obs_handle,
             provider=decision.path,
             request_spec=spec,
+            # PRD 022: the per-call credential rides the job row encrypted (the
+            # worker decrypts it per attempt); the queue payload below stays
+            # job_id-only — no credential ever enters Redis.
+            credential_encrypted=(
+                encrypt_credential(identity.token) if identity is not None else None
+            ),
         )
 
     # Provenance keyed to the durable spec, never a staged URL (CLAUDE.md hard rule).
@@ -743,6 +1008,30 @@ async def _submit_retrieval(
 # -- idempotent dedupe (PRD 020) -------------------------------------------
 
 
+async def _reuse_identity_scope(
+    caps: CollectionCapabilities,
+    concept_id: str,
+    identity: EDLIdentity | None,
+    session_factory,
+) -> str | None:
+    """The credential-identity dimension for this request's dedupe signature
+    (PRD 022): ``None`` — the globally shared cache — only for a collection CMR
+    affirmatively reports unrestricted *and* that no EULA-classified failure
+    has ever durably flagged; restricted or unknown scopes to the fetching
+    identity (the EDL username behind the token, or the service identity for
+    env-credential fetches). Conservative default: unknown → per-identity.
+    """
+    restricted = caps.access_restricted
+    if restricted is not True:
+        async with session_factory() as session:
+            flagged = await crud.collection_restriction(session, concept_id)
+        if flagged:
+            restricted = True
+    if restricted is False:
+        return None
+    return identity.scope_key if identity is not None else service_identity_scope()
+
+
 async def _check_reuse(
     *,
     store: WorkspaceStore,
@@ -751,6 +1040,7 @@ async def _check_reuse(
     enqueue_fn: EnqueueFn,
     workspace_id: str,
     signature: str,
+    edl_token: str | None = None,
 ) -> dict | None:
     """Exact-match reuse lookup for ``retrieve_subset`` (PRD 020).
 
@@ -779,6 +1069,7 @@ async def _check_reuse(
         enqueue_fn=enqueue_fn,
         workspace_id=workspace_id,
         signature=signature,
+        edl_token=edl_token,
     )
 
 
@@ -791,6 +1082,7 @@ async def _reuse_response_for_match(
     enqueue_fn: EnqueueFn,
     workspace_id: str,
     signature: str,
+    edl_token: str | None = None,
 ) -> dict | None:
     """Build the reuse response for an ``obs_`` handle already known to match
     ``signature`` — shared by :func:`_check_reuse`'s pre-submit SELECT and
@@ -822,8 +1114,13 @@ async def _reuse_response_for_match(
       signature would be permanently un-retryable.
 
     Records a ``reused`` provenance event on the existing handle for every hit
-    (never a new lineage node — reuse is an event, not a derivation).
+    (never a new lineage node — reuse is an event, not a derivation), and — when
+    the match was a prefetch — **promotes** it first (PRD 025): a speculative
+    result someone has now asked for is not speculative any more.
     """
+    await _promote_if_speculative(
+        match, store=store, provenance=provenance, workspace_id=workspace_id
+    )
     async with session_factory() as session:
         job = await crud.get_job_by_obs_handle(session, match.handle)
 
@@ -841,6 +1138,7 @@ async def _reuse_response_for_match(
             provenance=provenance,
             session_factory=session_factory,
             enqueue_fn=enqueue_fn,
+            edl_token=edl_token,
         )
     elif status == "ready":
         result = {
@@ -873,6 +1171,51 @@ async def _reuse_response_for_match(
     return result
 
 
+async def _promote_if_speculative(
+    match: HandleRecord,
+    *,
+    store: WorkspaceStore,
+    provenance: ProvenanceStore,
+    workspace_id: str,
+) -> None:
+    """Clear ``speculative`` on a prefetched handle a user request just matched
+    (PRD 025 story 4), and record the transition.
+
+    A prefetched result is second-class on purpose: the eviction sweep discards
+    every speculative candidate before any requested one, and it cannot be
+    pinned. Both of those stop being right the instant someone asks for it —
+    the guess turned out to be a real request, and the result is no more
+    disposable than one retrieved directly. Promotion happens for **every** hit
+    shape, including a match that is still in flight: what promotes a handle is
+    someone having asked, not the bytes having landed.
+
+    The provenance event is what keeps a promoted result distinguishable from
+    one that was always real, which is the only way ``prefetch-hit`` over
+    ``prefetch-issued`` can be read back honestly. A no-op — no write, no
+    event — for a handle that was never speculative.
+    """
+    if not match.payload.get("speculative"):
+        return
+    await store.update_handle(workspace_id, match.handle, {"speculative": False})
+    await provenance.record_event(
+        workspace_id,
+        match.handle,
+        ProvenanceEventType.PROMOTED,
+        detail={"from": "speculative", "reason": "matched_by_user_request"},
+    )
+    logger.info(
+        "%s: %s promoted by a matching request",
+        PREFETCH_HIT,
+        match.handle,
+        extra={
+            "event": PREFETCH_HIT,
+            "workspace_id": workspace_id,
+            "obs_handle": match.handle,
+            "size_bytes": match.payload.get("size_bytes"),
+        },
+    )
+
+
 #: Bounds for :func:`_await_reuse_after_conflict`'s retry of a just-lost
 #: ``put_handle_unique_signature`` race. The winner's obs_ handle insert and
 #: its job-row insert are two separate commits a few awaits apart (routing
@@ -894,6 +1237,7 @@ async def _await_reuse_after_conflict(
     enqueue_fn: EnqueueFn,
     workspace_id: str,
     signature: str,
+    edl_token: str | None = None,
 ) -> dict | None:
     """Resolve the loser side of a ``put_handle_unique_signature`` race (PRD
     020 story 6): the winner's obs_ handle is already committed (that's *why*
@@ -919,6 +1263,7 @@ async def _await_reuse_after_conflict(
             enqueue_fn=enqueue_fn,
             workspace_id=workspace_id,
             signature=signature,
+            edl_token=edl_token,
         )
         if reused is not None:
             return reused
@@ -936,6 +1281,7 @@ async def _reenqueue_replay(
     provenance: ProvenanceStore,
     session_factory,
     enqueue_fn: EnqueueFn,
+    edl_token: str | None = None,
 ) -> dict:
     """Re-enqueue the durable job behind ``handle`` from ``job``'s already-
     persisted request spec — never inventing a new spec, never accepting
@@ -945,6 +1291,12 @@ async def _reenqueue_replay(
     Shared by :func:`~earthdata_mcp.tools.export.rematerialize` (PRD 017,
     caller-initiated recovery) and :func:`_check_reuse`'s evicted branch
     (PRD 020, submit-time reuse) — one durable-replay path, two callers.
+
+    ``edl_token`` (PRD 022) is the *current call's* identity, encrypted onto
+    the replay job row. The original job's own credential was erased when it
+    reached its terminal state, so a replay never resurrects a stale token —
+    the caller either supplies its identity afresh or the replay runs as the
+    service account, exactly like a fresh submission.
     """
     new_job_id = uuid4().hex
     new_job_handle = await store.put_handle(
@@ -959,6 +1311,9 @@ async def _reenqueue_replay(
             obs_handle=handle,
             provider=job.provider,
             request_spec=job.request_spec,
+            credential_encrypted=(
+                encrypt_credential(edl_token) if edl_token else None
+            ),
         )
     await provenance.record_event(
         workspace_id,

@@ -295,6 +295,69 @@ async def test_poll_invokes_on_progress(l2_caps) -> None:
     assert seen[0].progress == 10
 
 
+# -- cancel: best-effort, idempotent (PRD 021) ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_calls_client_cancel_with_mapped_id(l2_caps) -> None:
+    client = MagicMock()
+    p = _provider(l2_caps, client=client)
+    await p.cancel(JobRef(provider="harmony", provider_job_id=_VALID_UUID))
+    client.cancel.assert_called_once_with(_VALID_UUID)
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_idempotent_on_already_terminal_conflict(l2_caps) -> None:
+    """harmony-py's client.cancel raises a two-arg Exception(reason, message) for
+    a 409 (job already in a terminal state) — the Protocol says this must not
+    raise, so it is logged and swallowed."""
+    client = MagicMock()
+    client.cancel.side_effect = Exception("Conflict", "Job status cannot transition")
+    p = _provider(l2_caps, client=client)
+    await p.cancel(JobRef(provider="harmony", provider_job_id=_VALID_UUID))  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_idempotent_on_unknown_job_404(l2_caps) -> None:
+    import requests
+
+    client = MagicMock()
+    response = MagicMock(status_code=404)
+    client.cancel.side_effect = requests.HTTPError(response=response)
+    p = _provider(l2_caps, client=client)
+    await p.cancel(JobRef(provider="harmony", provider_job_id=_VALID_UUID))  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_cancel_reraises_genuine_failures(l2_caps) -> None:
+    client = MagicMock()
+    client.cancel.side_effect = ConnectionError("network unreachable")
+    p = _provider(l2_caps, client=client)
+    with pytest.raises(ConnectionError):
+        await p.cancel(JobRef(provider="harmony", provider_job_id=_VALID_UUID))
+
+
+@pytest.mark.asyncio
+async def test_cancel_reraises_non_terminal_http_error(l2_caps) -> None:
+    import requests
+
+    client = MagicMock()
+    response = MagicMock(status_code=500)
+    client.cancel.side_effect = requests.HTTPError(response=response)
+    p = _provider(l2_caps, client=client)
+    with pytest.raises(requests.HTTPError):
+        await p.cancel(JobRef(provider="harmony", provider_job_id=_VALID_UUID))
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_a_noop_for_missing_or_malformed_job_id(l2_caps) -> None:
+    client = MagicMock()
+    p = _provider(l2_caps, client=client)
+    await p.cancel(JobRef(provider="harmony", provider_job_id=None))
+    await p.cancel(JobRef(provider="harmony", provider_job_id="not-a-uuid"))
+    client.cancel.assert_not_called()
+
+
 # -- materialize: persist through StorageBackend ---------------------------
 
 
@@ -382,6 +445,9 @@ async def test_materialize_bundles_multiple_granules(
     assert result.media_type == "application/netcdf-bundle+zip"
     assert result.storage_key == "harmony/job_xyz/result.nc.zip"
     assert result.extra["granule_count"] == 3
+    # PRD 023: Harmony emits one output file per input granule, so the output
+    # names are the identifiers it gives the granules that actually went in.
+    assert result.extra["granule_ids"] == sorted(members)
     bundle = await local_backend.get(result.storage_key)
     with zipfile.ZipFile(io.BytesIO(bundle)) as zf:
         assert sorted(zf.namelist()) == sorted(members)
@@ -451,3 +517,54 @@ async def test_materialize_mixed_bundle_gets_native_archive_type(
     )
 
     assert result.media_type == "application/x-native-archive+zip"
+
+
+@pytest.mark.asyncio
+async def test_materialize_bundle_never_slurps_granules_into_memory(
+    l2_caps, local_backend, tmp_path, monkeypatch
+) -> None:
+    """Regression (worker OOM): bundling used to build ``[(p.name, p.read_bytes())
+    for p in paths]`` and then zip that into a ``BytesIO`` — holding every granule
+    *and* the finished archive in RAM at once, ~2x the uncompressed bundle at peak.
+    A 50-granule TEMPO request OOM-killed the worker, and because a SIGKILL leaves
+    the row non-terminal, every restart resumed the job straight back into the same
+    kill. Members must stream from disk into the archive instead, so peak memory
+    stays flat in the granule count.
+    """
+    _HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+    members = {f"TEMPO_NO2_L3_S{i:03d}.nc4": _HDF5_MAGIC + b"g" * 512 for i in range(4)}
+    granules: set[Path] = set()
+    futures = []
+    for name, data in members.items():
+        path = tmp_path / name
+        path.write_bytes(data)
+        granules.add(path)
+        future = MagicMock()
+        future.result.return_value = str(path)
+        futures.append(future)
+    client = MagicMock()
+    client.download_all.return_value = iter(futures)
+
+    # Reading a whole granule into memory is the defect itself — make it fail loudly.
+    real_read_bytes = Path.read_bytes
+
+    def _no_whole_granule_reads(self: Path) -> bytes:
+        if self in granules:
+            raise AssertionError(
+                f"granule {self.name} was read whole into memory; stream it instead"
+            )
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _no_whole_granule_reads)
+
+    p = _provider(l2_caps, client=client, storage=local_backend)
+    result = await p.materialize(
+        JobRef(
+            provider="harmony", provider_job_id=_VALID_UUID, job_handle="job_stream"
+        )
+    )
+
+    # Streaming must not change the observable result.
+    assert result.media_type == "application/netcdf-bundle+zip"
+    assert result.extra["granule_count"] == 4
+    assert result.extra["uncompressed_bytes"] == sum(len(d) for d in members.values())

@@ -205,7 +205,7 @@ def patch_worker_seam(monkeypatch, workspace_store):
     monkeypatch.setattr(discovery_mod, "_default_store", lambda: workspace_store)
 
     def _install(provider: _FakeProvider) -> None:
-        async def _fake_load_provider(spec) -> _FakeProvider:
+        async def _fake_load_provider(spec, edl_token=None) -> _FakeProvider:
             return provider
 
         monkeypatch.setattr(worker_mod, "_load_provider", _fake_load_provider)

@@ -132,7 +132,7 @@ async def _run(caps: CollectionCapabilities, fmt: str) -> None:
     # The two seams a real worker reaches for: rebuild the provider against UAT
     # Harmony (where serviceId pinning is honoured), and resolve the obs handle
     # through this test's real store.
-    async def _load_provider(spec) -> "HarmonyProvider":
+    async def _load_provider(spec, edl_token=None) -> "HarmonyProvider":
         return HarmonyProvider(caps, settings=settings, env=harmony.Environment.UAT)
 
     orig_load_provider = worker_mod._load_provider

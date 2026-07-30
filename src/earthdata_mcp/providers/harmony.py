@@ -21,7 +21,6 @@ key (§4.4), and worker wiring are deliberately **not** built here.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import mimetypes
 import re
@@ -31,6 +30,8 @@ from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import requests
 
 from earthdata_mcp.config import Settings, get_settings
 from earthdata_mcp.formats import NETCDF_FAMILY_FORMATS, sniff_format
@@ -84,6 +85,31 @@ _HDF4_MEDIA_TYPE = "application/x-hdf4"
 _UNKNOWN_MEDIA_TYPE = "application/octet-stream"
 _NATIVE_ARCHIVE_MEDIA_TYPE = "application/x-native-archive+zip"
 
+#: Bytes to read off the front of a result file to classify it. ``sniff_format``
+#: only ever inspects leading magic numbers (the longest is 8 bytes), so a short
+#: header read answers exactly as well as the whole file — and lets a multi-GB
+#: granule be identified without ever being resident in memory.
+_MAGIC_PREFIX_BYTES = 16
+
+
+def _read_magic(path: Path) -> bytes:
+    """The leading bytes of ``path``, enough for :func:`sniff_format` to classify it."""
+    with path.open("rb") as fh:
+        return fh.read(_MAGIC_PREFIX_BYTES)
+
+
+def _granule_ids(paths: list[Path]) -> list[str]:
+    """The delivered-content identifiers for a Harmony result (PRD 023).
+
+    A Harmony job emits **one output file per input granule**, and names each
+    after the granule it came from, so the output names are the identifiers
+    Harmony itself gives the granules it resolved server-side at submit time —
+    which is exactly what an unchanged spec does *not* pin down. Sorted, since
+    ``download_all``'s completion order is not meaningful.
+    """
+    return sorted(path.name for path in paths)
+
+
 # Harmony job status string -> our durable JobState (the durable state machine).
 _STATUS_MAP: dict[str, JobState] = {
     "accepted": JobState.SUBMITTED,
@@ -112,6 +138,7 @@ class HarmonyProvider:
         settings: Settings | None = None,
         env: "harmony.Environment | None" = None,
         on_progress: Callable[[JobStatus], None] | None = None,
+        edl_token: str | None = None,
     ) -> None:
         self._caps = capabilities
         self._service_name_hint = service_name_hint
@@ -121,6 +148,11 @@ class HarmonyProvider:
         self._storage = storage
         self._env = env
         self._on_progress = on_progress
+        # Per-call identity (PRD 022): when set, the client is built with
+        # harmony-py's explicit ``token=`` argument (no process-env mutation)
+        # and cached per identity; when absent, the env-credential path below
+        # is byte-for-byte today's behavior.
+        self._edl_token = edl_token
 
     # -- capability gate --------------------------------------------------
 
@@ -186,6 +218,42 @@ class HarmonyProvider:
             self._on_progress(status)
         return status
 
+    async def cancel(self, job: JobRef) -> None:
+        """Best-effort Harmony cancel via harmony-py's ``client.cancel(job_id)``.
+
+        A missing/malformed job id (never actually submitted, or a test
+        fixture id) is a no-op — there is nothing upstream to cancel.
+        harmony-py raises a two-arg ``Exception(response.reason, message)``
+        for a 409 (job already in a terminal state — the only case its own
+        cancel() method special-cases) and ``requests.HTTPError`` for a 404
+        (unknown job id); both are exactly the "already-terminal or unknown"
+        cases the Protocol says must never raise, so both are logged and
+        swallowed here. Any other failure (auth, network, 5xx) propagates —
+        the caller (``cancel_retrieval``) treats it as non-fatal but reports it.
+        """
+        if not job.provider_job_id or not _UUID_RE.match(job.provider_job_id):
+            return
+        client = self._client()
+        await get_limiter("harmony").acquire()
+        try:
+            await asyncio.to_thread(client.cancel, job.provider_job_id)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                logger.info("Harmony cancel: job %s not found (already gone)", job.provider_job_id)
+                return
+            raise
+        except Exception as exc:
+            # harmony-py's own 409-conflict branch raises exactly this shape
+            # (see harmony.Client.cancel) — never any other exception's shape.
+            if type(exc) is Exception and len(exc.args) == 2:
+                logger.info(
+                    "Harmony cancel: job %s already in a terminal state (%s)",
+                    job.provider_job_id,
+                    exc.args[1],
+                )
+                return
+            raise
+
     async def materialize(self, job: JobRef) -> MaterializedResult:
         """Persist the finished job's result(s) through ``StorageBackend``.
 
@@ -196,50 +264,71 @@ class HarmonyProvider:
         :meth:`OPeNDAPProvider.materialize`, so one obs handle maps to one key and
         the whole request is materialized (not just the first granule);
         ``tools/_dataio`` concatenates the members on the time axis on read.
+
+        Everything moves **file-to-file**: granules are downloaded to a scratch
+        directory, zipped member-by-member into an archive on disk, and handed to
+        the backend with ``put_file``. Nothing here ever holds a whole granule (or
+        the whole bundle) in memory, so peak RSS stays flat in the granule count
+        instead of scaling with the result. That is not a micro-optimization: the
+        earlier read-everything-then-zip-in-RAM version needed ~2x the uncompressed
+        bundle and was OOM-killed by the kernel on a 50-granule TEMPO request —
+        and since a SIGKILL leaves the job row non-terminal, the worker resumed it
+        on restart straight back into the same kill.
         """
         client = self._client()
         storage = self._storage_backend()
-        files = await asyncio.to_thread(self._download_all, client, job)
         handle = job.job_handle or job.provider_job_id or "result"
 
-        if len(files) == 1:
-            name, data = files[0]
-            key = f"{PROVIDER}/{handle}/{name}"
-            await storage.put(key, data)
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = await asyncio.to_thread(self._download_all, client, job, tmp)
+
+            if len(paths) == 1:
+                path = paths[0]
+                key = f"{PROVIDER}/{handle}/{path.name}"
+                await storage.put_file(key, path)
+                return MaterializedResult(
+                    storage_key=key,
+                    media_type=self._media_type_for(path.name, _read_magic(path)),
+                    size_bytes=path.stat().st_size,
+                    extra={"granule_ids": _granule_ids(paths)},
+                )
+
+            # Multiple granule outputs: bundle them so one obs handle maps to one key.
+            # Sniffed per-member: all netCDF-family -> today's bundle type; any
+            # HDF4/unknown member -> the whole bundle is a native archive (PRD 008 —
+            # a mixed bundle is never half-opened, so one bad member taints the lot).
+            # The archive is built beside the granules rather than in a BytesIO, and
+            # each member is sniffed from its leading bytes only.
+            bundle_path = Path(tmp) / "_bundle.nc.zip"
+            total = 0
+            formats: dict[str, int] = {}
+            def _write_bundle() -> None:
+                nonlocal total
+                with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for path in paths:
+                        total += path.stat().st_size
+                        detected = sniff_format(_read_magic(path))
+                        formats[detected] = formats.get(detected, 0) + 1
+                        zf.write(path, arcname=path.name)
+
+            await asyncio.to_thread(_write_bundle)
+            all_netcdf = all(fmt in NETCDF_FAMILY_FORMATS for fmt in formats)
+            media_type = (
+                _NETCDF_BUNDLE_MEDIA_TYPE if all_netcdf else _NATIVE_ARCHIVE_MEDIA_TYPE
+            )
+            key = f"{PROVIDER}/{handle}/result.nc.zip"
+            await storage.put_file(key, bundle_path)
             return MaterializedResult(
                 storage_key=key,
-                media_type=self._media_type_for(name, data),
-                size_bytes=len(data),
+                media_type=media_type,
+                size_bytes=bundle_path.stat().st_size,
+                extra={
+                    "granule_count": len(paths),
+                    "uncompressed_bytes": total,
+                    "detected_formats": formats,
+                    "granule_ids": _granule_ids(paths),
+                },
             )
-
-        # Multiple granule outputs: bundle them so one obs handle maps to one key.
-        # Sniffed per-member: all netCDF-family -> today's bundle type; any
-        # HDF4/unknown member -> the whole bundle is a native archive (PRD 008 —
-        # a mixed bundle is never half-opened, so one bad member taints the lot).
-        buf = io.BytesIO()
-        total = 0
-        formats: dict[str, int] = {}
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for name, data in files:
-                total += len(data)
-                detected = sniff_format(data)
-                formats[detected] = formats.get(detected, 0) + 1
-                zf.writestr(name, data)
-        bundle = buf.getvalue()
-        all_netcdf = all(fmt in NETCDF_FAMILY_FORMATS for fmt in formats)
-        media_type = _NETCDF_BUNDLE_MEDIA_TYPE if all_netcdf else _NATIVE_ARCHIVE_MEDIA_TYPE
-        key = f"{PROVIDER}/{handle}/result.nc.zip"
-        await storage.put(key, bundle)
-        return MaterializedResult(
-            storage_key=key,
-            media_type=media_type,
-            size_bytes=len(bundle),
-            extra={
-                "granule_count": len(files),
-                "uncompressed_bytes": total,
-                "detected_formats": formats,
-            },
-        )
 
     # -- harmony-py request mapping (the only logic we own) ---------------
 
@@ -306,12 +395,23 @@ class HarmonyProvider:
     # -- client / storage construction ------------------------------------
 
     def _client(self) -> "harmony.Client":
-        """Return the injected client, else build one from settings/EDL token."""
+        """Return the injected client, else build one from the per-call token
+        (cached per identity, PRD 022) or from settings/EDL env credentials."""
         if self._injected_client is not None:
             return self._injected_client
         import harmony
 
         env = self._env if self._env is not None else harmony.Environment.PROD
+        if self._edl_token:
+            from earthdata_mcp.providers.identity import get_token_session, parse_edl_token
+
+            identity = parse_edl_token(self._edl_token)
+            session = get_token_session(identity)
+            self._injected_client = session.client_for(
+                f"harmony:{getattr(env, 'name', env)}",
+                lambda: harmony.Client(token=identity.token, env=env),
+            )
+            return self._injected_client
         token = self._settings.earthdata_token or None
         if token:
             self._injected_client = harmony.Client(token=token, env=env)
@@ -362,26 +462,28 @@ class HarmonyProvider:
 
     @staticmethod
     def _download_all(
-        client: "harmony.Client", job: JobRef
-    ) -> list[tuple[str, bytes]]:
-        """Download the job's result files; return ``(filename, bytes)`` for each.
+        client: "harmony.Client", job: JobRef, directory: str
+    ) -> list[Path]:
+        """Download the job's result files into ``directory``; return their paths.
 
         Every output file is kept (a Harmony job emits one per input granule), so a
         multi-granule request materializes in full rather than discarding all but the
         first — the caller bundles them when there is more than one.
+
+        Returns *paths*, never bytes: the caller owns ``directory``'s lifetime and
+        streams from these files, so a large result is never resident in memory.
         """
         if not job.provider_job_id or not _UUID_RE.match(job.provider_job_id):
             raise ValueError(
                 f"invalid Harmony job ID {job.provider_job_id!r}: expected UUID; "
                 "job was likely created by a test fixture"
             )
-        with tempfile.TemporaryDirectory() as tmp:
-            futures = list(
-                client.download_all(job.provider_job_id, directory=tmp, overwrite=True)
+        futures = list(
+            client.download_all(job.provider_job_id, directory=directory, overwrite=True)
+        )
+        paths = [Path(f.result()) for f in futures]
+        if not paths:
+            raise RuntimeError(
+                f"Harmony job {job.provider_job_id} produced no result files"
             )
-            paths = [Path(f.result()) for f in futures]
-            if not paths:
-                raise RuntimeError(
-                    f"Harmony job {job.provider_job_id} produced no result files"
-                )
-            return [(p.name, p.read_bytes()) for p in paths]
+        return paths

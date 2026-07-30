@@ -283,6 +283,20 @@ class RetrievalProvider(Protocol):
 
     async def materialize(self, job: JobRef) -> MaterializedResult: ...
 
+    async def cancel(self, job: JobRef) -> None:
+        """Best-effort, idempotent provider-side cancel (PRD 021).
+
+        Must never raise for an already-terminal or unknown upstream job — a
+        cancel racing a job that just finished, or one that was never really
+        submitted upstream, is not an error, it is the caller's intent already
+        satisfied. A genuine failure (auth, network, an unrecognized error from
+        the provider) may still raise; the caller (``cancel_retrieval``)
+        treats that as non-fatal to the tool but reports it. Every future
+        ``RetrievalProvider`` must honor this contract — it is the first
+        Protocol method that mutates provider-side state.
+        """
+        ...
+
 
 # -- helpers ---------------------------------------------------------------
 

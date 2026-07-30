@@ -64,6 +64,27 @@ async def test_list_workspace_filters_by_handle_type(
     assert [e["handle"] for e in out["handles"]] == [aoi]
 
 
+async def test_list_workspace_reports_whether_a_result_is_pinned(
+    workspace_store, workspace_id,
+) -> None:
+    """"Why is this still here" and "why is this gone" both need an answer
+    (PRD 024 story 4), so a result's pin is visible without resolving it."""
+    pinned = await workspace_store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {"status": "ready", "media_type": "application/x-netcdf", "pinned": True},
+    )
+    loose = await workspace_store.put_handle(
+        workspace_id, HandleType.OBS, {"status": "ready", "media_type": "application/x-netcdf"}
+    )
+
+    out = await list_workspace(workspace_id, store=workspace_store)
+
+    by_handle = {e["handle"]: e for e in out["handles"]}
+    assert by_handle[pinned]["summary"]["pinned"] is True
+    assert by_handle[loose]["summary"]["pinned"] is False
+
+
 async def test_list_workspace_is_scoped_to_the_workspace(
     workspace_store, workspace_id,
 ) -> None:

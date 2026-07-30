@@ -6,6 +6,7 @@ backend. Keys are opaque strings (use ``/`` as the separator). See PLAN.md §4.4
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,19 @@ class StorageBackend(ABC):
     @abstractmethod
     async def put(self, key: str, data: bytes) -> None:
         """Store ``data`` under ``key``, overwriting any existing object."""
+
+    async def put_file(self, key: str, path: "Path") -> None:
+        """Store the file at ``path`` under ``key``, without the caller ever
+        holding its contents in memory.
+
+        The default reads the file and delegates to :meth:`put`, so every backend
+        works unchanged; a backend that can transfer from disk directly (the local
+        one moves the file; an object store would multipart-upload a stream)
+        overrides this. Materializing a multi-granule bundle goes through here
+        precisely so peak memory stays flat in the result size — reading the whole
+        archive back just to hand it over is what OOM-killed the worker.
+        """
+        await self.put(key, await asyncio.to_thread(path.read_bytes))
 
     @abstractmethod
     async def get(self, key: str) -> bytes:

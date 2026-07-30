@@ -60,3 +60,35 @@ task (plus startup reclaim) catches it at the load seam and fails the job
 cleanly instead of crashing the task. Startup reclaim also fails (rather than
 re-enqueues) a non-terminal job older than `job_stale_after_days` — blind
 re-enqueue-forever is how debris jobs accumulate.
+
+## Speculative result / promotion
+
+A **speculative result** is one nobody asked for: adjacent-granule prefetch
+(`jobs/prefetch.py`, PRD 025) guessed that the next contiguous time window would
+be requested and retrieved it in advance. It is marked `speculative: true` in
+both places that matter — the `obs_` handle payload (what the cache and
+`pin_result` read) and the `jobs.speculative` column (what the worker reads to
+know a job must not prefetch again).
+
+Speculative is a *standing*, not a flavour, and it is deliberately second-class:
+
+- the eviction sweep (`jobs/eviction.py`) discards **every** speculative
+  candidate before **any** requested one — a lexicographic first key ahead of
+  size, rebuild cost and recency, never a weight;
+- `pin_result` refuses it;
+- it never chains: a speculative job reaching `READY` issues no prefetch of its
+  own, so one retrieval can trigger at most one speculative step;
+- it is dropped rather than deferred whenever user-requested work is in flight.
+
+**Promotion** is the one transition out of that standing. When a user request
+matches a speculative handle, `tools/retrieval._promote_if_speculative` clears
+the flag on PRD 020's reuse path and records a `promoted` provenance event: the
+guess turned out to be a real request, so the result is no more disposable than
+one retrieved directly. What promotes a handle is *someone having asked*, not the
+bytes having landed — a request that collapses onto a speculative job still in
+flight promotes it too.
+
+The pair `prefetch-issued` / `prefetch-hit` (plus `prefetch-wasted` for a
+speculative result evicted unused) are structured log events, and their ratio is
+the only honest answer to whether the feature earns its quota. That is why
+promotion has to be recorded rather than merely applied.

@@ -45,6 +45,9 @@ services:
     volumes:
       - ./src:/app/src
       - ./tests:/app/tests
+      # Read-only: maintenance scripts need this container's DB access and deps,
+      # but nothing in the image may write back to the repo.
+      - ./scripts:/app/scripts:ro
       - data:/data          # local storage backend root (default)
     depends_on:
       db:

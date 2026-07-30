@@ -66,6 +66,13 @@ class ProvenanceEventType(StrEnum):
     EXPIRED = "expired"
     RE_MATERIALIZED = "re-materialized"
     REUSED = "reused"
+    #: This result was speculative when it was created — nobody had asked for it
+    #: yet (PRD 025). Recorded on the prefetched handle at enqueue.
+    PREFETCHED = "prefetched"
+    #: A user request matched a prefetched handle, so it stopped being
+    #: speculative: someone asked for it. The transition has to be legible or a
+    #: promoted result is indistinguishable from one that was always real.
+    PROMOTED = "promoted"
 
 
 class Base(DeclarativeBase):
@@ -90,6 +97,15 @@ class Handle(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    # When this handle was last *used* — written only by ``touch_handle`` (PRD
+    # 024). ``updated_at`` cannot answer this: it also moves on every status
+    # write, so a job transitioning to READY looks identical to a consumer
+    # reading the result. The eviction score needs the difference. NULL for a
+    # handle nobody has read since the column existed; the score falls back to
+    # ``updated_at``, so behavior is unchanged until reads start recording.
+    last_accessed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
     )
 
 
@@ -119,7 +135,8 @@ class ProvenanceEdge(Base):
 class ProvenanceEvent(Base):
     """A first-class lineage event (``created``/``submitted``/``provider-fallback``/
     ``opendap-not-applicable``/``job-failed``/``materialized``/``expired``/
-    ``re-materialized``/``reused``) attached to a handle."""
+    ``re-materialized``/``reused``/``prefetched``/``promoted``) attached to a
+    handle."""
 
     __tablename__ = "provenance_events"
 

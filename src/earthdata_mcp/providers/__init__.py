@@ -46,22 +46,33 @@ __all__ = [
 ]
 
 
-def build(spec: RequestSpec, caps: CollectionCapabilities) -> RetrievalProvider:
+def build(
+    spec: RequestSpec,
+    caps: CollectionCapabilities,
+    *,
+    edl_token: str | None = None,
+) -> RetrievalProvider:
     """The single spec -> :class:`RetrievalProvider` seam (durable worker side).
 
     Bound to the caller's freshly-fetched ``caps`` so ``find_service`` re-checks
     the matched service rather than trusting the spec blindly. An unknown
     ``spec.provider`` fails loud — a job is never silently mis-driven by a
-    provider another provider planned it for.
+    provider another provider planned it for. ``edl_token`` (PRD 022) is the
+    job's per-call identity — the worker decrypts it off the job row per
+    attempt and threads it here so every provider (including the runtime
+    OPeNDAP fallback) authenticates as the caller, never the service account.
     """
     if spec.provider == "harmony":
-        return HarmonyProvider(caps, service_name_hint=spec.service_name)
+        return HarmonyProvider(
+            caps, service_name_hint=spec.service_name, edl_token=edl_token
+        )
     if spec.provider == "appeears":
-        return AppEEARSProvider(caps)
+        return AppEEARSProvider(caps, edl_token=edl_token)
     if spec.provider == "opendap":
         return OPeNDAPProvider(
             caps,
             opendap_urls=list(spec.opendap_urls),
+            edl_token=edl_token,
             # ``None`` is a real, meaningful value here (the DMR-fallback case: no
             # single global coordinate pair, each variable's own is in
             # ``var_coords`` instead) — never coerce it to a literal "lat"/"lon",

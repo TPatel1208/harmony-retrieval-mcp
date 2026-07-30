@@ -18,6 +18,7 @@ from xml.etree import ElementTree as ET
 
 from earthdata_mcp.catalog.enrichment import enrich_variable
 from earthdata_mcp.providers.cmr import CMRProvider
+from earthdata_mcp.providers.identity import parse_edl_token
 from earthdata_mcp.providers.opendap._dmr import parse_dmr
 from earthdata_mcp.providers.opendap._planning import _opendap_url_of
 from earthdata_mcp.tools.discovery import DEFAULT_WORKSPACE, _default_store
@@ -72,6 +73,7 @@ async def describe_dataset(
     dataset_handle: str,
     workspace_id: str = DEFAULT_WORKSPACE,
     detail: bool = False,
+    edl_token: str | None = None,
     *,
     cmr: CMRProvider | None = None,
     store: WorkspaceStore | None = None,
@@ -88,9 +90,11 @@ async def describe_dataset(
     (:data:`_COMPACT_METADATA_FIELDS`). Pass ``detail=True`` for the full
     per-variable UMM-Var enrichment and the complete collection metadata.
     ``variable_count`` is always the true total, in both modes, so no
-    trimming is ever silent.
+    trimming is ever silent. ``edl_token`` (PRD 022) makes the CMR/DMR
+    fetches run as that identity; absent means today's env-credential path.
     """
-    cmr = cmr or CMRProvider()
+    identity = parse_edl_token(edl_token)
+    cmr = cmr or CMRProvider(edl_token=identity.token if identity else None)
     store = store or _default_store()
 
     concept_id = await resolve_dataset(store, workspace_id, dataset_handle)

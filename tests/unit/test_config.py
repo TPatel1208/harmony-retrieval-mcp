@@ -37,7 +37,17 @@ def test_env_overrides_storage(monkeypatch) -> None:
     assert settings.storage_kind == "s3"
 
 
-def test_mcp_transport_defaults_to_stdio() -> None:
+def test_mcp_transport_defaults_to_stdio(monkeypatch) -> None:
+    # Hermetic against the container's own ambient transport config: the mcp
+    # service runs with EARTHDATA_MCP_TRANSPORT=http since the PRD 018 compose
+    # topology, and this test asserts the *code* default, not the deployment's.
+    for name in (
+        "EARTHDATA_MCP_TRANSPORT",
+        "EARTHDATA_MCP_HOST",
+        "EARTHDATA_MCP_PORT",
+        "EARTHDATA_MCP_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
     settings = Settings(_env_file=None)
     assert settings.mcp_transport == "stdio"
     assert settings.mcp_host == "0.0.0.0"
@@ -61,3 +71,20 @@ def test_invalid_mcp_transport_rejected(monkeypatch) -> None:
     monkeypatch.setenv("EARTHDATA_MCP_TRANSPORT", "carrier-pigeon")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_prefetch_ships_disabled(monkeypatch) -> None:
+    """A feature that spends provider quota on guesses must be opted into
+    (PRD 025 story 6). Hermetic against the container's own ambient config."""
+    monkeypatch.delenv("EARTHDATA_PREFETCH_ENABLED", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.earthdata_prefetch_enabled is False
+
+
+def test_prefetch_size_cap_is_well_below_the_request_size_warning(monkeypatch) -> None:
+    """A guess may not cost what a request a researcher actually made is allowed
+    to — the prefetch cap is deliberately far under ``size_warning_threshold_mb``."""
+    monkeypatch.delenv("EARTHDATA_PREFETCH_MAX_BYTES", raising=False)
+    settings = Settings(_env_file=None)
+    warning_bytes = settings.size_warning_threshold_mb * 1024**2
+    assert settings.earthdata_prefetch_max_bytes < warning_bytes / 2

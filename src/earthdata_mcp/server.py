@@ -14,9 +14,10 @@ dependencies lazily, on first call, never at import.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from fastmcp import FastMCP
+from pydantic import Field
 from starlette.middleware import Middleware
 
 from earthdata_mcp.config import get_settings
@@ -28,6 +29,7 @@ from earthdata_mcp.tools import (
     export,
     preview,
     provenance,
+    retention,
     retrieval,
     transform,
     understanding,
@@ -36,12 +38,31 @@ from earthdata_mcp.tools import (
 
 mcp = FastMCP("earthdata-mcp")
 
+#: The uniform per-call identity parameter (PRD 022), advertised on every
+#: workspace-scoped tool's input schema so a consumer can feature-detect
+#: support at connect time. Consumer-supplied, never model-supplied (the
+#: consumer strips it from model-facing schemas, like ``workspace_id``);
+#: absent/empty means the server's environment credential — byte-for-byte
+#: today's behavior.
+EdlToken = Annotated[
+    str | None,
+    Field(
+        description=(
+            "Optional per-user Earthdata Login bearer token. Consumer-supplied, "
+            "never model-supplied. When present, this call (and any durable job "
+            "it spawns) authenticates to NASA as that token's identity; absent "
+            "means the server's environment credential."
+        )
+    ),
+]
+
 
 @mcp.tool
 async def search_datasets(
     query: str,
     filters: dict[str, Any] | None = None,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Search NASA Earthdata collections; mint a ``dataset_`` handle per result.
 
@@ -49,7 +70,7 @@ async def search_datasets(
     an optional dict of CMR collection-search params (e.g. ``temporal``,
     ``bounding_box``, ``provider``, ``limit``).
     """
-    return await discovery.search_datasets(query, filters, workspace_id)
+    return await discovery.search_datasets(query, filters, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -57,6 +78,7 @@ async def describe_dataset(
     dataset_handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
     detail: bool = False,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Resolve a ``dataset_`` handle to its metadata, variables, and advisory notes.
 
@@ -66,13 +88,14 @@ async def describe_dataset(
     core collection identification fields only). Pass ``detail=True`` for the
     full per-variable UMM-Var enrichment and the complete collection metadata.
     """
-    return await understanding.describe_dataset(dataset_handle, workspace_id, detail)
+    return await understanding.describe_dataset(dataset_handle, workspace_id, detail, edl_token=edl_token)
 
 
 @mcp.tool
 async def define_area_of_interest(
     location: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Define an area of interest and mint an ``aoi_`` handle.
 
@@ -88,7 +111,7 @@ async def define_area_of_interest(
     is ``{"type", "vertex_count"}`` (or ``None``); resolve the handle for the
     full geometry.
     """
-    return await area.define_area_of_interest(location, workspace_id)
+    return await area.define_area_of_interest(location, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -97,10 +120,11 @@ async def check_coverage(
     aoi_handle: str,
     time_range: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Check granule coverage for a dataset/AOI/time. Returns a count + sample granules."""
     return await coverage.check_coverage(
-        dataset_handle, aoi_handle, time_range, workspace_id
+        dataset_handle, aoi_handle, time_range, workspace_id, edl_token=edl_token
     )
 
 
@@ -110,10 +134,11 @@ async def check_availability(
     aoi_handle: str,
     time_range: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Fast count-only availability check — no granule data fetched."""
     return await coverage.check_availability(
-        dataset_handle, aoi_handle, time_range, workspace_id
+        dataset_handle, aoi_handle, time_range, workspace_id, edl_token=edl_token
     )
 
 
@@ -124,10 +149,11 @@ async def inspect_granules(
     time_range: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
     limit: int = 10,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Return granule records for a dataset/AOI/time (up to ``limit``, CMR-capped at 50)."""
     return await coverage.inspect_granules(
-        dataset_handle, aoi_handle, time_range, workspace_id, limit=limit
+        dataset_handle, aoi_handle, time_range, workspace_id, limit=limit, edl_token=edl_token
     )
 
 
@@ -137,10 +163,11 @@ async def estimate_retrieval_size(
     aoi_handle: str,
     time_range: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Estimate total retrieval size by sampling up to 50 granules' reported sizes."""
     return await coverage.estimate_retrieval_size(
-        dataset_handle, aoi_handle, time_range, workspace_id
+        dataset_handle, aoi_handle, time_range, workspace_id, edl_token=edl_token
     )
 
 
@@ -151,6 +178,7 @@ async def retrieve_data(
     time_range: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
     output_format: str | None = None,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Retrieve a dataset over an AOI + time window as a durable job.
 
@@ -159,7 +187,7 @@ async def retrieve_data(
     collection's shape (gridded → Zarr) unless ``output_format`` is given.
     """
     return await retrieval.retrieve_data(
-        dataset_handle, aoi_handle, time_range, workspace_id, output_format
+        dataset_handle, aoi_handle, time_range, workspace_id, output_format, edl_token=edl_token
     )
 
 
@@ -171,6 +199,7 @@ async def retrieve_subset(
     variables: list[str],
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
     output_format: str | None = None,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Retrieve a variable + bbox + temporal subset as a durable job.
 
@@ -179,7 +208,7 @@ async def retrieve_subset(
     OPeNDAP is the worker's runtime fallback. Returns the job/obs handles.
     """
     return await retrieval.retrieve_subset(
-        dataset_handle, aoi_handle, time_range, variables, workspace_id, output_format
+        dataset_handle, aoi_handle, time_range, variables, workspace_id, output_format, edl_token=edl_token
     )
 
 
@@ -192,6 +221,7 @@ async def retrieve_timeseries(
     output_format: str | None = None,
     aoi_handle: str | None = None,
     point_sample: bool = False,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Retrieve a variable time-series as a durable job; the AOI is optional.
 
@@ -205,7 +235,7 @@ async def retrieve_timeseries(
         workspace_id,
         output_format,
         aoi_handle,
-        point_sample,
+        point_sample, edl_token=edl_token
     )
 
 
@@ -213,22 +243,41 @@ async def retrieve_timeseries(
 async def get_retrieval_status(
     job_handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Read a retrieval job's durable state from Postgres (status/progress/error).
+
+    Also carries a curated slice of what the job pertains to — ``short_name``,
+    ``variables``, ``aoi_bbox``, ``time_range``, ``provider``,
+    ``output_format``, and ``granule_count`` — whichever of those the job's
+    request actually set; never the raw internal spec. ``granule_count`` is
+    accompanied by ``granule_count_source``: ``"materialized"`` once the job
+    has run (what it actually retrieved) or ``"planned"`` before that (a
+    planning-time tally no provider is obliged to honor).
 
     An unknown, cross-workspace, or orphaned ``job_`` handle is a structured
     ``{job_handle, status: "not_found", message}`` answer, not an error — a
     missing job is a valid answer to "what's this job's status?".
     """
-    return await retrieval.get_retrieval_status(job_handle, workspace_id)
+    return await retrieval.get_retrieval_status(job_handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
 async def cancel_retrieval(
     job_handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Cancel a non-terminal retrieval job.
+
+    Flips the local durable state to cancelled (the worker stops
+    polling/materializing) and then best-effort cancels the job at its
+    provider too — real for Harmony and AppEEARS, a no-op for the synchronous
+    OPeNDAP path. The response carries ``upstream``: ``"requested"`` (issued
+    to the provider), ``"unsupported"`` (OPeNDAP, or a job never submitted
+    upstream), ``"already_terminal"`` (the job had already finished before
+    this call landed), or ``"error"`` (the provider cancel failed — logged,
+    never fatal to this call; the local cancel still succeeds).
 
     Idempotent: a job that is already terminal (ready/failed/expired/cancelled)
     is left as-is and its current status is returned rather than raising — the
@@ -240,7 +289,7 @@ async def cancel_retrieval(
     error: it returns ``{job_handle, status: "not_found", cancelled: False,
     message}`` — "stop this job" on a gone job is already satisfied.
     """
-    return await retrieval.cancel_retrieval(job_handle, workspace_id)
+    return await retrieval.cancel_retrieval(job_handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -250,6 +299,7 @@ async def preview_dataset(
     aoi_handle: str | None = None,
     layer: str | None = None,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Build a GIBS visual preview reference for a dataset; mint a ``preview_`` handle.
 
@@ -257,7 +307,7 @@ async def preview_dataset(
     made — ``gibs_url`` is a request the agent or a browser can fetch.
     """
     return await preview.preview_dataset(
-        dataset_handle, time_range, aoi_handle, layer, workspace_id
+        dataset_handle, time_range, aoi_handle, layer, workspace_id, edl_token=edl_token
     )
 
 
@@ -265,9 +315,10 @@ async def preview_dataset(
 async def summarize_dataset(
     handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Structural summary of a ``dataset_`` (metadata) or materialized ``obs_``/``cube_``."""
-    return await preview.summarize_dataset(handle, workspace_id)
+    return await preview.summarize_dataset(handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -275,9 +326,10 @@ async def inspect_statistics(
     handle: str,
     variables: list[str] | None = None,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Descriptive per-variable statistics (min/max/mean/std/count) over a result."""
-    return await preview.inspect_statistics(handle, variables, workspace_id)
+    return await preview.inspect_statistics(handle, variables, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -287,10 +339,11 @@ async def subset(
     variables: list[str] | None = None,
     time_range: str | None = None,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Spatial/variable/temporal subset of a materialized result → a ``cube_`` handle."""
     return await transform.subset(
-        source_handle, aoi_handle, variables, time_range, workspace_id
+        source_handle, aoi_handle, variables, time_range, workspace_id, edl_token=edl_token
     )
 
 
@@ -299,9 +352,10 @@ async def reproject(
     source_handle: str,
     crs: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Tag a gridded result with a target CRS → a ``cube_`` handle."""
-    return await transform.reproject(source_handle, crs, workspace_id)
+    return await transform.reproject(source_handle, crs, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -310,10 +364,11 @@ async def resample(
     time_freq: str | None = None,
     spatial_factor: int | None = None,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Temporal and/or spatial resampling of a gridded result → a ``cube_`` handle."""
     return await transform.resample(
-        source_handle, time_freq, spatial_factor, workspace_id
+        source_handle, time_freq, spatial_factor, workspace_id, edl_token=edl_token
     )
 
 
@@ -322,6 +377,7 @@ async def convert_format(
     source_handle: str,
     output_format: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Re-serialize a materialized result to a different media type → a ``cube_`` handle.
 
@@ -329,7 +385,7 @@ async def convert_format(
     their media-type spellings), case-insensitive. CSV requires a tabular (point)
     source; netCDF requires a gridded source — each raises a clear error otherwise.
     """
-    return await transform.convert_format(source_handle, output_format, workspace_id)
+    return await transform.convert_format(source_handle, output_format, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
@@ -337,15 +393,17 @@ async def align(
     source_handles: list[str],
     method: str = "outer",
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Align ≥2 gridded results to a common grid → a ``cube_`` handle + alignment report."""
-    return await transform.align(source_handles, method, workspace_id=workspace_id)
+    return await transform.align(source_handles, method, workspace_id=workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
 async def export_result(
     handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Resolve a materialized ``obs_``/``cube_`` handle to an openable URI.
 
@@ -355,17 +413,27 @@ async def export_result(
     logic survives a move to hosted deployment unchanged. Exporting LRU-touches
     the handle so an actively-read result is never the first thing evicted.
 
+    A ready answer also carries ``content_digest`` — a stable identifier for
+    what this handle **actually** contains (the granules that were really
+    retrieved, the provider that really ran) — plus ``partial`` (true when the
+    provider named no granules, so the digest describes less than the whole
+    result) and ``granule_count``. Key a derived-artifact cache on
+    ``content_digest`` rather than on the handle alone: a rematerialization of
+    the same request can legitimately deliver different data. All three are
+    absent for a result materialized before this record existed.
+
     A pending or expired (evicted) handle answers ``{handle, status, message}``
     instead of raising; an unknown or cross-workspace handle collapses to the
     same ``not_found`` answer so existence never leaks.
     """
-    return await export.export_result(handle, workspace_id)
+    return await export.export_result(handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
 async def rematerialize(
     handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Re-enqueue the durable job behind an evicted ``obs_`` handle.
 
@@ -379,13 +447,40 @@ async def rematerialize(
     ``cube_``) or an unknown/cross-workspace handle answers a structured
     ``{status: "not_found"}`` rather than raising.
     """
-    return await export.rematerialize(handle, workspace_id)
+    return await export.rematerialize(handle, workspace_id, edl_token=edl_token)
+
+
+@mcp.tool
+async def pin_result(
+    handle: str,
+    pinned: bool = True,
+    workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
+) -> dict:
+    """Exempt a materialized ``obs_``/``cube_`` handle from cache eviction, or clear it.
+
+    Pin a result you will come back to: the materialization cache evicts by
+    value — biggest reclaim for the least rebuild cost, least-recently-read
+    first — and a pinned result is never selected, so unrelated work in the same
+    workspace cannot evict it. The pin is durable and survives a restart.
+
+    Returns ``{handle, status, pinned, pinned_bytes, pinned_bytes_max}``.
+    ``status`` is ``"refused"`` when the pin would put the workspace past its
+    pinned-bytes ceiling — the pin is *not* applied, and ``message`` says by how
+    much. An evicted handle answers ``{status: "expired"}``: rematerialize it
+    first, then pin it. An unknown or cross-workspace handle answers
+    ``{status: "not_found"}`` rather than raising.
+
+    Pass ``pinned=False`` to unpin; that is always allowed.
+    """
+    return await retention.pin_result(handle, pinned, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
 async def get_provenance(
     handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Return a handle's lineage: its ancestry graph (recursive CTE) and events.
 
@@ -399,13 +494,14 @@ async def get_provenance(
     resolved_handle?, note?}`` scoped to the workspace — lineage never crosses a
     workspace boundary.
     """
-    return await provenance.get_provenance(handle, workspace_id)
+    return await provenance.get_provenance(handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
 async def cite_dataset(
     dataset_handle: str,
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Official DOI + formal citation strings for a ``dataset_`` handle.
 
@@ -413,13 +509,14 @@ async def cite_dataset(
     hand-rolled. Returns ``{handle, concept_id, doi, doi_authority,
     collection_citations, reference_citation_count}``.
     """
-    return await provenance.cite_dataset(dataset_handle, workspace_id)
+    return await provenance.cite_dataset(dataset_handle, workspace_id, edl_token=edl_token)
 
 
 @mcp.tool
 async def list_workspace(
     workspace_id: str = discovery.DEFAULT_WORKSPACE,
     handle_type: str | None = None,
+    edl_token: EdlToken = None,
 ) -> dict:
     """Re-enumerate a workspace's handles — for a consumer reconnecting after a
     restart or page reload, with no conversation history to replay them from.
@@ -429,22 +526,103 @@ async def list_workspace(
     created_at, summary}]}``, oldest first; ``summary`` is a small type-specific
     slice of the handle's payload, not the full payload.
     """
-    return await workspace.list_workspace(workspace_id, handle_type)
+    return await workspace.list_workspace(workspace_id, handle_type, edl_token=edl_token)
+
+
+def _install_exit_debug() -> None:
+    """[MCP-EXIT-DEBUG] Temporary instrumentation to diagnose the earthdata-mcp
+    container's silent clean-exit-0 crash-restart loop (RestartCount>10). Prints
+    to stderr (flush=True) so it survives whatever logging config is active and
+    shows up in `docker logs`. Remove once the exit cause is identified.
+
+    Distinguishes the two hypotheses:
+      * a signal arrived (SIGTERM/SIGINT from Docker/compose/orchestrator) ->
+        the signal handler line fires, then uvicorn shuts down gracefully; and
+      * the process died from a fatal fault (segfault/abort in a C extension:
+        rasterio/GDAL/pyproj/numpy) -> faulthandler dumps all-thread tracebacks.
+    An unhandled Python exception out of mcp.run() is caught by main()'s wrapper.
+    """
+    import atexit
+    import faulthandler
+    import os
+    import signal
+    import sys
+
+    faulthandler.enable(all_threads=True)  # fatal C-level faults -> stderr traceback
+
+    # uvicorn installs its own asyncio signal handlers during startup, which
+    # replace any signal.signal()/faulthandler handler we set here — so a plain
+    # handler never fires. Patch uvicorn's handler *method* instead: it runs
+    # whenever uvicorn processes a shutdown signal, regardless of install order,
+    # and tells us WHICH signal (and the stack at that moment). If the organic
+    # exit sets should_exit without a signal, this never fires and we're left
+    # with main()'s "returned normally" — itself the finding (internal shutdown,
+    # not an external signal).
+    try:
+        import uvicorn
+
+        _orig_handle_exit = uvicorn.Server.handle_exit
+
+        def _logged_handle_exit(self, sig, frame):
+            try:
+                name = signal.Signals(sig).name
+            except (ValueError, TypeError):
+                name = str(sig)
+            print(f"[MCP-EXIT-DEBUG] uvicorn.handle_exit sig={sig} ({name}) pid={os.getpid()} — stack:",
+                  file=sys.stderr, flush=True)
+            faulthandler.dump_traceback(all_threads=True)
+            return _orig_handle_exit(self, sig, frame)
+
+        uvicorn.Server.handle_exit = _logged_handle_exit
+    except Exception as exc:  # pragma: no cover — best-effort instrumentation
+        print(f"[MCP-EXIT-DEBUG] could not patch uvicorn.handle_exit: {exc!r}",
+              file=sys.stderr, flush=True)
+
+    @atexit.register
+    def _on_exit():
+        print(f"[MCP-EXIT-DEBUG] interpreter exiting (pid={os.getpid()})",
+              file=sys.stderr, flush=True)
+
+    print(f"[MCP-EXIT-DEBUG] instrumentation armed (pid={os.getpid()})",
+          file=sys.stderr, flush=True)
 
 
 def main() -> None:
     """Run the MCP server: stdio by default, streamable HTTP when configured."""
+    import sys
+    import traceback
+
+    _install_exit_debug()  # [MCP-EXIT-DEBUG] remove once exit cause is found
     settings = get_settings()
     if settings.mcp_transport == "http":
         middleware = []
         if settings.mcp_token:
             middleware.append(Middleware(BearerTokenMiddleware, token=settings.mcp_token))
-        mcp.run(
-            transport="http",
-            host=settings.mcp_host,
-            port=settings.mcp_port,
-            middleware=middleware,
-        )
+        try:
+            mcp.run(
+                transport="http",
+                host=settings.mcp_host,
+                port=settings.mcp_port,
+                middleware=middleware,
+                # Uvicorn's default access logger crashes formatting the access line
+                # for sse_starlette's streamed responses (record.args is None on the
+                # final send() after a client disconnects mid-stream), which breaks
+                # the SSE connection and sends clients into a reconnect storm. Access
+                # logging brings no operational value here (structured app logs cover
+                # request handling); disabling it removes the crash entirely.
+                uvicorn_config={"access_log": False},
+            )
+        except BaseException:  # [MCP-EXIT-DEBUG] capture any escape from the serve loop
+            print("[MCP-EXIT-DEBUG] mcp.run() raised — traceback follows:",
+                  file=sys.stderr, flush=True)
+            traceback.print_exc()
+            raise
+        else:
+            # [MCP-EXIT-DEBUG] normal return == uvicorn shut down gracefully
+            # (should_exit set — almost always a received signal). If no signal
+            # line was printed above, the serve loop returned on its own.
+            print("[MCP-EXIT-DEBUG] mcp.run() returned normally (graceful uvicorn shutdown)",
+                  file=sys.stderr, flush=True)
     else:
         mcp.run()
 
