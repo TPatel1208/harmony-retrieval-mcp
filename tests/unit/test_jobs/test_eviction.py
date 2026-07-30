@@ -12,8 +12,10 @@ Eviction is deliberately global (it scans handles across every workspace, per
 the PRD's "the cap is global" decision), and the Postgres fixtures are real,
 persistent rows with no per-test rollback — so every storage key here embeds
 ``workspace_id`` (itself a fresh uuid per test) to guarantee it can never alias
-a debris row left behind by an earlier test run, and :func:`_isolate_cache`
-below clears the suite's own leftovers before each test.
+a debris row left behind by an earlier test run, and the shared
+``session_factory`` fixture retires the suite's own leftover ``ready`` handles
+around every test (see ``tests/conftest.py``) so each cap arithmetic here means
+what it says.
 """
 
 from __future__ import annotations
@@ -24,13 +26,6 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import update
 
-#: Every workspace this test suite mints is ``ws-<uuid4 hex>`` (the shared
-#: ``workspace_id`` fixture) or an explicit ``ws-`` literal. A real deployment's
-#: workspaces are ``default`` or ``user-{id}``, so this pattern selects test
-#: debris and nothing else — the DB these tests run against is shared with real
-#: rows, and nothing here may touch them.
-_SUITE_WORKSPACE_PATTERN = "ws-%"
-
 from earthdata_mcp.jobs import crud
 from earthdata_mcp.jobs.eviction import EvictionService
 from earthdata_mcp.jobs.models import Job
@@ -38,28 +33,6 @@ from earthdata_mcp.jobs.prefetch import PREFETCH_WASTED
 from earthdata_mcp.jobs.state import JobState
 from earthdata_mcp.workspace.models import Handle, HandleType, ProvenanceEventType
 from earthdata_mcp.workspace.provenance import ProvenanceStore
-
-
-@pytest.fixture(autouse=True)
-async def _isolate_cache(session_factory):
-    """Retire ``ready`` handles other test modules left in the shared database.
-
-    A sweep is global by design, and it now reads the ``size_bytes`` a handle
-    persists rather than stat-ing the blob (PRD 024 story 7) — so a ready handle
-    another module seeded counts toward the cap here even though its bytes live
-    in that test's own tmp directory. Retiring the suite's leftovers first is
-    what makes each test's arithmetic mean what it says.
-    """
-    async with session_factory() as session:
-        await session.execute(
-            update(Handle)
-            .where(
-                Handle.workspace_id.like(_SUITE_WORKSPACE_PATTERN),
-                Handle.payload["status"].astext == "ready",
-            )
-            .values(payload=Handle.payload.concat({"status": "expired"}))
-        )
-        await session.commit()
 
 
 def _key(workspace_id: str, name: str) -> str:

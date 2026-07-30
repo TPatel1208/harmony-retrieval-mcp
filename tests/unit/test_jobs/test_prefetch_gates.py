@@ -9,6 +9,11 @@ silently disable the others. That isolation is the point of this module.
 Real Postgres fixtures (the budget and fair-share gates are durable questions,
 and the enqueue writes real handles and a real job row); the CMR/OPeNDAP
 planning pass and the queue are injected, so nothing here touches the network.
+
+Two of these gates read *global* state — the PRD 024 fair share and "is any
+user-requested job in flight" — so this module's arithmetic only means what it
+says because the shared ``session_factory`` fixture retires the suite's leftover
+rows around every test (see ``tests/conftest.py``).
 """
 
 from __future__ import annotations
@@ -17,21 +22,15 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
-import pytest
-from sqlalchemy import or_, update
+from sqlalchemy import update
 
 from earthdata_mcp.config import Settings
 from earthdata_mcp.jobs import crud, prefetch
 from earthdata_mcp.jobs.models import Job
 from earthdata_mcp.jobs.prefetch import PrefetchService, WindowPlan
-from earthdata_mcp.jobs.state import TERMINAL_STATES, JobState
+from earthdata_mcp.jobs.state import JobState
 from earthdata_mcp.providers.request_spec import RequestSpec, compute_request_signature
-from earthdata_mcp.workspace.models import Handle, HandleType, ProvenanceEventType
-
-#: Same isolation contract as ``test_eviction.py``: the fair-share reading is
-#: global by design, so this suite's own workspaces are the only ``ws-`` rows and
-#: leftovers from other modules are retired before each test.
-_SUITE_WORKSPACE_PATTERN = "ws-%"
+from earthdata_mcp.workspace.models import HandleType, ProvenanceEventType
 
 #: The origin window and what it predicts. Both are far enough in the past that
 #: the NRT-latency gate passes for every test that isn't about that gate.
@@ -41,47 +40,6 @@ _PREDICTED_WINDOW = "2024-04-08T00:00:00Z/2024-04-15T00:00:00Z"
 _BBOX = (-75.6, 38.9, -73.9, 41.4)
 _VARIABLES = ("vertical_column_troposphere",)
 _FORMAT = "application/netcdf4"
-
-
-@pytest.fixture(autouse=True)
-async def _isolate_cache_and_queue(session_factory):
-    """Retire the test debris other modules left in the shared database.
-
-    Two readings here are global by design — the PRD 024 fair share, and "is any
-    user-requested job in flight" — so a ``ready`` handle or a non-terminal job
-    row another module seeded would decide this module's gates instead of its own
-    arithmetic.
-
-    Handles are selected by ``ws-`` workspace (the shared ``workspace_id``
-    fixture's pattern; a real deployment's are ``default`` or ``user-{id}``).
-    Jobs are selected by that *or* by having no ``workspace_id`` in their durable
-    spec at all: every spec ``RequestSpec.from_plan`` builds carries one, so a
-    row without one can only have been seeded directly by a test. Nothing here
-    may touch a real row. Prior art: ``test_eviction.py``'s ``_isolate_cache``.
-    """
-    async with session_factory() as session:
-        await session.execute(
-            update(Handle)
-            .where(
-                Handle.workspace_id.like(_SUITE_WORKSPACE_PATTERN),
-                Handle.payload["status"].astext == "ready",
-            )
-            .values(payload=Handle.payload.concat({"status": "expired"}))
-        )
-        await session.execute(
-            update(Job)
-            .where(
-                Job.state.not_in([s.value for s in TERMINAL_STATES]),
-                or_(
-                    Job.request_spec["workspace_id"].astext.like(
-                        _SUITE_WORKSPACE_PATTERN
-                    ),
-                    Job.request_spec["workspace_id"].astext.is_(None),
-                ),
-            )
-            .values(state=JobState.CANCELLED.value)
-        )
-        await session.commit()
 
 
 def _settings(**overrides) -> Settings:
