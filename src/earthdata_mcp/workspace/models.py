@@ -66,6 +66,13 @@ class ProvenanceEventType(StrEnum):
     EXPIRED = "expired"
     RE_MATERIALIZED = "re-materialized"
     REUSED = "reused"
+    #: This result was speculative when it was created — nobody had asked for it
+    #: yet (PRD 025). Recorded on the prefetched handle at enqueue.
+    PREFETCHED = "prefetched"
+    #: A user request matched a prefetched handle, so it stopped being
+    #: speculative: someone asked for it. The transition has to be legible or a
+    #: promoted result is indistinguishable from one that was always real.
+    PROMOTED = "promoted"
 
 
 class Base(DeclarativeBase):
@@ -128,7 +135,8 @@ class ProvenanceEdge(Base):
 class ProvenanceEvent(Base):
     """A first-class lineage event (``created``/``submitted``/``provider-fallback``/
     ``opendap-not-applicable``/``job-failed``/``materialized``/``expired``/
-    ``re-materialized``/``reused``) attached to a handle."""
+    ``re-materialized``/``reused``/``prefetched``/``promoted``) attached to a
+    handle."""
 
     __tablename__ = "provenance_events"
 

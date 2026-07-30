@@ -53,6 +53,12 @@ async def pin_result(
     the pin would push this workspace past its pinned-bytes ceiling — in which
     case ``pinned`` stays ``False`` and ``message`` explains the limit.
 
+    A speculative (prefetched, PRD 025) handle is likewise ``"refused"``: a
+    result nobody has asked for is disposable by construction, and pinning it
+    would exempt it from the very rule that keeps speculation from costing a
+    researcher their own data. Requesting that window promotes the handle, and a
+    promoted handle pins like any other.
+
     A handle whose result has been evicted answers ``{status: "expired"}``: there
     are no bytes left to protect, and ``rematerialize`` is the recovery path. An
     unknown or cross-workspace handle answers the same ``not_found`` as every
@@ -90,6 +96,24 @@ async def pin_result(
             "pinned": False,
             "pinned_bytes": await _pinned_bytes(store, storage, workspace_id, exclude=handle),
             "pinned_bytes_max": max_pinned_bytes,
+        }
+
+    if record.payload.get("speculative"):
+        # PRD 025: a prefetched result is disposable by construction, and the
+        # eviction rule that discards it before any requested result is exactly
+        # what stops speculation from costing a researcher their own data. A pin
+        # would exempt it from that rule. Refused rather than ignored, and the
+        # message names the one action that makes it pinnable: ask for it.
+        return {
+            "handle": handle,
+            "status": "refused",
+            "pinned": False,
+            "message": (
+                f"handle {handle!r} holds a speculative (prefetched) result "
+                "nobody has requested yet, and speculative results cannot be "
+                "pinned; retrieve this window explicitly — the matching request "
+                "promotes it to an ordinary result, which can then be pinned"
+            ),
         }
 
     if record.payload.get("status") != "ready":

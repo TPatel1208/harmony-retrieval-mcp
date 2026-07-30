@@ -154,3 +154,62 @@ async def test_pin_result_rejects_a_non_result_handle(
             store=workspace_store,
             storage=local_backend,
         )
+
+
+async def test_pinning_a_speculative_result_is_refused(
+    workspace_store, local_backend, workspace_id
+) -> None:
+    """A prefetched result is disposable by construction (PRD 025): pinning it
+    would exempt data nobody asked for from the very eviction rule that keeps
+    speculation from costing a researcher their own results. Refused with a
+    message that says what to do instead, never silently ignored."""
+    key = f"harmony/{workspace_id}/spec.nc"
+    await local_backend.put(key, b"x" * 40)
+    handle = await workspace_store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {
+            "status": "ready",
+            "storage_key": key,
+            "media_type": "application/x-netcdf",
+            "size_bytes": 40,
+            "speculative": True,
+        },
+    )
+
+    out = await pin_result(
+        handle, True, workspace_id, store=workspace_store, storage=local_backend
+    )
+
+    assert out["status"] == "refused"
+    assert out["pinned"] is False
+    assert "speculative" in out["message"]
+    record = await workspace_store.get_handle(workspace_id, handle)
+    assert not record.payload.get("pinned")
+
+
+async def test_a_promoted_result_can_be_pinned(
+    workspace_store, local_backend, workspace_id
+) -> None:
+    """Promotion is what makes a prefetched result ordinary — including
+    pinnable. The refusal above must be about *being* speculative, not about
+    having once been."""
+    key = f"harmony/{workspace_id}/promoted.nc"
+    await local_backend.put(key, b"x" * 40)
+    handle = await workspace_store.put_handle(
+        workspace_id,
+        HandleType.OBS,
+        {
+            "status": "ready",
+            "storage_key": key,
+            "media_type": "application/x-netcdf",
+            "size_bytes": 40,
+            "speculative": False,
+        },
+    )
+
+    out = await pin_result(
+        handle, True, workspace_id, store=workspace_store, storage=local_backend
+    )
+
+    assert out["pinned"] is True

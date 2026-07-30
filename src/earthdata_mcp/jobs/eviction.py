@@ -23,7 +23,12 @@ A sweep has two passes, in order:
    * **Fairness.** Bytes are taken from the workspace furthest over its fair
      share (cap ÷ active workspaces), so one user's heavy week cannot evict
      another user's results. A single-workspace deployment is unaffected.
-   * **Value density.** Within a workspace, the highest
+   * **Speculation.** Within a workspace, every result nobody asked for (a
+     prefetch, PRD 025) is evicted before *any* result someone did, whatever
+     their sizes, costs and recencies say. A prefetch that could cost a
+     researcher their own data would be worse than no prefetch at all, so this
+     is a lexicographic first key and not a weight.
+   * **Value density.** Among equally-speculative candidates, the highest
      :meth:`_Candidate.score` goes first: the most bytes reclaimed for the
      least rebuild pain, least-recently-*read* first. This subsumes LRU — the
      thing worth minimising is time to rebuild what was thrown away, not bytes
@@ -80,6 +85,50 @@ _EVICTABLE_TYPES: tuple[str, ...] = (HandleType.OBS.value, HandleType.CUBE.value
 DEFAULT_REBUILD_COST_SECONDS = 60.0
 
 
+async def under_fair_share(
+    session_factory: async_sessionmaker,
+    workspace_id: str,
+    *,
+    max_bytes: int,
+    extra_bytes: int = 0,
+) -> bool:
+    """Would ``workspace_id`` still be within its fair share holding
+    ``extra_bytes`` more (PRD 024's fairness rule, PRD 025's admission gate)?
+
+    Fair share is the same quantity :meth:`EvictionService._evict_over_cap`
+    takes bytes by — ``max_bytes ÷ active workspaces`` — and it lives here so
+    there is exactly one definition of it rather than a second one drifting in
+    the caller. ``extra_bytes`` is what the caller is *about to* add, so a
+    workspace comfortably under its share today cannot admit something that
+    puts it over.
+
+    Read from the ``size_bytes`` handles persist and nothing else: no ``stat``
+    fallback, no storage round-trip. An admission gate runs before the bytes
+    exist and must not cost a walk of the cache; a handle too old to carry its
+    own size simply doesn't count toward anyone's footprint here.
+    """
+    async with session_factory() as session:
+        stmt = select(Handle.workspace_id, Handle.payload).where(
+            Handle.handle_type.in_(_EVICTABLE_TYPES)
+        )
+        rows = (await session.execute(stmt)).all()
+
+    held: dict[str, int] = {}
+    for row_workspace, payload in rows:
+        if not payload or payload.get("status") != "ready":
+            continue
+        size = payload.get("size_bytes")
+        if not isinstance(size, int):
+            continue
+        held[row_workspace] = held.get(row_workspace, 0) + size
+
+    # A workspace holding nothing yet is still an active workspace the moment it
+    # asks for room, so it counts itself into the denominator.
+    workspaces = set(held) | {workspace_id}
+    fair_share = max_bytes / len(workspaces)
+    return held.get(workspace_id, 0) + extra_bytes <= fair_share
+
+
 @dataclass(frozen=True)
 class _Candidate:
     """One ready result the sweep may evict, with everything scoring needs."""
@@ -91,6 +140,22 @@ class _Candidate:
     last_used: datetime
     rebuild_cost_seconds: float
     pinned: bool
+    #: Nobody asked for this result — adjacent-granule prefetch guessed it
+    #: (PRD 025). Sorted ahead of every requested candidate regardless of score.
+    speculative: bool = False
+
+    def eviction_key(self, now: datetime) -> tuple[bool, float]:
+        """Where this candidate sits in its workspace's eviction order.
+
+        Ascending; the queue is popped from the back, so the largest key goes
+        first. ``speculative`` leads the tuple, which is what makes speculation
+        strictly second-class: **every** speculative candidate is evicted before
+        **any** requested one, whatever their sizes, costs and recencies say
+        (PRD 025 story 3). A prefetch that could evict data a researcher asked
+        for would be worse than no prefetch at all, so this cannot be a weight —
+        it has to be a lexicographic first key.
+        """
+        return (self.speculative, self.score(now))
 
     def score(self, now: datetime) -> float:
         """Value density: bytes reclaimed per unit of rebuild pain, aged up.
@@ -226,7 +291,7 @@ class EvictionService:
                 continue
             queues.setdefault(candidate.workspace_id, []).append(candidate)
         for queue in queues.values():
-            queue.sort(key=lambda c: c.score(now))
+            queue.sort(key=lambda c: c.eviction_key(now))
 
         while total > self._max_bytes and queues:
             # Take from whoever is furthest over their fair share, so one
@@ -271,6 +336,7 @@ class EvictionService:
                     last_used=row.last_accessed_at or row.updated_at,
                     rebuild_cost_seconds=costs.get(row.handle) or self._default_rebuild_cost,
                     pinned=bool(row.payload.get("pinned")),
+                    speculative=bool(row.payload.get("speculative")),
                 )
             )
         return candidates
@@ -304,6 +370,7 @@ class EvictionService:
                 "reason": "cache_eviction_cap",
                 "rebuild_cost_seconds": candidate.rebuild_cost_seconds,
                 "score": score,
+                "speculative": candidate.speculative,
             },
         )
         async with self._session_factory() as session:
@@ -311,15 +378,25 @@ class EvictionService:
             if job is not None and JobState(job.state) is JobState.READY:
                 await crud.transition_state(session, job.job_id, JobState.EXPIRED)
         # Structured, so cap sizing becomes an evidence question rather than a
-        # guess: what was reclaimed, and what rebuild cost was thrown away.
+        # guess: what was reclaimed, and what rebuild cost was thrown away. A
+        # speculative candidate discarded unused is additionally named as
+        # prefetch waste — a feature that spends quota on guesses has to report
+        # what the wrong guesses cost or its hit rate is unfalsifiable (PRD 025).
+        # Imported here rather than at module scope: prefetch reads this module's
+        # fair share, so a top-level import back the other way would be a cycle.
+        from earthdata_mcp.jobs.prefetch import PREFETCH_WASTED
+
+        event = PREFETCH_WASTED if candidate.speculative else "cache-eviction"
         logger.info(
             "evicted %s under the materialization cache cap",
             handle,
             extra={
+                "event": event,
                 "handle": handle,
                 "workspace_id": workspace_id,
                 "bytes_reclaimed": candidate.size_bytes,
                 "rebuild_cost_seconds": candidate.rebuild_cost_seconds,
                 "score": score,
+                "speculative": candidate.speculative,
             },
         )

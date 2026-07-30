@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from earthdata_mcp.jobs.models import CollectionAccess, Job
@@ -48,12 +48,17 @@ async def create_job(
     provider: str,
     request_spec: dict,
     credential_encrypted: str | None = None,
+    speculative: bool = False,
 ) -> Job:
     """Insert a fresh job in ``PENDING`` with its durable, re-materializable spec.
 
     ``credential_encrypted`` (PRD 022) is the per-call EDL credential the job
     runs under, already Fernet-encrypted — never plaintext, never inside
     ``request_spec`` (which flows to provenance edges and status enrichment).
+
+    ``speculative`` (PRD 025) marks a job nobody asked for — issued by
+    adjacent-granule prefetch. Defaults to ``False`` so every existing caller
+    keeps minting user-requested work; only the prefetch path passes ``True``.
     """
     job = Job(
         job_id=job_id,
@@ -64,6 +69,7 @@ async def create_job(
         state=JobState.PENDING.value,
         progress=0,
         credential_encrypted=credential_encrypted,
+        speculative=speculative,
     )
     session.add(job)
     await session.commit()
@@ -157,6 +163,47 @@ async def rebuild_costs(session: AsyncSession, obs_handles: list[str]) -> dict[s
         # job — the cost of the build that actually produced what is cached now.
         costs.setdefault(obs_handle, float(cost))
     return costs
+
+
+async def user_work_in_flight(session: AsyncSession) -> bool:
+    """Is any *user-requested* job non-terminal right now (PRD 025)?
+
+    The gate behind "a researcher's job must never wait behind a guess": a
+    pending prefetch is dropped, not deferred, whenever this is true. Asked of
+    Postgres rather than of the queue because the ``jobs`` table is the source of
+    truth and Arq exposes no priority lanes — dropping is the only honest way to
+    keep speculation off a busy worker.
+
+    Speculative jobs are excluded deliberately: another guess already in flight
+    is not a researcher waiting.
+    """
+    terminal = [s.value for s in TERMINAL_STATES]
+    stmt = (
+        select(Job.job_id)
+        .where(Job.state.not_in(terminal), Job.speculative.is_(False))
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalars().first() is not None
+
+
+async def speculative_jobs_since(
+    session: AsyncSession, workspace_id: str, since: datetime
+) -> int:
+    """How many speculative jobs this workspace has been issued since ``since``.
+
+    Backs the per-workspace prefetch budget (PRD 025). Prefetch never chains, so
+    no single retrieval can cascade — but a long sequential exploration would
+    still spend unbounded provider quota one step at a time, and this is that
+    backstop. Scoped by the ``workspace_id`` carried in the durable spec (the
+    ``jobs`` table has no workspace column of its own), so one workspace's
+    speculation never spends another's budget.
+    """
+    stmt = select(func.count()).select_from(Job).where(
+        Job.speculative.is_(True),
+        Job.request_spec["workspace_id"].astext == workspace_id,
+        Job.created_at >= since,
+    )
+    return int((await session.execute(stmt)).scalar_one())
 
 
 async def reclaim_non_terminal(session: AsyncSession) -> list[Job]:

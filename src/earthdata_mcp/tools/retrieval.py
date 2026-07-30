@@ -37,6 +37,7 @@ from uuid import uuid4
 from earthdata_mcp.config import get_settings
 from earthdata_mcp.db import create_engine, create_session_factory
 from earthdata_mcp.jobs import crud
+from earthdata_mcp.jobs.prefetch import PREFETCH_HIT
 from earthdata_mcp.jobs.state import LEGAL_TRANSITIONS, TERMINAL_STATES, JobState
 from earthdata_mcp.providers import build as _build_provider
 from earthdata_mcp.providers._capabilities import CollectionCapabilities
@@ -1113,8 +1114,13 @@ async def _reuse_response_for_match(
       signature would be permanently un-retryable.
 
     Records a ``reused`` provenance event on the existing handle for every hit
-    (never a new lineage node — reuse is an event, not a derivation).
+    (never a new lineage node — reuse is an event, not a derivation), and — when
+    the match was a prefetch — **promotes** it first (PRD 025): a speculative
+    result someone has now asked for is not speculative any more.
     """
+    await _promote_if_speculative(
+        match, store=store, provenance=provenance, workspace_id=workspace_id
+    )
     async with session_factory() as session:
         job = await crud.get_job_by_obs_handle(session, match.handle)
 
@@ -1163,6 +1169,51 @@ async def _reuse_response_for_match(
     )
     result["reused"] = True
     return result
+
+
+async def _promote_if_speculative(
+    match: HandleRecord,
+    *,
+    store: WorkspaceStore,
+    provenance: ProvenanceStore,
+    workspace_id: str,
+) -> None:
+    """Clear ``speculative`` on a prefetched handle a user request just matched
+    (PRD 025 story 4), and record the transition.
+
+    A prefetched result is second-class on purpose: the eviction sweep discards
+    every speculative candidate before any requested one, and it cannot be
+    pinned. Both of those stop being right the instant someone asks for it —
+    the guess turned out to be a real request, and the result is no more
+    disposable than one retrieved directly. Promotion happens for **every** hit
+    shape, including a match that is still in flight: what promotes a handle is
+    someone having asked, not the bytes having landed.
+
+    The provenance event is what keeps a promoted result distinguishable from
+    one that was always real, which is the only way ``prefetch-hit`` over
+    ``prefetch-issued`` can be read back honestly. A no-op — no write, no
+    event — for a handle that was never speculative.
+    """
+    if not match.payload.get("speculative"):
+        return
+    await store.update_handle(workspace_id, match.handle, {"speculative": False})
+    await provenance.record_event(
+        workspace_id,
+        match.handle,
+        ProvenanceEventType.PROMOTED,
+        detail={"from": "speculative", "reason": "matched_by_user_request"},
+    )
+    logger.info(
+        "%s: %s promoted by a matching request",
+        PREFETCH_HIT,
+        match.handle,
+        extra={
+            "event": PREFETCH_HIT,
+            "workspace_id": workspace_id,
+            "obs_handle": match.handle,
+            "size_bytes": match.payload.get("size_bytes"),
+        },
+    )
 
 
 #: Bounds for :func:`_await_reuse_after_conflict`'s retry of a just-lost

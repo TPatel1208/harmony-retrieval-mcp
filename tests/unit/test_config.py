@@ -71,3 +71,20 @@ def test_invalid_mcp_transport_rejected(monkeypatch) -> None:
     monkeypatch.setenv("EARTHDATA_MCP_TRANSPORT", "carrier-pigeon")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_prefetch_ships_disabled(monkeypatch) -> None:
+    """A feature that spends provider quota on guesses must be opted into
+    (PRD 025 story 6). Hermetic against the container's own ambient config."""
+    monkeypatch.delenv("EARTHDATA_PREFETCH_ENABLED", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.earthdata_prefetch_enabled is False
+
+
+def test_prefetch_size_cap_is_well_below_the_request_size_warning(monkeypatch) -> None:
+    """A guess may not cost what a request a researcher actually made is allowed
+    to — the prefetch cap is deliberately far under ``size_warning_threshold_mb``."""
+    monkeypatch.delenv("EARTHDATA_PREFETCH_MAX_BYTES", raising=False)
+    settings = Settings(_env_file=None)
+    warning_bytes = settings.size_warning_threshold_mb * 1024**2
+    assert settings.earthdata_prefetch_max_bytes < warning_bytes / 2

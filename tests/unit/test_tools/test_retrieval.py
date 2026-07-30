@@ -2175,3 +2175,104 @@ async def test_get_status_omits_the_tally_for_a_partial_record(
 
     assert "granule_count" not in status
     assert "granule_count_source" not in status
+
+
+# -- prefetch promotion on reuse (PRD 025) ----------------------------------
+
+
+async def test_retrieve_subset_promotes_a_prefetched_handle_it_matches(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """Story 4: the moment a user request matches a prefetched result, it stops
+    being speculative — someone asked for it. It is returned via the ordinary
+    reuse path, its ``speculative`` flag is cleared (so eviction stops treating
+    it as disposable), and the transition is recorded so a promoted result is
+    distinguishable from one that was always real."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    first = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    # Stand in for a prefetch having produced this handle: materialized, and
+    # marked speculative exactly as the prefetch path marks it.
+    await workspace_store.update_handle(
+        workspace_id, first["obs_handle"],
+        {
+            "status": "ready",
+            "storage_key": "harmony/x/prefetched",
+            "media_type": "application/netcdf4",
+            "speculative": True,
+        },
+    )
+
+    second = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    assert second["reused"] is True
+    assert second["obs_handle"] == first["obs_handle"]
+
+    record = await workspace_store.get_handle(workspace_id, first["obs_handle"])
+    assert record.payload["speculative"] is False
+
+    events = await provenance_store.events(workspace_id, first["obs_handle"])
+    assert any(e.event_type == "promoted" for e in events)
+
+
+async def test_retrieve_subset_promotes_a_prefetch_still_in_flight(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """Promotion is about someone having asked, not about the bytes having
+    landed: a request that collapses onto a speculative job still running
+    promotes it, so the result is not disposable by the time it arrives."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    first = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    await workspace_store.update_handle(
+        workspace_id, first["obs_handle"], {"speculative": True}
+    )
+
+    second = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    assert second["reused"] is True
+    record = await workspace_store.get_handle(workspace_id, first["obs_handle"])
+    assert record.payload["speculative"] is False
+
+
+async def test_retrieve_subset_reuse_of_an_ordinary_handle_records_no_promotion(
+    grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue,
+    workspace_id,
+) -> None:
+    """Promotion has to mean something: a plain PRD 020 reuse hit on a handle
+    that was never speculative must not claim one."""
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+
+    first = await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+    await workspace_store.update_handle(
+        workspace_id, first["obs_handle"],
+        {"status": "ready", "storage_key": "harmony/x/plain", "media_type": "application/netcdf4"},
+    )
+
+    await retrieve_subset(
+        ds, aoi, _TIME, ["NDVI"], workspace_id=workspace_id,
+        **_kwargs(grid_cmr, workspace_store, provenance_store, session_factory, mock_enqueue),
+    )
+
+    events = await provenance_store.events(workspace_id, first["obs_handle"])
+    assert not any(e.event_type == "promoted" for e in events)

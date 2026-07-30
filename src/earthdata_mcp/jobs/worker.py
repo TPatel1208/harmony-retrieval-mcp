@@ -45,6 +45,7 @@ from earthdata_mcp.providers.identity import (
     decrypt_credential,
     parse_edl_token,
 )
+from earthdata_mcp.jobs.prefetch import PrefetchService
 from earthdata_mcp.providers.materialization import MaterializationRecord
 from earthdata_mcp.providers.request_spec import InvalidSpecError, RequestSpec
 from earthdata_mcp.redaction import redact
@@ -161,6 +162,49 @@ def _eviction(ctx: dict[str, Any]) -> EvictionService:
         )
         ctx["eviction"] = service
     return service
+
+
+def _prefetch(ctx: dict[str, Any]) -> PrefetchService:
+    """Return the ctx-cached :class:`PrefetchService`, building it once.
+
+    Mirrors :func:`_eviction`'s ctx-caching convention (PRD 025). Enqueues
+    through this worker's own Redis connection, so a speculative job rides the
+    ordinary durable job queue and is never an in-memory background task.
+    """
+    service = ctx.get("prefetch")
+    if service is None:
+        service = PrefetchService(
+            _session_factory(ctx),
+            provenance=_provenance(ctx),
+            enqueue_fn=ctx["redis"].enqueue_job,
+        )
+        ctx["prefetch"] = service
+    return service
+
+
+async def _maybe_prefetch_safe(
+    ctx: dict[str, Any],
+    spec: RequestSpec,
+    *,
+    speculative_origin: bool,
+    size_bytes: int | None,
+    credential_encrypted: str | None,
+) -> None:
+    """Ask for a prefetch without ever letting it block the caller (PRD 025):
+    same log-and-swallow convention as :func:`_sweep_eviction_safe`. Speculation
+    is optional; the retrieval it followed is not, and a guess must never be the
+    reason a real materialization fails.
+    """
+    try:
+        decision = await _prefetch(ctx).maybe_prefetch(
+            spec,
+            speculative_origin=speculative_origin,
+            size_bytes=size_bytes,
+            credential_encrypted=credential_encrypted,
+        )
+        logger.debug("prefetch decision for %s: %s", spec.obs_handle, decision.reason)
+    except Exception:
+        logger.exception("prefetch evaluation failed")
 
 
 async def _sweep_eviction_safe(ctx: dict[str, Any], *, protected_handle: str | None) -> None:
@@ -673,7 +717,8 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
 
     Once ``READY``, runs the cache eviction sweep (PRD 015) with this job's own
     result protected — a retrieval can never evict its own output before it's
-    read. The sweep is best-effort: it never fails the materialization.
+    read — and then asks whether to warm the next contiguous window (PRD 025).
+    Both are best-effort: neither ever fails the materialization.
     """
     session_factory = _session_factory(ctx)
     async with session_factory() as session:
@@ -685,6 +730,10 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
             return
         url = job.provider_job_url
         credential_encrypted = job.credential_encrypted
+        # Read here, before the READY transition below erases the credential
+        # (crud.set_state) — a prefetch has to inherit the identity this job ran
+        # as, and this is the last moment it is knowable (PRD 025).
+        speculative_origin = bool(job.speculative)
 
     identity = await _load_job_identity(
         ctx, job_id, spec, "materialize", credential_encrypted
@@ -763,6 +812,18 @@ async def materialize_job(ctx: dict[str, Any], job_id: str) -> None:
         )
 
     await _sweep_eviction_safe(ctx, protected_handle=spec.obs_handle)
+
+    # PRD 025: sequential exploration is predictable, so warm the next window —
+    # after the sweep, so a speculative job is never admitted into a cache this
+    # very materialization has just put over its cap. Off by default; refused
+    # unless every gate in ``jobs/prefetch.py`` passes; never chains.
+    await _maybe_prefetch_safe(
+        ctx,
+        spec,
+        speculative_origin=speculative_origin,
+        size_bytes=result.size_bytes,
+        credential_encrypted=credential_encrypted,
+    )
 
 
 async def healthcheck(ctx: dict[str, Any]) -> str:

@@ -64,6 +64,28 @@ class Settings(BaseSettings):
     # estimate_retrieval_size warns when the extrapolated total exceeds this
     # (MB); default ~10 GB — the gate the tool's docstring promises.
     size_warning_threshold_mb: float = 10 * 1024
+
+    # Adjacent-granule prefetch (PRD 025) ----------------------------------
+    # Ships OFF, and that is the decision, not an oversight: prefetching spends
+    # provider quota, worker capacity and cache bytes on data nobody has asked
+    # for. Turn it on, then read `prefetch-hit` over `prefetch-issued` out of the
+    # logs — the feature earns its default by measurement, not by argument.
+    earthdata_prefetch_enabled: bool = False
+    # Ceiling on what one speculative retrieval may be estimated to cost, in
+    # bytes. Deliberately far below `size_warning_threshold_mb` above: a guess is
+    # not allowed to cost what a request a researcher actually made can. Default
+    # ~2 GiB.
+    earthdata_prefetch_max_bytes: int = 2 * 1024**3
+    # How many speculative jobs one workspace may be issued per rolling day —
+    # the backstop that keeps a long sequential exploration from turning into an
+    # unbounded quota spend even though prefetch itself never chains.
+    earthdata_prefetch_budget_per_workspace_per_day: int = 24
+    # How far in the past a predicted window must already end before it is
+    # prefetchable. This stands in for the collection's *latency*: UMM-C gives no
+    # per-collection latency we can trust, and prefetching a window upstream has
+    # not finished filling buys a partial result that gets re-fetched the moment
+    # the rest lands — spending quota twice for one window. Default 48 hours.
+    earthdata_prefetch_min_window_age_hours: float = 48.0
     # Worker startup reclaim (PRD 004): a non-terminal job older than this is
     # failed as stale instead of re-enqueued forever. Generous by default — real
     # Harmony/AppEEARS jobs can legitimately run for hours.

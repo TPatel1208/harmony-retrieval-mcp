@@ -202,6 +202,10 @@ All settings come from environment variables (loaded from `.env` by Compose). Se
 | `EARTHDATA_PINNED_BYTES_MAX_PER_WORKSPACE` | `10737418240` (~10 GiB) | Ceiling on bytes one workspace may hold pinned (`pin_result`). |
 | `EARTHDATA_REBUILD_COST_DEFAULT_SECONDS` | `60` | Build cost assumed when a result's job never recorded one. |
 | `EARTHDATA_ORPHAN_SWEEP_INTERVAL_SECONDS` | `3600` | How often orphan-blob reclamation runs. |
+| `EARTHDATA_PREFETCH_ENABLED` | `false` | Warm the next contiguous time window after a retrieval completes. Off by default — see "Adjacent-granule prefetch" below. |
+| `EARTHDATA_PREFETCH_MAX_BYTES` | `2147483648` (~2 GiB) | Ceiling on one speculative retrieval's estimated size. |
+| `EARTHDATA_PREFETCH_BUDGET_PER_WORKSPACE_PER_DAY` | `24` | Speculative jobs one workspace may be issued per rolling day. |
+| `EARTHDATA_PREFETCH_MIN_WINDOW_AGE_HOURS` | `48` | How long a predicted window must already be in the past before it is prefetchable. |
 | `LOG_LEVEL` | `INFO` | Logging verbosity. |
 | `EARTHDATA_MCP_TRANSPORT` | `stdio` | `stdio` or `http` (streamable HTTP). See "Running the MCP server" above. |
 | `EARTHDATA_MCP_HOST` / `EARTHDATA_MCP_PORT` | `0.0.0.0` / `8765` | Bind address for `http` transport. |
@@ -210,6 +214,30 @@ All settings come from environment variables (loaded from `.env` by Compose). Se
 Per-provider rate limits (token buckets, generous defaults) are also configurable:
 `CMR_RATE_PER_SEC` (20), `HARMONY_RATE_PER_SEC` / `APPEEARS_RATE_PER_SEC` /
 `OPENDAP_RATE_PER_SEC` (10).
+
+### Adjacent-granule prefetch (off by default)
+
+Sequential exploration is predictable: a researcher who retrieves 1–7 April very
+often asks for 8–14 April next. With `EARTHDATA_PREFETCH_ENABLED=true`, a
+retrieval that reaches `ready` enqueues **at most one** low-priority speculative
+job for the next contiguous window — same collection, AOI, variables and format,
+nothing else varied.
+
+It is refused unless every gate passes: the workspace is under its cache fair
+share, the predicted window is already comfortably in the past (not a window
+upstream is still filling), the predicted request isn't already held, the
+estimate is under `EARTHDATA_PREFETCH_MAX_BYTES`, the workspace is inside its
+daily budget, no user-requested job is in flight, and the originating job was
+itself user-requested — **prefetch never chains**.
+
+Prefetched results are second-class explicitly: the eviction sweep discards every
+speculative result before any result someone asked for, and `pin_result` refuses
+them. When a later request matches one, it is returned via the ordinary reuse
+path and *promoted* — it stops being speculative, because someone asked for it.
+
+Judge it from the logs before trusting it. `prefetch-issued`, `prefetch-hit` and
+`prefetch-wasted` are structured log events; `prefetch-hit ÷ prefetch-issued` is
+the number that says whether the quota is well spent on your workload.
 
 ### Getting an Earthdata Login token
 

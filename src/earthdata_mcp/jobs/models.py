@@ -76,6 +76,16 @@ class Job(Base):
     # that reached READY before this column existed; the eviction score
     # substitutes a configured default rather than treating absent as free.
     rebuild_cost_seconds: Mapped[float | None] = mapped_column(Float, default=None)
+    # Whether nobody asked for this job (PRD 025): it was issued by
+    # adjacent-granule prefetch as a guess about the next request. Speculative
+    # work is second-class *explicitly* — the eviction sweep discards it before
+    # any user-requested result, it cannot be pinned, and it never chains (a
+    # speculative job issues no prefetch of its own). FALSE for every job that
+    # existed before this column, which is the honest default: those were all
+    # asked for.
+    speculative: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -108,9 +118,10 @@ async def create_jobs_schema(engine: AsyncEngine) -> None:
     each is created from its own ``metadata``. ``create_all`` only creates a
     missing table — it never alters an existing one — so a column added to the
     model after a table already exists (``last_polled_at``, PRD 012;
-    ``credential_encrypted``, PRD 022; ``materialization``, PRD 023) needs its
-    own idempotent ``ADD COLUMN IF NOT EXISTS`` alongside it. A couple of
-    columns don't warrant a migration framework.
+    ``credential_encrypted``, PRD 022; ``materialization``, PRD 023;
+    ``speculative``, PRD 025) needs its own idempotent
+    ``ADD COLUMN IF NOT EXISTS`` alongside it. A couple of columns don't warrant
+    a migration framework.
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -129,6 +140,12 @@ async def create_jobs_schema(engine: AsyncEngine) -> None:
             text(
                 "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS "
                 "rebuild_cost_seconds DOUBLE PRECISION"
+            )
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS "
+                "speculative BOOLEAN NOT NULL DEFAULT FALSE"
             )
         )
 

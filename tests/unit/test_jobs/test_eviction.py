@@ -34,6 +34,7 @@ _SUITE_WORKSPACE_PATTERN = "ws-%"
 from earthdata_mcp.jobs import crud
 from earthdata_mcp.jobs.eviction import EvictionService
 from earthdata_mcp.jobs.models import Job
+from earthdata_mcp.jobs.prefetch import PREFETCH_WASTED
 from earthdata_mcp.jobs.state import JobState
 from earthdata_mcp.workspace.models import Handle, HandleType, ProvenanceEventType
 from earthdata_mcp.workspace.provenance import ProvenanceStore
@@ -73,10 +74,13 @@ async def _put_obs(
     status="ready",
     media_type="application/x-netcdf",
     pinned=False,
+    speculative=False,
 ):
     payload = {"status": status, "storage_key": storage_key, "media_type": media_type}
     if pinned:
         payload["pinned"] = True
+    if speculative:
+        payload["speculative"] = True
     return await workspace_store.put_handle(workspace_id, HandleType.OBS, payload)
 
 
@@ -649,3 +653,76 @@ async def test_eviction_of_cube_handle_with_no_job_row_does_not_error(
 
     record = await workspace_store.get_handle(workspace_id, cube_handle)
     assert record.payload["status"] == "expired"
+
+
+async def test_speculative_results_are_evicted_before_any_requested_one(
+    workspace_store, local_backend, session_factory, workspace_id
+) -> None:
+    """PRD 025's central safety property: a prefetch may never cost a researcher
+    their own results. The speculative candidate here wins on *every* other
+    axis — it is smaller, newer, and more expensive to rebuild, so value-density
+    scoring alone would keep it — and it still goes first.
+    """
+    now = datetime.now(timezone.utc)
+    key_spec, key_real = (_key(workspace_id, n) for n in ("spec/g.nc", "real/g.nc"))
+
+    speculative = await _put_obs(workspace_store, workspace_id, key_spec, speculative=True)
+    await local_backend.put(key_spec, b"x" * 10)
+    await _age(session_factory, speculative, now)
+    await _seed_ready_job(session_factory, workspace_id, speculative, rebuild_cost_seconds=900.0)
+
+    requested = await _put_obs(workspace_store, workspace_id, key_real)
+    await local_backend.put(key_real, b"x" * 40)
+    await _age(session_factory, requested, now - timedelta(hours=10))
+    await _seed_ready_job(session_factory, workspace_id, requested, rebuild_cost_seconds=3.0)
+
+    # 50 bytes held against a 40-byte cap: exactly one candidate must go.
+    await _service(session_factory, local_backend, max_bytes=40).sweep()
+
+    assert (
+        await workspace_store.get_handle(workspace_id, speculative)
+    ).payload["status"] == "expired"
+    assert (await workspace_store.get_handle(workspace_id, requested)).payload["status"] == "ready"
+
+
+async def test_a_speculative_result_evicted_unused_is_reported_as_waste(
+    workspace_store, local_backend, session_factory, workspace_id, caplog
+) -> None:
+    """A feature that spends quota on guesses has to say what the wrong guesses
+    cost, or its hit rate is unfalsifiable (PRD 025 story 5)."""
+    key = _key(workspace_id, "spec/g.nc")
+    handle = await _put_obs(workspace_store, workspace_id, key, speculative=True)
+    await local_backend.put(key, b"x" * 40)
+
+    with caplog.at_level("INFO"):
+        await _service(session_factory, local_backend, max_bytes=0).sweep()
+
+    wasted = [r for r in caplog.records if getattr(r, "event", None) == PREFETCH_WASTED]
+    assert len(wasted) == 1
+    assert wasted[0].bytes_reclaimed == 40
+    assert wasted[0].handle == handle
+
+
+async def test_promoting_a_speculative_result_restores_its_normal_standing(
+    workspace_store, local_backend, session_factory, workspace_id
+) -> None:
+    """Once someone has asked for it, a prefetched result is not disposable any
+    more — it competes on score like anything else (PRD 025 story 4)."""
+    now = datetime.now(timezone.utc)
+    key_promoted, key_other = (_key(workspace_id, n) for n in ("prom/g.nc", "other/g.nc"))
+
+    promoted = await _put_obs(workspace_store, workspace_id, key_promoted, speculative=True)
+    await local_backend.put(key_promoted, b"x" * 40)
+    await _age(session_factory, promoted, now - timedelta(hours=1))
+
+    other = await _put_obs(workspace_store, workspace_id, key_other)
+    await local_backend.put(key_other, b"x" * 40)
+    await _age(session_factory, other, now - timedelta(hours=10))
+
+    await workspace_store.update_handle(workspace_id, promoted, {"speculative": False})
+    await _age(session_factory, promoted, now - timedelta(hours=1))
+
+    await _service(session_factory, local_backend, max_bytes=50).sweep()
+
+    assert (await workspace_store.get_handle(workspace_id, promoted)).payload["status"] == "ready"
+    assert (await workspace_store.get_handle(workspace_id, other)).payload["status"] == "expired"
