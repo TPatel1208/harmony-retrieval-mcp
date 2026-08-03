@@ -24,6 +24,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
+
 from arq.connections import RedisSettings
 from arq.worker import func
 
@@ -89,6 +91,33 @@ _RESUME_TASK: dict[JobState, str] = {
 
 # Delay (seconds) before the next poll while a job is still running.
 _POLL_INTERVAL = 5
+
+# Longer delay before re-polling after a transient fault, so an outage lasting
+# minutes costs a couple of probes a minute rather than one every five seconds.
+_POLL_TRANSIENT_RETRY_INTERVAL = 30
+
+#: Faults that say nothing about the job -- only that we could not reach the
+#: provider this time. DNS, refused connections, resets and timeouts all land
+#: here. Deliberately narrower than ``httpx.TransportError``: that would also
+#: swallow ``UnsupportedProtocol``, a malformed-URL bug that would then re-poll
+#: forever instead of failing loudly.
+_TRANSIENT_FAULTS = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    ConnectionError,
+    TimeoutError,
+)
+
+
+def _is_transient_fault(exc: BaseException) -> bool:
+    """Whether ``exc`` is a failure to *reach* the provider rather than a
+    verdict from it.
+
+    The distinction is the whole point: a transient fault is not evidence the
+    retrieval failed, so it must not fail the job, and it is not permission to
+    stop watching, so the caller must reschedule instead of returning silently.
+    """
+    return isinstance(exc, _TRANSIENT_FAULTS)
 
 
 def lifecycle_job_id(task: str, job_id: str) -> str:
@@ -678,16 +707,44 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
         url = job.provider_job_url
         credential_encrypted = job.credential_encrypted
 
+    # Left outside the guard below on purpose: it fails the job itself and
+    # re-raises (PRD 022), so catching it here would fail the same job twice.
     identity = await _load_job_identity(ctx, job_id, spec, "poll", credential_encrypted)
-    provider = await _load_provider(spec, edl_token=identity.token if identity else None)
-    ref = JobRef(
-        provider=spec.provider,
-        provider_job_id=_job_id_from_url(url),
-        provider_job_url=url,
-    )
+
+    # _load_provider re-fetches collection capabilities from CMR on every poll,
+    # so the network is touched *before* provider.poll -- and until 2026-08-02
+    # that call sat outside this guard. A DNS blip there escaped poll_job
+    # entirely, arq burned its retries, and because nothing reached _fail_job
+    # the row was never written: the job stalled in RUNNING with an empty error
+    # and no poll queued, invisible until someone restarted the worker.
     try:
+        provider = await _load_provider(
+            spec, edl_token=identity.token if identity else None
+        )
+        ref = JobRef(
+            provider=spec.provider,
+            provider_job_id=_job_id_from_url(url),
+            provider_job_url=url,
+        )
         status = await provider.poll(ref)
     except Exception as exc:
+        if _is_transient_fault(exc):
+            # Not a verdict on the job -- just an unreachable provider. Leaving
+            # the state alone is the honest record (the job really is still
+            # running out there), and re-queueing is what keeps anything
+            # looking at it. Bounded in the end by the reclaim pass's staleness
+            # horizon, which fails a job that never resolves.
+            logger.warning(
+                "job %s: transient fault polling %s, re-polling in %ss: %s",
+                job_id,
+                spec.provider,
+                _POLL_TRANSIENT_RETRY_INTERVAL,
+                redact(str(exc)),
+            )
+            await ctx["redis"].enqueue_job(
+                "poll_job", job_id, _defer_by=_POLL_TRANSIENT_RETRY_INTERVAL
+            )
+            return
         credential_exc = classify_credential_failure(exc, identity)
         if credential_exc is not None:
             await _fail_classified_credential(ctx, job_id, spec, "poll", credential_exc)

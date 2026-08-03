@@ -103,6 +103,29 @@ async def test_retries_5xx_then_succeeds(httpx_mock, provider: CMRProvider) -> N
     assert len(httpx_mock.get_requests()) == 2  # one retry
 
 
+async def test_retries_connection_failure_then_succeeds(
+    httpx_mock, provider: CMRProvider
+) -> None:
+    """A connection failure -- DNS in particular -- is the textbook transient
+    fault, and was the one class the retry policy did not cover.
+
+    ``httpx.ConnectError`` is a *sibling* of ``httpx.TimeoutException`` (both
+    derive from ``TransportError``), not a subclass, so a predicate naming only
+    the timeout let every DNS blip through on the first attempt. Observed live
+    2026-08-02: ``ConnectError: [Errno -5] No address associated with
+    hostname`` escaping a worker poll and stranding the job being polled.
+    """
+    httpx_mock.add_exception(
+        httpx.ConnectError("[Errno -5] No address associated with hostname")
+    )
+    httpx_mock.add_response(json={"items": []})
+
+    result = await provider.search_collections(keyword="rain")
+
+    assert result == []
+    assert len(httpx_mock.get_requests()) == 2  # the connect failure was retried
+
+
 async def test_does_not_retry_4xx(httpx_mock, provider: CMRProvider) -> None:
     httpx_mock.add_response(
         status_code=400, json={"errors": ["bad parameter: nope"]}
@@ -146,9 +169,16 @@ async def test_get_dmr_returns_none_on_4xx(httpx_mock, provider: CMRProvider) ->
 async def test_get_dmr_returns_none_on_network_error(
     httpx_mock, provider: CMRProvider
 ) -> None:
-    httpx_mock.add_exception(httpx.ConnectError("connection refused"))
+    """Still degrades to None rather than raising -- but only after exhausting
+    the backoff, since a connection error is now retried. One unreachable
+    attempt is no longer taken as proof the DMR is unavailable."""
+    for _ in range(4):  # stop_after_attempt(4)
+        httpx_mock.add_exception(httpx.ConnectError("connection refused"))
+
     xml = await provider.get_dmr("https://opendap.earthdata.nasa.gov/granules/ATL08.h5")
+
     assert xml is None
+    assert len(httpx_mock.get_requests()) == 4
 
 
 async def test_two_phase_variable_lookup(httpx_mock, provider: CMRProvider) -> None:
