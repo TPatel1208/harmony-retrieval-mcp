@@ -90,6 +90,21 @@ class Settings(BaseSettings):
     # failed as stale instead of re-enqueued forever. Generous by default — real
     # Harmony/AppEEARS jobs can legitimately run for hours.
     job_stale_after_days: float = 7.0
+    # Periodic reclaim sweep. A job with no sign of life for this long has fallen
+    # out of the lifecycle chain — the state was committed but the next task was
+    # never enqueued, Redis lost the queue, or arq exhausted its retries — and is
+    # re-enqueued without waiting for a worker restart. Must stay comfortably
+    # above the 5s poll interval so a healthy job is never mistaken for a
+    # stranded one, and comfortably below any horizon a human would notice.
+    job_stalled_after_seconds: float = 300.0
+    # The same, for MATERIALIZING. Deliberately much longer: a download writes
+    # nothing to the row while it streams, so this must exceed the worker's
+    # ``job_timeout`` (1h) or the sweep would restart transfers that are still
+    # running. Default 2 hours.
+    job_materializing_stalled_after_seconds: float = 7200.0
+    # How often the sweep runs, in minutes. Must divide 60 evenly (it becomes an
+    # arq cron minute set); anything else is rounded down to the nearest divisor.
+    job_reclaim_sweep_minutes: int = 5
 
     # Database -------------------------------------------------------------
     database_url: str = (

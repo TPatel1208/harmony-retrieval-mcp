@@ -22,6 +22,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from earthdata_mcp.jobs import crud, worker as worker_mod
 from earthdata_mcp.jobs.models import Job
@@ -159,3 +160,47 @@ async def test_a_permanent_error_still_fails_the_job(
         await poll_job(_ctx(session_factory), job_id)
 
     assert await _state_of(session_factory, job_id) == JobState.FAILED.value
+
+
+# -- the same rule, applied to the *other* dependency -----------------------
+#
+# The 2026-08-02 fix guarded the network. Postgres was left outside the guard
+# in exactly the same shape: `crud.get_job` and the spec load at the top of
+# poll_job sit before the `try`, so a DB restart or an exhausted connection
+# pool escapes uncaught, arq burns its retries, and the row stays RUNNING with
+# an empty error. Worse than the network case, because the failure path itself
+# needs the database: `_fail_job` could not have written a verdict anyway.
+
+
+class _DeadDatabase:
+    """A session factory for a Postgres that isn't answering."""
+
+    def __call__(self):
+        raise OperationalError("SELECT jobs", {}, ConnectionRefusedError("db is down"))
+
+
+async def test_an_unreachable_database_reschedules_the_poll(
+    session_factory, _no_identity
+) -> None:
+    """A DB outage says nothing about the retrieval — same rule as a DNS blip,
+    and the same consequence for getting it wrong: nobody looks at this job
+    again."""
+    job_id = await _seed_running_job(session_factory)
+    ctx = {"session_factory": _DeadDatabase(), "redis": AsyncMock()}
+
+    await poll_job(ctx, job_id)
+
+    assert ("poll_job", job_id) in _enqueued(ctx["redis"])
+
+
+async def test_an_unreachable_database_does_not_strand_the_job(
+    session_factory, _no_identity
+) -> None:
+    """And it must not escape uncaught, which is what burned arq's retries and
+    left the row untouched."""
+    job_id = await _seed_running_job(session_factory)
+    ctx = {"session_factory": _DeadDatabase(), "redis": AsyncMock()}
+
+    await poll_job(ctx, job_id)  # must not raise
+
+    assert await _state_of(session_factory, job_id) == JobState.RUNNING.value

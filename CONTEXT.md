@@ -61,6 +61,33 @@ cleanly instead of crashing the task. Startup reclaim also fails (rather than
 re-enqueues) a non-terminal job older than `job_stale_after_days` — blind
 re-enqueue-forever is how debris jobs accumulate.
 
+## Reclaim: boot sweep vs. stalled sweep
+
+Two reclaim passes, one policy. Both walk non-terminal jobs, share
+`_triage_reclaimed` (fail the dead ends, resume the rest) and enqueue under
+`lifecycle_job_id`'s deterministic arq id, but they select differently and the
+difference is load-bearing:
+
+- **`startup`** (`on_startup`) takes *every* non-terminal job. Safe only because
+  nothing is in flight at boot.
+- **`sweep_stalled_jobs`** (`cron_jobs`, every `job_reclaim_sweep_minutes`)
+  takes only jobs with no sign of life since `job_stalled_after_seconds` —
+  `job_materializing_stalled_after_seconds` for `MATERIALIZING`, which must stay
+  above the worker's `job_timeout` because a download writes nothing to the row
+  while it streams. Liveness is `last_polled_at` falling back to `updated_at`.
+
+Running the boot pass on a timer instead would enqueue a resume beside the
+chained poll a healthy job already has deferred — two workers racing one row
+through the state guard, which is the `IllegalTransition: submitted -> submitted`
+wedge `lifecycle_job_id` exists to prevent. **Staleness, never non-terminality,
+is what a periodic sweep may select on.**
+
+The stalled sweep is the only recovery for the failures no in-task handler can
+reach, because in each the process that would have retried no longer knows the
+job exists: a state committed to Postgres whose follow-on `enqueue_job` never
+landed, a Redis that lost its queue, and `max_tries` exhaustion. It is also what
+actually bounds `poll_job`'s transient re-poll loop.
+
 ## Speculative result / promotion
 
 A **speculative result** is one nobody asked for: adjacent-granule prefetch
