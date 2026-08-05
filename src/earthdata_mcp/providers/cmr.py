@@ -105,8 +105,18 @@ class CMRProvider:
 
     # -- HTTP -------------------------------------------------------------
 
+    # ``httpx.NetworkError`` sits alongside ``TimeoutException`` under
+    # ``TransportError`` -- it is not a subclass of it -- so naming only the
+    # timeout left connection failures unretried, the first attempt raising
+    # straight through. DNS is the common one: observed live 2026-08-02,
+    # ``ConnectError: [Errno -5] No address associated with hostname`` escaped a
+    # worker's poll and stranded the job it was polling. A connection that could
+    # not be established is exactly what a bounded backoff is for; a genuinely
+    # unreachable host still fails, four attempts later, with the same error.
     @retry(
-        retry=retry_if_exception_type((RetryableError, httpx.TimeoutException)),
+        retry=retry_if_exception_type(
+            (RetryableError, httpx.TimeoutException, httpx.NetworkError)
+        ),
         stop=stop_after_attempt(4),
         wait=wait_exponential(multiplier=0.5, max=8),
         reraise=True,
