@@ -13,8 +13,7 @@ where it came from, and let it be cited and re-built. CMR and Harmony are intern
 dependencies, never exposed.
 
 > Canon for our CMR code is CMR's public API + the UMM schemas — see
-> [`docs/cmr_patterns.md`](docs/cmr_patterns.md). The full design rationale lives in
-> [`Plan.md`](Plan.md); contributor rules in [`CLAUDE.md`](CLAUDE.md).
+> [`docs/cmr_patterns.md`](docs/cmr_patterns.md).
 
 ---
 
@@ -42,7 +41,7 @@ dependencies, never exposed.
   spec**, never an ephemeral staged-output URL. `cite_dataset` returns the official
   DOI + formal citation strings straight from CMR's records.
 
-The full v1 surface is **22 tools** (see [`Plan.md`](Plan.md) §7).
+The full v1 surface is **22 tools** — see [Tool surface](#tool-surface-v1) below.
 
 ---
 
@@ -97,24 +96,10 @@ cp .env.example .env
 docker compose up -d --build
 
 # 4. Create the database schema (idempotent; safe to re-run)
-docker compose exec mcp python -c "
-import asyncio
-from earthdata_mcp.db import create_engine
-from earthdata_mcp.workspace import create_schema
-from earthdata_mcp.jobs.models import create_jobs_schema
-async def go():
-    engine = create_engine()
-    await create_schema(engine)        # handles + provenance tables
-    await create_jobs_schema(engine)   # durable jobs table
-    await engine.dispose()
-asyncio.run(go())
-print('schema ready')
-"
+docker compose exec mcp python scripts/init_db.py
 
 # 5. Smoke-test: the server imports cleanly and exposes 22 tools
-docker compose exec mcp python -c "
-import asyncio; from earthdata_mcp.server import mcp
-print('tools:', len(asyncio.run(mcp.list_tools())))"
+docker compose exec mcp python -c "import asyncio; from earthdata_mcp.server import mcp; print('tools:', len(asyncio.run(mcp.list_tools())))"
 ```
 
 The `worker` service starts automatically and runs
@@ -157,8 +142,8 @@ services:
   tta-backend:
     # ...
     environment:
-      MCP_URL: http://mcp:8765/mcp
-      MCP_TOKEN: ${EARTHDATA_MCP_TOKEN}
+      EARTHDATA_MCP_URL: http://mcp:8765/mcp
+      EARTHDATA_MCP_TOKEN: ${EARTHDATA_MCP_TOKEN}
     networks:
       - earthdata_net
     volumes:
@@ -172,6 +157,8 @@ volumes:
   earthdata_data:
     external: true
 ```
+
+(Variable names above are the consumer's — Talking-to-Air's backend specifically reads `EARTHDATA_MCP_URL` / `EARTHDATA_MCP_TOKEN`. A different consumer may name them differently; what has to match exactly is the network name, volume name, and mount path.)
 
 Because both stacks mount the same volume at `/data`, a `file://` URI returned by
 `export_result` resolves identically inside the consumer container — opening it is
@@ -313,14 +300,7 @@ design.
 ```bash
 uv sync --extra dev          # install deps incl. test tooling
 # Ensure Postgres+PostGIS and Redis are reachable and DATABASE_URL/REDIS_URL point at them.
-uv run python -c "
-import asyncio
-from earthdata_mcp.db import create_engine
-from earthdata_mcp.workspace import create_schema
-from earthdata_mcp.jobs.models import create_jobs_schema
-async def go():
-    e = create_engine(); await create_schema(e); await create_jobs_schema(e); await e.dispose()
-asyncio.run(go())"
+uv run python scripts/init_db.py     # create the schema (idempotent; safe to re-run)
 uv run pytest tests/unit -q          # run unit tests
 uv run ruff check src tests          # lint
 uv run python -m earthdata_mcp.server  # run the MCP server (stdio)
@@ -329,30 +309,7 @@ uv run arq earthdata_mcp.jobs.worker.WorkerSettings  # run the worker
 
 ---
 
-## Project layout
-
-```
-src/earthdata_mcp/
-  server.py            FastMCP app; registers the 22 tools
-  config.py            env-driven settings
-  db.py                async engine / session factory
-  providers/           cmr, harmony, opendap, appeears, router, auth, _capabilities, ratelimit
-  workspace/           handles, store (isolation), provenance (spec-keyed DAG)
-  jobs/                durable jobs table, state machine, Arq worker (restart-resume)
-  storage/             StorageBackend + local / s3 implementations
-  catalog/             KMS keyword normalization, thin advisory enrichment
-  tools/               discovery, understanding, area, coverage, retrieval,
-                       preview, transform, provenance
-tests/                 unit/ · integration/ · live/
-docs/                  cmr_patterns.md · tta_audit.md
-Plan.md                design spec (single source of truth)
-CLAUDE.md              contributor hard rules
-```
-
----
-
 ## License
 
 See repository for licensing. This is a research-project effort intended to be
-maintainable by engineers who did not write it; please keep the hard rules in
-[`CLAUDE.md`](CLAUDE.md) intact.
+maintainable by engineers who did not write it.

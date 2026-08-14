@@ -203,6 +203,11 @@ async def retrieve_subset(
 ) -> dict:
     """Retrieve a variable + bbox + temporal subset as a durable job.
 
+    Call ``describe_dataset`` first to get this collection's exact variable
+    names — they are collection-specific, often group-qualified paths (e.g.
+    ``product/vertical_column_troposphere``), and cannot be reliably guessed
+    from a variable's common/scientific name.
+
     Harmony is tried first: a single service that does all the requested transforms
     is pinned; if none does, Harmony is submitted unpinned (server picks the chain).
     OPeNDAP is the worker's runtime fallback. Returns the job/obs handles.
@@ -224,6 +229,11 @@ async def retrieve_timeseries(
     edl_token: EdlToken = None,
 ) -> dict:
     """Retrieve a variable time-series as a durable job; the AOI is optional.
+
+    Call ``describe_dataset`` first to get this collection's exact variable
+    names — they are collection-specific, often group-qualified paths (e.g.
+    ``product/vertical_column_troposphere``), and cannot be reliably guessed
+    from a variable's common/scientific name.
 
     Set ``point_sample=True`` to sample at a point/area: the request routes to
     AppEEARS and returns a tabular series as Parquet (never a Zarr cube).

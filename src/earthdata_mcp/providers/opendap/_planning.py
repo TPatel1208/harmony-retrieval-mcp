@@ -493,7 +493,13 @@ def validate_variables(cmr_vars: list[dict], variables: tuple[str, ...]) -> None
     for v in unknown:
         matches = difflib.get_close_matches(v.rsplit("/", 1)[-1], all_leaves, n=5)
         parts.append(f"{v!r} (closest matches: {matches})" if matches else repr(v))
-    raise ValueError(f"Unknown variable(s) for this collection: {'; '.join(parts)}")
+    raise ValueError(
+        f"Unknown variable(s) for this collection: {'; '.join(parts)}. "
+        "Variable names are collection-specific and often group-qualified "
+        "(e.g. 'product/vertical_column_troposphere') — do not guess from the "
+        "variable's common/scientific name. Call describe_dataset on this "
+        "dataset handle to get the exact list."
+    )
 
 
 async def _discover_opendap_urls(

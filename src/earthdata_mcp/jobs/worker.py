@@ -2,9 +2,14 @@
 
 The worker owns no state: the Postgres ``jobs`` table is the source of truth. It
 exposes three tasks — ``submit_job`` → ``poll_job`` → ``materialize_job`` — that
-walk a job through the state machine, each re-enqueueing the next, and a
-``startup`` hook that **reclaims every non-terminal job on boot and re-enqueues
-it from its current state**, so a process restart never strands an in-flight job.
+walk a job through the state machine, each re-enqueueing the next, and two
+reclaim passes that put a stranded job back on the queue: a ``startup`` hook
+that **reclaims every non-terminal job on boot**, so a process restart never
+strands an in-flight job, and a ``sweep_stalled_jobs`` cron that **reclaims
+jobs showing no sign of life while the worker keeps running**, so a stall does
+not wait on a human noticing and restarting it. The second selects on
+staleness, never on non-terminality — see its docstring for why that
+distinction is load-bearing.
 
 Run with ``arq earthdata_mcp.jobs.worker.WorkerSettings``.
 
@@ -18,6 +23,7 @@ the row.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -25,7 +31,9 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from sqlalchemy import exc as sa_exc
 
+from arq import cron
 from arq.connections import RedisSettings
 from arq.worker import func
 
@@ -96,22 +104,32 @@ _POLL_INTERVAL = 5
 # minutes costs a couple of probes a minute rather than one every five seconds.
 _POLL_TRANSIENT_RETRY_INTERVAL = 30
 
-#: Faults that say nothing about the job -- only that we could not reach the
-#: provider this time. DNS, refused connections, resets and timeouts all land
-#: here. Deliberately narrower than ``httpx.TransportError``: that would also
-#: swallow ``UnsupportedProtocol``, a malformed-URL bug that would then re-poll
-#: forever instead of failing loudly.
+#: Faults that say nothing about the job -- only that we could not reach one of
+#: its dependencies this time. DNS, refused connections, resets and timeouts all
+#: land here, and so do connection-level Postgres failures: a restarted database
+#: or an exhausted pool is no more a verdict on the retrieval than a DNS blip
+#: is, and it is strictly worse to treat as one, because the path that records
+#: a verdict needs that same database.
+#:
+#: Deliberately narrower than ``httpx.TransportError`` and
+#: ``sqlalchemy.exc.DBAPIError``: those would also swallow
+#: ``UnsupportedProtocol`` and ``ProgrammingError`` -- a malformed URL and a
+#: broken query, both real bugs that would then retry forever instead of
+#: failing loudly.
 _TRANSIENT_FAULTS = (
     httpx.TimeoutException,
     httpx.NetworkError,
     ConnectionError,
     TimeoutError,
+    sa_exc.OperationalError,
+    sa_exc.InterfaceError,
+    sa_exc.DisconnectionError,
 )
 
 
 def _is_transient_fault(exc: BaseException) -> bool:
-    """Whether ``exc`` is a failure to *reach* the provider rather than a
-    verdict from it.
+    """Whether ``exc`` is a failure to *reach* a dependency rather than a
+    verdict on the job.
 
     The distinction is the whole point: a transient fault is not evidence the
     retrieval failed, so it must not fail the job, and it is not permission to
@@ -589,12 +607,23 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
     plan = spec.to_plan()
     try:
         ref = await provider.submit(plan)
-    except Exception as exc:
+    except BaseException as exc:
+        # BaseException, like materialize_job: arq's job_timeout cancels the
+        # task, and CancelledError is not an Exception. A cancelled submit is
+        # failed rather than retried — it may well have reached the provider,
+        # but without the returned job URL there is nothing on our side left to
+        # poll, so a terminal row a user can retry from beats a PENDING one
+        # nobody will ever look at again.
+        #
         # PRD 022: a credential failure is first-class and terminates the job —
         # checked before the PRD 002 invalid/infrastructure split so an auth
         # rejection can never be misread as infrastructure and trigger the
         # OPeNDAP fallback under the wrong identity.
-        credential_exc = classify_credential_failure(exc, identity)
+        credential_exc = (
+            classify_credential_failure(exc, identity)
+            if isinstance(exc, Exception)
+            else None
+        )
         if credential_exc is not None:
             await _fail_classified_credential(ctx, job_id, spec, "submit", credential_exc)
             raise
@@ -692,7 +721,53 @@ async def submit_job(ctx: dict[str, Any], job_id: str) -> None:
 
 
 async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
-    """Poll a ``SUBMITTED``/``RUNNING`` job once and advance per provider status."""
+    """Poll a ``SUBMITTED``/``RUNNING`` job once and advance per provider status.
+
+    Every transient fault in the whole cycle -- reaching the provider *or*
+    reaching Postgres, at any of the three seams that touch one of them --
+    funnels through the one reschedule below. That is deliberate: a job stops
+    being watched the moment a single path out of this function forgets to
+    leave a poll queued, and the two live incidents behind this design were both
+    exactly that (a DNS error raised before the guarded call; a DB read left
+    outside it). One choke point is the only version of this that stays correct
+    as the body grows -- the same reason ``_fail_job`` is one.
+    """
+    try:
+        await _poll_once(ctx, job_id)
+    except BaseException as exc:
+        # A cancelled poll (arq's job_timeout firing) is the same kind of event
+        # as an unreachable dependency: no answer came back, so nothing is known
+        # about the job. It reschedules for that reason -- and then re-raises,
+        # because swallowing CancelledError breaks asyncio's cancellation
+        # contract and tells arq a timed-out task finished cleanly.
+        cancelled = isinstance(exc, asyncio.CancelledError)
+        if not (cancelled or _is_transient_fault(exc)):
+            raise
+        # Not a verdict on the job -- just an unreachable dependency. Leaving
+        # the state alone is the honest record (the job really is still running
+        # out there), and re-queueing is what keeps anything looking at it.
+        # Bounded in the end by the reclaim sweep's staleness horizon, which
+        # fails a job that never resolves.
+        logger.warning(
+            "job %s: transient fault during poll, re-polling in %ss: %s",
+            job_id,
+            _POLL_TRANSIENT_RETRY_INTERVAL,
+            redact(str(exc)),
+        )
+        # Best-effort when ``cancelled``: this await can itself be cancelled by
+        # the same timeout, in which case no poll is queued and the log line
+        # above overstates what happened. Not worth defending against -- the
+        # stalled sweep picks the row up within ``job_stalled_after_seconds``,
+        # which is exactly the class of hole it exists to cover.
+        await ctx["redis"].enqueue_job(
+            "poll_job", job_id, _defer_by=_POLL_TRANSIENT_RETRY_INTERVAL
+        )
+        if cancelled:
+            raise
+
+
+async def _poll_once(ctx: dict[str, Any], job_id: str) -> None:
+    """One poll cycle. Raises transient faults for :func:`poll_job` to reschedule."""
     session_factory = _session_factory(ctx)
     async with session_factory() as session:
         job = await crud.get_job(session, job_id)
@@ -729,22 +804,7 @@ async def poll_job(ctx: dict[str, Any], job_id: str) -> None:
         status = await provider.poll(ref)
     except Exception as exc:
         if _is_transient_fault(exc):
-            # Not a verdict on the job -- just an unreachable provider. Leaving
-            # the state alone is the honest record (the job really is still
-            # running out there), and re-queueing is what keeps anything
-            # looking at it. Bounded in the end by the reclaim pass's staleness
-            # horizon, which fails a job that never resolves.
-            logger.warning(
-                "job %s: transient fault polling %s, re-polling in %ss: %s",
-                job_id,
-                spec.provider,
-                _POLL_TRANSIENT_RETRY_INTERVAL,
-                redact(str(exc)),
-            )
-            await ctx["redis"].enqueue_job(
-                "poll_job", job_id, _defer_by=_POLL_TRANSIENT_RETRY_INTERVAL
-            )
-            return
+            raise  # poll_job reschedules; this path must not decide anything
         credential_exc = classify_credential_failure(exc, identity)
         if credential_exc is not None:
             await _fail_classified_credential(ctx, job_id, spec, "poll", credential_exc)
@@ -910,53 +970,112 @@ async def startup(ctx: dict[str, Any]) -> None:
     converges existing debris to an honest terminal state.
     """
     _configure_harmony_download_concurrency()
-    session_factory = _session_factory(ctx)
+    async with _session_factory(ctx)() as session:
+        jobs = await crud.reclaim_non_terminal(session)
+        resumable = _triage_reclaimed(jobs)
+        await session.commit()
+    await _resume_all(ctx, resumable)
+
+    # PRD 015: converge a box restarted after heavy use below the cap without
+    # waiting for the next retrieval.
+    await _sweep_eviction_safe(ctx, protected_handle=None)
+
+
+async def sweep_stalled_jobs(ctx: dict[str, Any]) -> None:
+    """Re-enqueue every job that has fallen out of the lifecycle chain, on a
+    timer, without waiting for a worker restart.
+
+    :func:`startup` recovers stranded jobs only at boot, which made every stall
+    a silent hang of unbounded duration — the row non-terminal, the ``error``
+    column empty, nothing queued, and no way back short of restarting the
+    worker. Three stalls are unreachable by any in-task error handling, because
+    in each the process that would have retried no longer knows the job exists:
+    a state committed to Postgres whose follow-on ``enqueue_job`` never landed
+    (the arq retry re-enters the task, hits the state guard, and returns early);
+    a Redis that lost its queue, which strands every in-flight job at once while
+    the worker lives on; and ``max_tries`` exhaustion, which by design leaves the
+    row non-terminal. This is also what actually bounds ``poll_job``'s
+    transient-fault re-poll loop, whose own docstring promises a staleness
+    horizon that until now only ever ran at boot.
+
+    It selects on **staleness**, never on non-terminality alone — see
+    :func:`crud.reclaim_stalled`. Running startup's blanket pass on a timer
+    would enqueue a resume beside the chained poll a healthy job already has
+    deferred, reviving the double-handling that :func:`lifecycle_job_id`
+    exists to prevent.
+    """
+    settings = get_settings()
+    now = datetime.now(timezone.utc)
+    async with _session_factory(ctx)() as session:
+        jobs = await crud.reclaim_stalled(
+            session,
+            stalled_before=now - timedelta(seconds=settings.job_stalled_after_seconds),
+            materializing_stalled_before=now
+            - timedelta(seconds=settings.job_materializing_stalled_after_seconds),
+        )
+        if jobs:
+            logger.warning(
+                "reclaim sweep found %d stalled job(s): %s",
+                len(jobs),
+                ", ".join(f"{job.job_id}({job.state})" for job in jobs),
+            )
+        resumable = _triage_reclaimed(jobs)
+        await session.commit()
+    await _resume_all(ctx, resumable)
+
+
+def _triage_reclaimed(jobs: list[Job]) -> list[tuple[str, JobState]]:
+    """Split reclaimed jobs into "resume this" and "this can never make
+    progress, fail it now" (PRD 004).
+
+    Mutates the passed rows in the caller's open session — the caller commits.
+    Shared by both reclaim paths so the boot sweep and the periodic one can
+    never drift into two different policies about the same row.
+    """
     stale_before = datetime.now(timezone.utc) - timedelta(
         days=get_settings().job_stale_after_days
     )
-
     resumable: list[tuple[str, JobState]] = []
-    async with session_factory() as session:
-        jobs = await crud.reclaim_non_terminal(session)
-        for job in jobs:
-            try:
-                RequestSpec.from_jsonb(job.request_spec)
-            except InvalidSpecError as exc:
-                logger.warning(
-                    "reclaimed job %s has an invalid durable spec, failing: %s",
-                    job.job_id,
-                    exc,
-                )
-                crud.set_state(job, JobState.FAILED, error=f"invalid job spec: {exc}")
-                continue
-            if job.created_at < stale_before:
-                logger.warning(
-                    "reclaimed job %s is stale (non-terminal since %s), failing",
-                    job.job_id,
-                    job.created_at,
-                )
-                crud.set_state(
-                    job,
-                    JobState.FAILED,
-                    error=(
-                        f"reclaimed as stale: non-terminal since "
-                        f"{job.created_at.isoformat()}"
-                    ),
-                )
-                continue
-            resumable.append((job.job_id, JobState(job.state)))
-        await session.commit()
+    for job in jobs:
+        try:
+            RequestSpec.from_jsonb(job.request_spec)
+        except InvalidSpecError as exc:
+            logger.warning(
+                "reclaimed job %s has an invalid durable spec, failing: %s",
+                job.job_id,
+                exc,
+            )
+            crud.set_state(job, JobState.FAILED, error=f"invalid job spec: {exc}")
+            continue
+        if job.created_at < stale_before:
+            logger.warning(
+                "reclaimed job %s is stale (non-terminal since %s), failing",
+                job.job_id,
+                job.created_at,
+            )
+            crud.set_state(
+                job,
+                JobState.FAILED,
+                error=(
+                    f"reclaimed as stale: non-terminal since "
+                    f"{job.created_at.isoformat()}"
+                ),
+            )
+            continue
+        resumable.append((job.job_id, JobState(job.state)))
+    return resumable
 
+
+async def _resume_all(ctx: dict[str, Any], resumable: list[tuple[str, JobState]]) -> None:
+    """Dispatch each reclaimed job to the task that resumes its state, under the
+    deterministic arq id that makes a repeated reclaim a no-op rather than a
+    second copy of the same work (:func:`lifecycle_job_id`)."""
     redis = ctx["redis"]
     for job_id, state in resumable:
         task = _RESUME_TASK.get(state)
         if task is not None:
             await redis.enqueue_job(task, job_id, _job_id=lifecycle_job_id(task, job_id))
             logger.info("resuming job %s (%s) via %s", job_id, state.value, task)
-
-    # PRD 015: converge a box restarted after heavy use below the cap without
-    # waiting for the next retrieval.
-    await _sweep_eviction_safe(ctx, protected_handle=None)
 
 
 # -- helpers ----------------------------------------------------------------
@@ -1040,6 +1159,21 @@ def _job_id_from_url(url: str | None) -> str | None:
     return path.rstrip("/").rsplit("/", 1)[-1] or None
 
 
+def _sweep_minutes(every: int) -> set[int]:
+    """The arq cron minute set for a sweep every ``every`` minutes.
+
+    arq's cron takes the minutes it fires *on*, not an interval, so an interval
+    that doesn't divide 60 would fire unevenly across the hour boundary (e.g. 7
+    → …56, 00, a 4-minute gap). Rounded down to the nearest divisor of 60 so a
+    misconfigured interval sweeps slightly more often rather than unevenly —
+    the safe direction for a recovery path.
+    """
+    every = max(1, min(60, int(every)))
+    while 60 % every:
+        every -= 1
+    return set(range(0, 60, every))
+
+
 class WorkerSettings:
     """Arq worker configuration. Run with ``arq earthdata_mcp.jobs.worker.WorkerSettings``."""
 
@@ -1058,6 +1192,21 @@ class WorkerSettings:
         func(poll_job, max_tries=5, keep_result=0),
         func(materialize_job, max_tries=5, keep_result=0),
         healthcheck,
+    ]
+    # The recovery path that runs *while* the worker runs. Without it, `startup`
+    # is the only thing that ever re-enqueues a stranded job, so every stall
+    # waits on a human noticing and restarting the process.
+    # ``run_at_startup=False``: `on_startup` already reclaims, more thoroughly.
+    # ``max_tries=1`` — a sweep that fails has nothing to salvage; the next tick
+    # is a few minutes away and sees the same rows.
+    cron_jobs = [
+        cron(
+            sweep_stalled_jobs,
+            minute=_sweep_minutes(get_settings().job_reclaim_sweep_minutes),
+            second=0,
+            run_at_startup=False,
+            max_tries=1,
+        )
     ]
     on_startup = startup
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from earthdata_mcp.jobs.models import CollectionAccess, Job
@@ -214,6 +214,49 @@ async def reclaim_non_terminal(session: AsyncSession) -> list[Job]:
     """
     terminal = [s.value for s in TERMINAL_STATES]
     stmt = select(Job).where(Job.state.not_in(terminal)).order_by(Job.created_at)
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def reclaim_stalled(
+    session: AsyncSession,
+    *,
+    stalled_before: datetime,
+    materializing_stalled_before: datetime | None = None,
+) -> list[Job]:
+    """Return every non-terminal job with no sign of life since ``stalled_before``.
+
+    The periodic counterpart to :func:`reclaim_non_terminal`, and deliberately
+    *not* the same query. At boot nothing is in flight, so taking every
+    non-terminal row is safe; on a timer it is not — the healthy lifecycle chain
+    enqueues its next step under a fresh arq id, so re-enqueueing a job that is
+    merely non-terminal puts a second worker on a row that already has one.
+    Staleness is what distinguishes "stranded" from "busy".
+
+    Liveness is ``last_polled_at`` falling back to ``updated_at`` (PRD 012): the
+    poll stamp is the honest signal, because a provider reporting the same
+    queued status poll after poll changes no other column and so never moves
+    ``updated_at``; the fallback covers rows written before that column existed
+    and states that no poll ever touches.
+
+    ``materializing_stalled_before`` is the separate, later horizon for
+    ``MATERIALIZING``, defaulting to ``stalled_before`` when not given. A
+    download is not a poll: it writes nothing to the row for as long as it
+    takes, so the poll horizon would call a job that is busy streaming bytes
+    stranded — and re-running ``materialize_job`` costs a whole transfer.
+    """
+    terminal = [s.value for s in TERMINAL_STATES]
+    if materializing_stalled_before is None:
+        materializing_stalled_before = stalled_before
+    liveness = func.coalesce(Job.last_polled_at, Job.updated_at)
+    horizon = case(
+        (Job.state == JobState.MATERIALIZING.value, materializing_stalled_before),
+        else_=stalled_before,
+    )
+    stmt = (
+        select(Job)
+        .where(Job.state.not_in(terminal), liveness < horizon)
+        .order_by(Job.created_at)
+    )
     return list((await session.execute(stmt)).scalars().all())
 
 
