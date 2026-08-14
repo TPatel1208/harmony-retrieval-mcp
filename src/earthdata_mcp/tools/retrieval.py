@@ -243,6 +243,11 @@ async def retrieve_subset(
 ) -> dict:
     """Retrieve a variable + bbox + temporal subset.
 
+    Call ``describe_dataset`` first to get this collection's exact variable
+    names — they are collection-specific, often group-qualified paths (e.g.
+    ``product/vertical_column_troposphere``), and cannot be reliably guessed
+    from a variable's common/scientific name.
+
     Harmony is tried first: a single service that does all three is pinned; if none
     does (the union-trap case), Harmony is submitted unpinned and the server picks
     the chain. OPeNDAP is the worker's runtime fallback if that submit fails.
@@ -300,6 +305,11 @@ async def retrieve_timeseries(
     enqueue_fn: EnqueueFn | None = None,
 ) -> dict:
     """Retrieve a variable time-series; the AOI is optional (a global series omits it).
+
+    Call ``describe_dataset`` first to get this collection's exact variable
+    names — they are collection-specific, often group-qualified paths (e.g.
+    ``product/vertical_column_troposphere``), and cannot be reliably guessed
+    from a variable's common/scientific name.
 
     A bbox subset is requested only when ``aoi_handle`` is given, so the route is
     gated on ``needs_bbox`` accordingly.
