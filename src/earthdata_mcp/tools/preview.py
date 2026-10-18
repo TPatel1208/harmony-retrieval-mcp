@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 
 import dask
 import numpy as np
@@ -54,10 +55,10 @@ _LAT_NAMES = ("lat", "latitude", "y")
 
 _storage: StorageBackend | None = None
 
-# In-process GIBS layer cache: concept_id → authoritative layer name.
+# In-process GIBS layer cache: concept_id → (layer name, layerPeriod).
 # Concurrent coroutines may race to populate the same key but will write the
 # same value — worst outcome is one extra CMR call, never a correctness issue.
-_gibs_layer_cache: dict[str, str] = {}
+_gibs_layer_cache: dict[str, tuple[str, str | None]] = {}
 
 
 def _default_storage() -> StorageBackend:
@@ -71,46 +72,52 @@ def _default_storage() -> StorageBackend:
 # -- GIBS layer resolution -------------------------------------------------
 
 
-def _select_gibs_layer(layers: list[dict]) -> str | None:
+def _select_gibs_layer(layers: list[dict]) -> dict | None:
     """Pick the best GIBS layer from a collection's EDSC tag data array.
 
-    Preference order (highest first):
+    Each entry names its GIBS layer in ``product`` (CMR's tag has no ``layer``
+    field). Preference order (highest first):
     1. Non-polar layers (arctic/antarctic flags absent or False) — polar-projection
        layers render blank at EPSG:4326 global extents.
     2. Within that pool, non-night layers (name does not contain ``_Night``) —
        daytime composites are the canonical preview product for most sensors.
-    3. First entry as a last resort when all candidates share the same traits.
+    3. Within that pool, a tropospheric layer over a stratospheric one — the
+       callers ask about air near the ground (TEMPO NO2 lists both).
+    4. First entry as a last resort when all candidates share the same traits.
 
-    Returns ``None`` when ``layers`` is empty or no entry has a ``"layer"`` field.
+    Returns the chosen entry, or ``None`` when no entry has a ``product``.
     """
-    candidates = [l for l in layers if l.get("layer")]
+    candidates = [l for l in layers if l.get("product")]
     if not candidates:
         return None
     non_polar = [l for l in candidates if not (l.get("arctic") or l.get("antarctic"))]
     pool = non_polar if non_polar else candidates
-    day_pool = [l for l in pool if "_Night" not in l["layer"]]
-    chosen = day_pool[0] if day_pool else pool[0]
-    return chosen["layer"]
+    day_pool = [l for l in pool if "_Night" not in l["product"]] or pool
+    surface_pool = [l for l in day_pool if "Stratosphere" not in l["product"]] or day_pool
+    return surface_pool[0]
 
 
 async def _discover_gibs_layer(
     concept_id: str, cmr: CMRProvider
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
     """Authoritative GIBS layer lookup via CMR EDSC tags.
 
-    Returns ``(layer_name, failure_reason)``. ``layer_name`` is ``None`` when not found.
-    Populates ``_gibs_layer_cache`` on success to avoid repeat CMR calls.
+    Returns ``(layer_name, layer_period, failure_reason)``. ``layer_name`` is
+    ``None`` when not found. Populates ``_gibs_layer_cache`` on success to avoid
+    repeat CMR calls.
     """
     if concept_id in _gibs_layer_cache:
-        return _gibs_layer_cache[concept_id], None
+        name, period = _gibs_layer_cache[concept_id]
+        return name, period, None
     layers = await cmr.fetch_gibs_layers(concept_id)
     if not layers:
-        return None, "no edsc.extra.serverless.gibs tag on CMR record"
-    layer_name = _select_gibs_layer(layers)
-    if not layer_name:
-        return None, "edsc.extra.serverless.gibs tag has no 'layer' field"
-    _gibs_layer_cache[concept_id] = layer_name
-    return layer_name, None
+        return None, None, "no edsc.extra.serverless.gibs tag on CMR record"
+    chosen = _select_gibs_layer(layers)
+    if not chosen:
+        return None, None, "edsc.extra.serverless.gibs tag has no 'product' field"
+    name, period = chosen["product"], chosen.get("layerPeriod")
+    _gibs_layer_cache[concept_id] = (name, period)
+    return name, period, None
 
 
 # -- preview_dataset -------------------------------------------------------
@@ -149,24 +156,28 @@ async def preview_dataset(
     # authoritative CMR EDSC tag lookup → short_name heuristic (last resort).
     lookup_source: str
     lookup_failure_reason: str | None = None
+    layer_period: str | None = None
 
     if layer is not None:
         resolved_layer = layer
         lookup_source = "explicit"
     elif "gibs_layer" in record.payload:
         resolved_layer = record.payload["gibs_layer"]
+        layer_period = record.payload.get("gibs_layer_period")
         lookup_source = "handle_payload"
     else:
         concept_id = record.payload.get("concept_id")
         if concept_id:
             _cmr = cmr or CMRProvider(edl_token=identity.token if identity else None)
-            cmr_layer, failure = await _discover_gibs_layer(concept_id, _cmr)
+            cmr_layer, layer_period, failure = await _discover_gibs_layer(concept_id, _cmr)
             if cmr_layer:
                 resolved_layer = cmr_layer
                 lookup_source = "cmr_tags"
                 # Write-through: persist so future calls skip the CMR round-trip.
                 await store.update_handle(
-                    workspace_id, dataset_handle, {"gibs_layer": cmr_layer}
+                    workspace_id,
+                    dataset_handle,
+                    {"gibs_layer": cmr_layer, "gibs_layer_period": layer_period},
                 )
             else:
                 resolved_layer = short_name
@@ -185,7 +196,12 @@ async def preview_dataset(
         )
 
     bbox = _preview_bbox(collection, await _aoi_bbox(aoi_handle, workspace_id, store))
-    time = _preview_time(time_range)
+    time = _preview_time(time_range, layer_period, bbox)
+    concept_id = record.payload.get("concept_id")
+    if resolved_layer.endswith("_Granule") and time and "T" in time and concept_id:
+        # A per-granule layer draws only inside one scan's window and footprint.
+        _cmr = cmr or CMRProvider(edl_token=identity.token if identity else None)
+        time = await _granule_scan_time(_cmr, concept_id, bbox, time) or time
 
     spec = {
         "source": "gibs",
@@ -230,13 +246,75 @@ def _preview_bbox(
     return _GLOBAL_BBOX
 
 
-def _preview_time(time_range: str | None) -> str | None:
-    """GIBS snapshots are single-date; use the start of a ``"start/end"`` range."""
+def _preview_time(
+    time_range: str | None,
+    layer_period: str | None = None,
+    bbox: tuple[float, float, float, float] = _GLOBAL_BBOX,
+) -> str | None:
+    """The single GIBS ``TIME`` for a ``"start/end"`` range: its start.
+
+    A date is enough for daily or coarser imagery. A subdaily layer needs an
+    instant — GIBS reads a bare date as 00:00Z, which is night over much of the
+    globe and returns a blank tile — so a date-only start becomes local solar
+    noon at the bbox centre (GIBS serves the latest scan at or before it). An
+    explicit instant is kept as given for a subdaily layer.
+    """
     if not time_range:
         return None
     start = time_range.split("/", 1)[0].strip()
-    # A date is enough for GIBS daily imagery; keep a full instant if that's given.
-    return start.split("T", 1)[0] if "T" in start else start
+    date, has_clock, _ = start.partition("T")
+    if layer_period != "Subdaily":
+        return date
+    if has_clock:
+        return start
+    west, _, east, _ = bbox
+    noon_utc = round(12 - (west + east) / 2 / 15) % 24
+    return f"{date}T{noon_utc:02d}:00:00Z"
+
+
+#: How far either side of the target instant to look for a scan.
+_GRANULE_SEARCH_HOURS = 3
+
+
+async def _granule_scan_time(
+    cmr: CMRProvider,
+    concept_id: str,
+    bbox: tuple[float, float, float, float],
+    target: str,
+) -> str | None:
+    """The middle of the scan over the bbox centre nearest ``target``, or None.
+
+    GIBS draws a per-granule layer only for an instant inside one granule's
+    time window, and only over that granule's footprint, so a guessed instant
+    is almost always blank. CMR is asked for granules containing the bbox
+    centre within a few hours of ``target``; their footprints cover the AOI
+    by construction. Never raises: a failed lookup leaves the caller's time.
+    """
+    west, south, east, north = bbox
+    lon, lat = (west + east) / 2, (south + north) / 2
+    try:
+        aim = datetime.fromisoformat(target)
+        span = timedelta(hours=_GRANULE_SEARCH_HOURS)
+        granules = await cmr.search_granules(
+            concept_id,
+            temporal=f"{_iso_z(aim - span)}/{_iso_z(aim + span)}",
+            bounding_box=f"{lon:g},{lat:g},{lon:g},{lat:g}",
+            limit=50,
+        )
+        middles = []
+        for granule in granules:
+            start = datetime.fromisoformat(granule["time_start"])
+            end = datetime.fromisoformat(granule.get("time_end") or granule["time_start"])
+            middles.append(start + (end - start) / 2)
+    except Exception:  # noqa: BLE001 — a preview never fails on this lookup
+        return None
+    if not middles:
+        return None
+    return _iso_z(min(middles, key=lambda middle: abs(middle - aim)))
+
+
+def _iso_z(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _gibs_url(

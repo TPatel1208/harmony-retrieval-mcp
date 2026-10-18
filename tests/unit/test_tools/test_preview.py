@@ -58,10 +58,14 @@ def _clear_gibs_layer_cache():
     _preview_module._gibs_layer_cache.clear()
 
 
-def _mock_cmr(gibs_layers: list[dict] | None = None) -> MagicMock:
-    """CMR mock whose fetch_gibs_layers returns gibs_layers (default: empty list)."""
+def _mock_cmr(
+    gibs_layers: list[dict] | None = None, granules: list[dict] | None = None
+) -> MagicMock:
+    """CMR mock whose fetch_gibs_layers returns gibs_layers and whose
+    search_granules returns granules (both default to an empty list)."""
     cmr = MagicMock()
     cmr.fetch_gibs_layers = AsyncMock(return_value=gibs_layers or [])
+    cmr.search_granules = AsyncMock(return_value=granules or [])
     return cmr
 
 
@@ -212,11 +216,26 @@ async def test_preview_rejects_non_dataset_handle(workspace_store, workspace_id)
 # -- GIBS layer authoritative discovery ------------------------------------
 
 
+def _gibs_tag(product: str, period: str = "Daily", **extra) -> dict:
+    """One entry of a CMR ``edsc.extra.serverless.gibs`` tag, in the shape CMR
+    really returns: the GIBS layer name is ``product``, there is no ``layer``."""
+    return {
+        "product": product,
+        "layerPeriod": period,
+        "group": "overlays",
+        "geographic": True,
+        "arctic": False,
+        "antarctic": False,
+        "format": "png",
+        **extra,
+    }
+
+
 async def test_preview_resolves_layer_from_cmr_tags(workspace_store, workspace_id):
     ds = await _seed_dataset(workspace_store, workspace_id)
     out = await preview_dataset(
         ds, workspace_id=workspace_id, store=workspace_store,
-        cmr=_mock_cmr([{"layer": "AIRS_L3_Temperature_Daily"}]),
+        cmr=_mock_cmr([_gibs_tag("AIRS_L3_Temperature_Daily")]),
     )
     assert out["layer"] == "AIRS_L3_Temperature_Daily"
     assert out["layer_is_guess"] is False
@@ -230,11 +249,93 @@ async def test_preview_caches_resolved_layer_in_handle_payload(
     ds = await _seed_dataset(workspace_store, workspace_id)
     await preview_dataset(
         ds, workspace_id=workspace_id, store=workspace_store,
-        cmr=_mock_cmr([{"layer": "AIRS_L3_Temperature_Daily"}]),
+        cmr=_mock_cmr([_gibs_tag("AIRS_L3_Temperature_Daily")]),
     )
     # After a successful CMR lookup the layer is written back to the dataset handle.
     record = await workspace_store.get_handle(workspace_id, ds)
     assert record.payload["gibs_layer"] == "AIRS_L3_Temperature_Daily"
+    assert record.payload["gibs_layer_period"] == "Daily"
+
+
+async def test_preview_subdaily_layer_gets_local_noon_over_the_aoi(
+    workspace_store, workspace_id
+):
+    # A subdaily layer (TEMPO's hourly scans) asked for at a bare date renders
+    # 00:00Z, which is night over the Americas: GIBS returns a blank tile. The
+    # AOI centre is -104.5°, so local solar noon is 12 + 104.5/15 ≈ 19:00Z.
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    out = await preview_dataset(
+        ds, time_range="2026-06-05/2026-06-05", aoi_handle=aoi,
+        workspace_id=workspace_id, store=workspace_store,
+        cmr=_mock_cmr([_gibs_tag("TEMPO_L3_NO2_Vertical_Column_Troposphere", "Subdaily")]),
+    )
+    assert out["time"] == "2026-06-05T19:00:00Z"
+    assert "TIME=2026-06-05T19%3A00%3A00Z" in out["gibs_url"]
+
+
+async def test_preview_subdaily_layer_keeps_an_explicit_instant(
+    workspace_store, workspace_id
+):
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    out = await preview_dataset(
+        ds, time_range="2026-06-05T15:30:00Z/2026-06-05T23:59:59Z",
+        workspace_id=workspace_id, store=workspace_store,
+        cmr=_mock_cmr([_gibs_tag("TEMPO_L3_NO2_Vertical_Column_Troposphere", "Subdaily")]),
+    )
+    assert out["time"] == "2026-06-05T15:30:00Z"
+
+
+async def test_preview_granule_layer_uses_the_scan_over_the_aoi_nearest_local_noon(
+    workspace_store, workspace_id
+):
+    # A per-granule layer (TEMPO L2) draws only inside one scan's time window
+    # and footprint: GIBS returns a blank tile at any other instant. The scan
+    # is found by asking CMR for granules over the AOI centre, and the one
+    # whose middle is nearest local noon (19:00Z here) is shown.
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    cmr = _mock_cmr(
+        [_gibs_tag("TEMPO_L2_NO2_Vertical_Column_Troposphere_Granule", "Subdaily")],
+        granules=[
+            {"time_start": "2026-06-05T18:20:26Z", "time_end": "2026-06-05T18:27:02Z"},
+            {"time_start": "2026-06-05T19:20:26Z", "time_end": "2026-06-05T19:27:02Z"},
+        ],
+    )
+    out = await preview_dataset(
+        ds, time_range="2026-06-05/2026-06-05", aoi_handle=aoi,
+        workspace_id=workspace_id, store=workspace_store, cmr=cmr,
+    )
+    assert out["time"] == "2026-06-05T19:23:44Z"
+    kwargs = cmr.search_granules.call_args.kwargs
+    assert kwargs["bounding_box"] == "-104.5,37.5,-104.5,37.5"
+
+
+async def test_preview_granule_layer_falls_back_to_noon_without_a_scan(
+    workspace_store, workspace_id
+):
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    aoi = await _seed_aoi(workspace_store, workspace_id)
+    out = await preview_dataset(
+        ds, time_range="2026-06-05/2026-06-05", aoi_handle=aoi,
+        workspace_id=workspace_id, store=workspace_store,
+        cmr=_mock_cmr(
+            [_gibs_tag("TEMPO_L2_NO2_Vertical_Column_Troposphere_Granule", "Subdaily")]
+        ),
+    )
+    assert out["time"] == "2026-06-05T19:00:00Z"
+
+
+async def test_preview_daily_layer_takes_the_date_of_a_full_day_window(
+    workspace_store, workspace_id
+):
+    ds = await _seed_dataset(workspace_store, workspace_id)
+    out = await preview_dataset(
+        ds, time_range="2026-06-05T00:00:00Z/2026-06-05T23:59:59Z",
+        workspace_id=workspace_id, store=workspace_store,
+        cmr=_mock_cmr([_gibs_tag("AIRS_L3_Temperature_Daily")]),
+    )
+    assert out["time"] == "2026-06-05"
 
 
 async def test_preview_skips_cmr_when_handle_has_gibs_layer(
@@ -282,35 +383,49 @@ async def test_preview_falls_back_to_short_name_when_cmr_has_no_tags(
 # -- _select_gibs_layer unit tests -----------------------------------------
 
 
+def _picked(layers: list[dict]) -> str | None:
+    chosen = _select_gibs_layer(layers)
+    return chosen["product"] if chosen else None
+
+
 def test_select_gibs_layer_prefers_day_over_night():
-    layers = [{"layer": "MODIS_LST_Night"}, {"layer": "MODIS_LST_Day"}]
-    assert _select_gibs_layer(layers) == "MODIS_LST_Day"
+    layers = [_gibs_tag("MODIS_LST_Night"), _gibs_tag("MODIS_LST_Day")]
+    assert _picked(layers) == "MODIS_LST_Day"
 
 
 def test_select_gibs_layer_prefers_global_over_polar():
-    layers = [{"layer": "A", "arctic": True}, {"layer": "B", "arctic": False}]
-    assert _select_gibs_layer(layers) == "B"
+    layers = [_gibs_tag("A", arctic=True), _gibs_tag("B")]
+    assert _picked(layers) == "B"
 
 
 def test_select_gibs_layer_prefers_global_nonnight_composite():
     layers = [
-        {"layer": "X_Night", "arctic": False},
-        {"layer": "Y_Day", "arctic": True},
-        {"layer": "Z_Day", "arctic": False},
+        _gibs_tag("X_Night"),
+        _gibs_tag("Y_Day", arctic=True),
+        _gibs_tag("Z_Day"),
     ]
-    assert _select_gibs_layer(layers) == "Z_Day"
+    assert _picked(layers) == "Z_Day"
 
 
 def test_select_gibs_layer_falls_back_to_first_when_all_night():
-    layers = [{"layer": "X_Night"}, {"layer": "Y_Night"}]
-    assert _select_gibs_layer(layers) == "X_Night"
+    layers = [_gibs_tag("X_Night"), _gibs_tag("Y_Night")]
+    assert _picked(layers) == "X_Night"
+
+
+def test_select_gibs_layer_prefers_troposphere_over_stratosphere():
+    # TEMPO_NO2_L3's real tag lists the stratospheric column first.
+    layers = [
+        _gibs_tag("TEMPO_L3_NO2_Vertical_Column_Stratosphere", "Subdaily"),
+        _gibs_tag("TEMPO_L3_NO2_Vertical_Column_Troposphere", "Subdaily"),
+    ]
+    assert _picked(layers) == "TEMPO_L3_NO2_Vertical_Column_Troposphere"
 
 
 def test_select_gibs_layer_returns_none_for_empty():
     assert _select_gibs_layer([]) is None
 
 
-def test_select_gibs_layer_returns_none_when_no_layer_field():
+def test_select_gibs_layer_returns_none_when_no_product_field():
     assert _select_gibs_layer([{"format": "image/png"}]) is None
 
 
